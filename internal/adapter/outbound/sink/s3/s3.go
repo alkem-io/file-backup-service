@@ -150,7 +150,7 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 
 // PutManifest writes a ledger snapshot object under _manifest/.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
-	key := path.Join(s.prefix, "_manifest", name)
+	key := path.Join(s.prefix, fsutil.ManifestKey(name))
 	if _, err := s.client.PutObject(ctx, s.bucket, key, r, -1, s.putOpts()); err != nil {
 		return fmt.Errorf("put manifest: %w", err)
 	}

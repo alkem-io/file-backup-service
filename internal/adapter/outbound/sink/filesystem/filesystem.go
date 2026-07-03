@@ -80,7 +80,8 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 // uses the same 0644 durable spine as Store — a DR restore on a different uid
 // must be able to read it.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
-	_, err := writeAtomic(ctx, filepath.Join(s.root, "_manifest"), filepath.Base(name), r)
+	dest := filepath.Join(s.root, filepath.FromSlash(fsutil.ManifestKey(name)))
+	_, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r)
 	return err
 }
 

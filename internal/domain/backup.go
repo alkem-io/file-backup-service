@@ -13,6 +13,12 @@ import (
 // full verified stream — it must never be recorded as "stored".
 var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stream")
 
+// panicErr renders a recovered panic as an error for the pipeline's per-target
+// recover guards (each lives on a different goroutine, so they can't share a defer).
+func panicErr(what string, r any) error {
+	return fmt.Errorf("%s panicked: %v", what, r)
+}
+
 // Per-target ledger states. The dedup reader, the writers, and the metrics labels
 // must all agree on these exact strings (StoredTargets treats only StateStored as
 // "already has it"), so they live in one place.
@@ -157,10 +163,12 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		wg.Add(1)
 		go func(i int, t Target, pr *io.PipeReader) {
 			defer wg.Done()
-			// A panicking sink must fail its target, not crash the worker.
+			// A panic in this goroutine's own setup/teardown must fail its target, not
+			// crash the worker (the sink's Store panic is recovered inside storeWithCtx,
+			// on the other side of a goroutine boundary this recover can't reach).
 			defer func() {
 				if r := recover(); r != nil {
-					results[i] = targetResult{err: fmt.Errorf("sink %s panicked: %v", t.Sink.Name(), r)}
+					results[i] = targetResult{err: panicErr("sink "+t.Sink.Name(), r)}
 					_ = pr.CloseWithError(errAbortedBeforeEOF)
 				}
 			}()
@@ -240,7 +248,7 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				ch <- targetResult{err: fmt.Errorf("sink %s panicked: %v", sink.Name(), rec)}
+				ch <- targetResult{err: panicErr("sink "+sink.Name(), rec)}
 			}
 		}()
 		sn, serr := sink.Store(ctx, hash, r, -1)

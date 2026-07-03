@@ -26,7 +26,10 @@ const (
 // We already parallelize across targets/objects, so encoder concurrency is 1.
 var zstdEncoderPool = sync.Pool{
 	New: func() any {
-		enc, _ := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+		enc, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+		if err != nil { // a fixed valid option set — an error here is a build-time bug
+			panic(fmt.Sprintf("zstd encoder: %v", err))
+		}
 		return enc
 	},
 }
@@ -46,7 +49,7 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 		// state, so it is dropped (GC'd), never returned to the pool.
 		defer func() {
 			if r := recover(); r != nil {
-				pw.CloseWithError(fmt.Errorf("zstd encode panicked: %v", r))
+				pw.CloseWithError(panicErr("zstd encode", r))
 			}
 		}()
 		enc.Reset(pw)

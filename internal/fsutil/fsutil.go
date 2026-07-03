@@ -49,6 +49,13 @@ func CommitFile(tmpName, dest string, mode os.FileMode) error {
 	return SyncDir(filepath.Dir(dest))
 }
 
+// ManifestKey returns the slash-style key for a ledger-snapshot manifest object
+// (`_manifest/<base>`). Owning this layout in ONE place keeps the sinks and the
+// DR-restore tooling from diverging on where manifests live.
+func ManifestKey(name string) string {
+	return path.Join("_manifest", path.Base(name))
+}
+
 // SyncDir fsyncs a directory so a create/rename within it is durable
 // (atomic != durable). Used after every content write.
 func SyncDir(dir string) error {
