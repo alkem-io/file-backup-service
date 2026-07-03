@@ -7,12 +7,12 @@ import (
 	"sync"
 )
 
-// Target pairs a Sink with its per-target policy.
+// Target is one backup destination. All targets are symmetric — there is no
+// primary/required/optional; every object goes to every target and "done"
+// requires all of them (FR-012). A flaky target is isolated, never a main one.
 type Target struct {
 	// Sink is the content-addressed store.
 	Sink Sink
-	// Required gates "done": every required target must store successfully.
-	Required bool
 	// Codec is the per-target transform (none | zstd).
 	Codec Codec
 }
@@ -37,9 +37,11 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // BackupOne stores the object on every target that still needs it. The source is
 // fetched ONCE and fanned out to all targets concurrently (streamed, bounded
 // memory), so adding a second target does not multiply read load on the primary
-// store — FR: N configurable targets. Dedup is answered by our own ledger (never
-// by re-reading a target), so it works with PutObject-only WORM credentials.
-// Returns true when all REQUIRED targets are stored.
+// store — FR: N symmetric configurable targets. Dedup is answered by our own
+// ledger (never by re-reading a target), so it works with PutObject-only WORM
+// credentials. Returns true only when EVERY target is stored (symmetric
+// done-gate); a flaky target leaves the object not-done for retry while never
+// blocking the healthy targets.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	pending := make([]Target, 0, len(p.Targets))
 	for _, t := range p.Targets {
@@ -58,7 +60,7 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		return false, err // source fetch failed — outbox retries the whole object
 	}
 
-	allRequiredOK := true
+	allStored := true
 	objectRecorded := false
 	for i, t := range pending {
 		name := t.Sink.Name()
@@ -67,9 +69,7 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 			if objectRecorded {
 				_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
 			}
-			if t.Required {
-				allRequiredOK = false
-			}
+			allStored = false
 			continue
 		}
 		// Object row must exist before its target_status (FK); idempotent.
@@ -82,7 +82,7 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 			return false, fmt.Errorf("ledger target status: %w", err)
 		}
 	}
-	return allRequiredOK, nil
+	return allStored, nil
 }
 
 type targetResult struct {

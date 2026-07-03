@@ -113,9 +113,9 @@ func serve(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	if !hasRequired(targets) {
-		return errors.New("no required backup target configured: at least one target must set required=true, " +
-			"else objects would be marked backed-up with no guaranteed copy")
+	if len(targets) == 0 {
+		return errors.New("no backup target configured: at least one target is required, " +
+			"else objects would be marked backed-up with no copy anywhere")
 	}
 	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), db.NewLedgerRepo(ledgerPool), targets)
 	pipeline.Metrics = mx
@@ -205,18 +205,9 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 		if t.Compression == string(domain.CodecZstd) {
 			codec = domain.CodecZstd
 		}
-		targets = append(targets, domain.Target{Sink: sink, Required: t.Required, Codec: codec})
+		targets = append(targets, domain.Target{Sink: sink, Codec: codec})
 	}
 	return targets, nil
-}
-
-func hasRequired(targets []domain.Target) bool {
-	for _, t := range targets {
-		if t.Required {
-			return true
-		}
-	}
-	return false
 }
 
 func buildSink(t config.Target) (domain.Sink, error) {

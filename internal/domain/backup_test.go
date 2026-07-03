@@ -71,7 +71,7 @@ func TestPipelineBackupOne(t *testing.T) {
 	}
 	sink := &memSink{name: "t1", store: map[string][]byte{}}
 	led := newFakeLedger()
-	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Required: true, Codec: CodecNone}})
+	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
 
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f1", ExternalID: h})
 	if err != nil || !ok {
@@ -90,7 +90,7 @@ func TestPipelineBackupOne(t *testing.T) {
 
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := &memSink{name: "t1", store: map[string][]byte{}}
-	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink, Required: true}})
+	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "deadbeef"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -125,8 +125,8 @@ func TestPipelineSingleFetchFanOut(t *testing.T) {
 	a := &memSink{name: "a", store: map[string][]byte{}}
 	b := &memSink{name: "b", store: map[string][]byte{}}
 	p := NewPipeline(src, newFakeLedger(), []Target{
-		{Sink: a, Required: true, Codec: CodecNone},
-		{Sink: b, Required: false, Codec: CodecNone},
+		{Sink: a, Codec: CodecNone},
+		{Sink: b, Codec: CodecNone},
 	})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
 	if err != nil || !ok {
@@ -152,8 +152,9 @@ func (f *failSink) Fetch(context.Context, string) (io.ReadCloser, error) {
 }
 func (f *failSink) PutManifest(context.Context, string, io.Reader) error { return nil }
 
-// TestPipelineTargetIsolation: a failing optional target must not abort the
-// required one — the healthy target still receives the full object.
+// TestPipelineTargetIsolation: targets are symmetric — a flaky target must not
+// abort the others (they still receive the object), and the object must NOT be
+// "done" until every target has it.
 func TestPipelineTargetIsolation(t *testing.T) {
 	data := []byte("hello isolation")
 	h, err := Sum(bytes.NewReader(data))
@@ -162,17 +163,17 @@ func TestPipelineTargetIsolation(t *testing.T) {
 	}
 	good := &memSink{name: "good", store: map[string][]byte{}}
 	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{
-		{Sink: &failSink{name: "bad"}, Required: false, Codec: CodecNone},
-		{Sink: good, Required: true, Codec: CodecNone},
+		{Sink: &failSink{name: "bad"}, Codec: CodecNone},
+		{Sink: good, Codec: CodecNone},
 	})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if !ok {
-		t.Fatal("required target succeeded; expected ok despite the optional failure")
+	if ok {
+		t.Fatal("one target failed — object must be not-done (retried), not marked backed-up")
 	}
 	if !bytes.Equal(good.store[h], data) {
-		t.Fatal("healthy target must still receive the full object")
+		t.Fatal("healthy target must still receive the full object despite the flaky one")
 	}
 }

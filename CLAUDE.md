@@ -69,7 +69,7 @@ target restorable with nothing but bytes + a hash check.
 - `FILE_SERVICE_BASE` — base URL for `GET /internal/file/{id}/content`
 - `ALKEMIO_DB_DSN` — scoped role for the outbox (SELECT/UPDATE only)
 - `LEDGER_DB_DSN` — this service's own ledger database
-- `TARGETS` — list of sinks (type, endpoint/bucket/path, required, compression, immutable, credentialsRef)
+- `TARGETS` — list of **symmetric** sinks (type, endpoint/bucket/path, compression, immutable, credentialsRef); every object goes to every target, "done" requires all
 - `CONCURRENCY`, `BACKFILL_RATE_PER_SEC`, retry/attempt limits, reconciliation schedule, RPO SLO
 - `METRICS_PORT` — health/metrics listen port (default 4004)
 

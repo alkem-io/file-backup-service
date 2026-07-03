@@ -15,7 +15,6 @@ type Target struct {
 	Bucket         string `json:"bucket,omitempty"`
 	Prefix         string `json:"prefix,omitempty"`
 	Path           string `json:"path,omitempty"`
-	Required       bool   `json:"required"`
 	Compression    string `json:"compression,omitempty"` // "none" | "zstd"
 	Immutable      bool   `json:"immutable,omitempty"`
 	CredentialsRef string `json:"credentialsRef,omitempty"`
