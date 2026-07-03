@@ -5,6 +5,8 @@
 package s3
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -65,17 +67,38 @@ func (s *Sink) key(hash string) string {
 }
 
 func (s *Sink) putOpts() minio.PutObjectOptions {
-	opts := minio.PutObjectOptions{}
+	// Bound the streaming (size=-1) multipart buffer. For an unknown length minio-go
+	// defaults to a ~528 MiB part (5 TiB / 10000 parts) and does make([]byte, part)
+	// PER upload — which OOMs the co-located RWO node at concurrency. 16 MiB caps the
+	// buffer 33x while still allowing 160 GiB objects (16 MiB x 10000 parts).
+	opts := minio.PutObjectOptions{PartSize: 16 << 20}
 	if s.sse != nil {
 		opts.ServerSideEncryption = s.sse
 	}
 	return opts
 }
 
-// Exists reports whether the object is present. On an immutable target the
-// worker's credentials are PutObject-only, so a HEAD returns 403 — treat that
-// (and a 404) as "not present / unknown" rather than a hard error, since the
-// ledger is the authoritative dedup source anyway.
+// Preflight verifies the bucket is reachable with the configured credentials so a
+// wrong key/secret/bucket/region fails loudly at startup rather than dead-lettering
+// every object. A PutObject-only WORM credential legitimately can't introspect the
+// bucket (403 AccessDenied) — that is treated as "reachable"; a wrong key/secret
+// (SignatureDoesNotMatch/InvalidAccessKeyId), a missing bucket (NoSuchBucket), or an
+// unreachable endpoint fail loud.
+func (s *Sink) Preflight(ctx context.Context) error {
+	if _, err := s.client.BucketExists(ctx, s.bucket); err != nil {
+		if minio.ToErrorResponse(err).Code == "AccessDenied" {
+			return nil // valid creds, write-only by design — can't introspect, but reachable
+		}
+		return fmt.Errorf("s3 preflight %q (creds/bucket/region/endpoint?): %w", s.name, err)
+	}
+	return nil
+}
+
+// Exists reports whether the object is present. Only a definite 404/NoSuchKey is
+// "absent"; a 403/AccessDenied (expected on a PutObject-only WORM credential, and
+// also what a real credential/endpoint fault returns) is surfaced as an ERROR, not
+// "absent", so a future reconcile never treats a permission fault as a gap to
+// refill. Dedup is answered by the ledger, not this method.
 func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 	_, err := s.client.StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
 	if err != nil {
@@ -94,8 +117,22 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 }
 
 // Store uploads bytes for hash (SSE applied; bucket default retention provides WORM).
-func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, size int64) (int64, error) {
-	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), r, size, s.putOpts())
+// size is always -1 (streamed) so minio reads to EOF and the commit is gated on the
+// upstream VerifyReader hash check. But a 0-byte object then completes a multipart
+// with an empty part, which Scaleway (and many S3 backends) reject (EntityTooSmall);
+// detect empty via a 1-byte peek and use a single empty PutObject instead.
+func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, _ int64) (int64, error) {
+	br := bufio.NewReader(r)
+	if _, err := br.Peek(1); err != nil {
+		if err == io.EOF { // empty object (already hash-verified upstream)
+			if _, perr := s.client.PutObject(ctx, s.bucket, s.key(hash), bytes.NewReader(nil), 0, s.putOpts()); perr != nil {
+				return 0, fmt.Errorf("put (empty): %w", perr)
+			}
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read: %w", err)
+	}
+	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), br, -1, s.putOpts())
 	if err != nil {
 		return 0, fmt.Errorf("put: %w", err)
 	}

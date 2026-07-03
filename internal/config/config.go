@@ -276,8 +276,10 @@ func validateTarget(i int, t Target, seen map[string]bool) error {
 			return fmt.Errorf("target %q: filesystem requires path", t.Name)
 		}
 	case "s3":
-		if t.Endpoint == "" || t.Bucket == "" {
-			return fmt.Errorf("target %q: s3 requires endpoint and bucket", t.Name)
+		if t.Endpoint == "" || t.Bucket == "" || t.Region == "" {
+			// region is mandatory: PutObject-only creds can't auto-discover it and SigV4
+			// signs it — an empty region fails every request with SignatureDoesNotMatch.
+			return fmt.Errorf("target %q: s3 requires endpoint, bucket, and region", t.Name)
 		}
 		if !t.Insecure && (!t.UseSSL || !t.SSE) {
 			return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+

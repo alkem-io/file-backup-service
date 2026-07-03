@@ -19,6 +19,7 @@ targets:
     type: s3
     endpoint: e
     bucket: b
+    region: r
     useSSL: true
     sse: true
 `), 0o600); err != nil {
@@ -110,7 +111,7 @@ func TestValidateRejectsInsecureS3(t *testing.T) {
 		LedgerDB:            DBConfig{Host: "h", User: "u", DBName: "l"},
 		PerObjectTimeoutSec: 1800,
 		StaleTTLSec:         3600,
-		Targets:             []Target{{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b"}}, // no useSSL/sse
+		Targets:             []Target{{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r"}}, // no useSSL/sse
 	}
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected the s3 TLS+SSE requirement to reject this config")
