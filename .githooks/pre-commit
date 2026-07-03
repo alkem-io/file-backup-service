@@ -1,0 +1,38 @@
+#!/bin/sh
+# Pre-commit: regenerate sqlc + openapi and check for drift.
+# Install: make setup-hooks  (git config core.hooksPath .githooks)
+set -e
+
+STAGED=$(git diff --cached --name-only)
+NEED_SQLC=false
+NEED_OPENAPI=false
+echo "$STAGED" | grep -q "db/queries/\|db/migrations/" && NEED_SQLC=true || true
+echo "$STAGED" | grep -q "internal/adapter/inbound/http/" && NEED_OPENAPI=true || true
+
+if [ "$NEED_SQLC" = true ]; then
+  if command -v sqlc >/dev/null 2>&1; then
+    echo "  Regenerating sqlc..."
+    sqlc -f db/sqlc.yaml generate
+    git diff --exit-code internal/adapter/outbound/db/queries/ || {
+      echo "ERROR: sqlc generated code is stale. Run 'make sqlc-generate' and stage the changes."
+      exit 1
+    }
+  else
+    echo "  WARN: sqlc not installed, skipping generated-code check"
+  fi
+fi
+
+if [ "$NEED_OPENAPI" = true ]; then
+  if command -v apispec >/dev/null 2>&1; then
+    echo "  Regenerating openapi.yaml..."
+    make openapi
+    git diff --exit-code openapi.yaml || {
+      echo "ERROR: openapi.yaml is stale. Run 'make openapi' and stage the changes."
+      exit 1
+    }
+  else
+    echo "  WARN: apispec not installed, skipping openapi check"
+  fi
+fi
+
+echo "Pre-commit: OK"

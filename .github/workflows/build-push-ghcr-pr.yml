@@ -1,0 +1,17 @@
+name: Build & Push Container (PR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-image-${{ github.event.number }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    uses: alkem-io/github-workflows/.github/workflows/container-pr.yml@v1
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
