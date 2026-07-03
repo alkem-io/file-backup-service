@@ -20,11 +20,13 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(destDir, 0o750); err != nil {
+	if err := os.MkdirAll(destDir, 0o755); err != nil { //nolint:gosec // primary store is world-readable
 		return fmt.Errorf("mkdir: %w", err)
 	}
 	tmp := dest + ".partial"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil { //nolint:gosec // restored to a validated hash name
+	// 0644 so file-service (a different uid, 65532) can read restored objects from
+	// the primary store. Ownership is handled by the ops runbook / fsGroup.
+	if err := os.WriteFile(tmp, out, 0o644); err != nil { //nolint:gosec // content-addressed blob, served by file-service
 		return fmt.Errorf("write: %w", err)
 	}
 	return os.Rename(tmp, dest)

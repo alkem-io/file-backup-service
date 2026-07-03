@@ -21,9 +21,9 @@ type Outbox interface {
 	Claim(ctx context.Context, n int) ([]OutboxEntry, error)
 	// MarkDone marks an entry done once all required targets confirm.
 	MarkDone(ctx context.Context, id int64) error
-	// Fail records a failure — re-queues with backoff, or dead-letters past the
-	// attempt limit.
-	Fail(ctx context.Context, id int64, reason string) error
+	// Fail records a failure — re-queues, or dead-letters past the attempt limit.
+	// Returns true when the entry was moved to dead-letter.
+	Fail(ctx context.Context, id int64, reason string) (bool, error)
 	// ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
 	ReapStale(ctx context.Context, ttl time.Duration) error
 }

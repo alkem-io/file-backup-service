@@ -57,17 +57,20 @@ func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
 }
 
 // Fail re-queues the entry (attempts already incremented on claim) or
-// dead-letters it once the attempt limit is reached.
-func (r *OutboxRepo) Fail(ctx context.Context, id int64, reason string) error {
+// dead-letters it once the attempt limit is reached. Returns true when the entry
+// was moved to dead-letter.
+func (r *OutboxRepo) Fail(ctx context.Context, id int64, reason string) (bool, error) {
 	const q = `UPDATE file_backup_outbox
 SET status = CASE WHEN attempts >= $2 THEN 'dead_letter' ELSE 'pending' END,
     "lastError" = $3,
     "claimedAt" = NULL
-WHERE id = $1`
-	if _, err := r.p.Exec(ctx, q, id, maxAttempts, reason); err != nil {
-		return fmt.Errorf("fail entry: %w", err)
+WHERE id = $1
+RETURNING status = 'dead_letter'`
+	var deadLettered bool
+	if err := r.p.QueryRow(ctx, q, id, maxAttempts, reason).Scan(&deadLettered); err != nil {
+		return false, fmt.Errorf("fail entry: %w", err)
 	}
-	return nil
+	return deadLettered, nil
 }
 
 // maxAttempts is the dead-letter threshold (configurable later — FR-006).

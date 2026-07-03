@@ -113,14 +113,19 @@ func serve(cfgPath string) error {
 	if err != nil {
 		return err
 	}
+	if !hasRequired(targets) {
+		return errors.New("no required backup target configured: at least one target must set required=true, " +
+			"else objects would be marked backed-up with no guaranteed copy")
+	}
 	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), db.NewLedgerRepo(ledgerPool), targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
-		Outbox:      db.NewOutboxRepo(alkemioPool),
-		Pipeline:    pipeline,
-		ListenPool:  alkemioPool.Pool,
-		Concurrency: cfg.Concurrency,
-		Logger:      logger,
+		Outbox:       db.NewOutboxRepo(alkemioPool),
+		Pipeline:     pipeline,
+		ListenPool:   alkemioPool.Pool,
+		Concurrency:  cfg.Concurrency,
+		OnDeadLetter: mx.DeadLetter,
+		Logger:       logger,
 	})
 
 	srv := startHTTP(cfg.MetricsPort, httpapi.Deps{
@@ -203,6 +208,15 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 		targets = append(targets, domain.Target{Sink: sink, Required: t.Required, Codec: codec})
 	}
 	return targets, nil
+}
+
+func hasRequired(targets []domain.Target) bool {
+	for _, t := range targets {
+		if t.Required {
+			return true
+		}
+	}
+	return false
 }
 
 func buildSink(t config.Target) (domain.Sink, error) {

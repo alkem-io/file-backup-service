@@ -29,6 +29,8 @@ type Deps struct {
 	// StaleTTL is how long a claimed entry may stay in_progress before the reaper
 	// returns it to pending.
 	StaleTTL time.Duration
+	// OnDeadLetter is called whenever an entry is moved to dead-letter (optional).
+	OnDeadLetter func()
 	// Logger is the structured logger.
 	Logger *zap.Logger
 }
@@ -93,6 +95,7 @@ func (c *Consumer) listen(ctx context.Context, wake chan<- struct{}) {
 		}
 		for ctx.Err() == nil {
 			if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+				sleep(ctx, time.Second) // avoid busy re-acquire on a broken notify conn
 				break
 			}
 			select {
@@ -132,16 +135,28 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 	switch {
 	case err != nil:
 		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))
-		if ferr := c.d.Outbox.Fail(ctx, e.ID, err.Error()); ferr != nil {
-			c.d.Logger.Error("mark fail", zap.Int64("id", e.ID), zap.Error(ferr))
-		}
+		c.fail(ctx, e.ID, err.Error())
 	case !ok:
-		if ferr := c.d.Outbox.Fail(ctx, e.ID, "not all required targets stored"); ferr != nil {
-			c.d.Logger.Error("mark fail", zap.Int64("id", e.ID), zap.Error(ferr))
-		}
+		c.fail(ctx, e.ID, "not all required targets stored")
 	default:
 		if derr := c.d.Outbox.MarkDone(ctx, e.ID); derr != nil {
 			c.d.Logger.Error("mark done", zap.Int64("id", e.ID), zap.Error(derr))
+		}
+	}
+}
+
+// fail marks an entry failed and fires the dead-letter observer when it crosses
+// the attempt limit.
+func (c *Consumer) fail(ctx context.Context, id int64, reason string) {
+	deadLettered, err := c.d.Outbox.Fail(ctx, id, reason)
+	if err != nil {
+		c.d.Logger.Error("mark fail", zap.Int64("id", id), zap.Error(err))
+		return
+	}
+	if deadLettered {
+		c.d.Logger.Error("dead-lettered", zap.Int64("id", id), zap.String("reason", reason))
+		if c.d.OnDeadLetter != nil {
+			c.d.OnDeadLetter()
 		}
 	}
 }
