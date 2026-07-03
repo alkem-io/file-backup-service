@@ -20,6 +20,9 @@ func (f *fakeLedger) UpsertTargetStatus(context.Context, string, string, string,
 	f.statuses++
 	return nil
 }
+func (f *fakeLedger) TargetState(context.Context, string, string) (string, int64, error) {
+	return "", 0, nil
+}
 
 type memSink struct {
 	name  string
@@ -69,7 +72,14 @@ func TestPipelineBackupOne(t *testing.T) {
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := &memSink{name: "t1", store: map[string][]byte{}}
 	p := NewPipeline(fakeSource{[]byte("wrong")}, &fakeLedger{}, []Target{{Sink: sink, Required: true}})
-	if _, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "deadbeef"}); err == nil {
-		t.Fatal("expected source integrity error")
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "deadbeef"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatal("expected required target to fail the integrity check")
+	}
+	if len(sink.store) != 0 {
+		t.Fatal("corrupt object must not be committed to the sink")
 	}
 }

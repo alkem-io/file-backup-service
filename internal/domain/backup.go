@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -21,69 +20,76 @@ type Target struct {
 type Pipeline struct {
 	// Source fetches object bytes by file id.
 	Source Source
-	// Ledger records object + per-target status.
+	// Ledger records object + per-target status and answers dedup.
 	Ledger Ledger
 	// Targets are the configured sinks.
 	Targets []Target
-	// MinGain is the adaptive-compression keep threshold.
-	MinGain float64
 	// Metrics receives observations (Nop if unset).
 	Metrics Metrics
 }
 
-// NewPipeline constructs a Pipeline with the default compression threshold.
+// NewPipeline constructs a Pipeline.
 func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
-	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, MinGain: DefaultMinGain, Metrics: Nop{}}
+	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, Metrics: Nop{}}
 }
 
-// BackupOne fetches the object, verifies it against its content hash, and stores
-// it on every target. Returns true when all REQUIRED targets stored successfully.
-//
-// The object is buffered in memory because adaptive compression must compare
-// sizes. TODO(large-object streaming) for multi-hundred-MB objects.
+// BackupOne stores the object on every target, fully streamed (bounded memory).
+// Dedup is answered by our own ledger — never by re-reading the target — so it
+// works with PutObject-only credentials on an immutable/WORM target. Returns true
+// when all REQUIRED targets are stored.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
-	rc, err := p.Source.FetchContent(ctx, e.FileID)
-	if err != nil {
-		return false, err
-	}
-	data, err := io.ReadAll(rc)
-	_ = rc.Close()
-	if err != nil {
-		return false, fmt.Errorf("read source: %w", err)
-	}
-	if ok, _ := Verify(e.ExternalID, bytes.NewReader(data)); !ok {
-		return false, fmt.Errorf("source integrity: bytes do not match %s", e.ExternalID)
-	}
-	if err := p.Ledger.UpsertObject(ctx, ObjectMeta{ExternalID: e.ExternalID, Size: int64(len(data))}); err != nil {
-		return false, fmt.Errorf("ledger object: %w", err)
-	}
 	allRequiredOK := true
+	size := int64(-1)
 	for _, t := range p.Targets {
-		if err := p.storeOne(ctx, t, e.ExternalID, data); err != nil && t.Required {
-			allRequiredOK = false
+		name := t.Sink.Name()
+		if state, _, err := p.Ledger.TargetState(ctx, e.ExternalID, name); err == nil && state == "stored" {
+			p.Metrics.ObjectDedup(name)
+			continue
+		}
+		plaintext, stored, err := p.streamToTarget(ctx, t, e)
+		if err != nil {
+			p.Metrics.ObjectFailed(name)
+			_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
+			if t.Required {
+				allRequiredOK = false
+			}
+			continue
+		}
+		size = plaintext
+		p.Metrics.ObjectStored(name, stored)
+		if err := p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "stored", stored); err != nil {
+			return false, fmt.Errorf("ledger target status: %w", err)
+		}
+	}
+	if size >= 0 {
+		if err := p.Ledger.UpsertObject(ctx, ObjectMeta{ExternalID: e.ExternalID, Size: size}); err != nil {
+			return false, fmt.Errorf("ledger object: %w", err)
 		}
 	}
 	return allRequiredOK, nil
 }
 
-func (p *Pipeline) storeOne(ctx context.Context, t Target, hash string, data []byte) error {
-	name := t.Sink.Name()
-	if present, err := t.Sink.Exists(ctx, hash); err == nil && present {
-		p.Metrics.ObjectDedup(name)
-		return p.Ledger.UpsertTargetStatus(ctx, hash, name, "stored", int64(len(data)))
-	}
-	payload := data
-	if t.Codec == CodecZstd {
-		if comp, kept, cerr := CompressAdaptive(data, p.MinGain); cerr == nil && kept {
-			payload = comp
-		}
-	}
-	n, err := t.Sink.Store(ctx, hash, bytes.NewReader(payload), int64(len(payload)))
+// streamToTarget streams the object from the source through a hash-verifying
+// reader (and the target codec) straight into the sink. The VerifyReader fails
+// the stream at EOF on a hash mismatch, so the sink's atomic write never commits
+// corrupt data. Returns the plaintext size and the stored (post-codec) size.
+func (p *Pipeline) streamToTarget(ctx context.Context, t Target, e OutboxEntry) (plaintext int64, stored int64, err error) {
+	rc, err := p.Source.FetchContent(ctx, e.FileID)
 	if err != nil {
-		p.Metrics.ObjectFailed(name)
-		_ = p.Ledger.UpsertTargetStatus(ctx, hash, name, "failed", 0)
-		return err
+		return 0, 0, err
 	}
-	p.Metrics.ObjectStored(name, n)
-	return p.Ledger.UpsertTargetStatus(ctx, hash, name, "stored", n)
+	defer func() { _ = rc.Close() }()
+
+	vr := NewVerifyReader(rc, e.ExternalID)
+	var reader io.Reader = vr
+	if t.Codec == CodecZstd {
+		zr := ZstdReader(vr)
+		defer func() { _ = zr.Close() }()
+		reader = zr
+	}
+	stored, err = t.Sink.Store(ctx, e.ExternalID, reader, -1)
+	if err != nil {
+		return 0, 0, err
+	}
+	return vr.Total, stored, nil
 }

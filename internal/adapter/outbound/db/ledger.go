@@ -2,7 +2,10 @@ package db
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db/queries"
@@ -35,6 +38,22 @@ func (r *LedgerRepo) UpsertTargetStatus(ctx context.Context, externalID, target,
 		State:       state,
 		StoredBytes: pgtype.Int8{Int64: storedBytes, Valid: true},
 	})
+}
+
+// TargetState returns the recorded (state, storedBytes) for (externalID, target).
+func (r *LedgerRepo) TargetState(ctx context.Context, externalID, target string) (string, int64, error) {
+	row, err := r.q.GetTargetStatus(ctx, queries.GetTargetStatusParams{ExternalID: externalID, Target: target})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", 0, nil
+		}
+		return "", 0, fmt.Errorf("get target status: %w", err)
+	}
+	var stored int64
+	if row.StoredBytes.Valid {
+		stored = row.StoredBytes.Int64
+	}
+	return row.State, stored, nil
 }
 
 func uuidOrNull(s string) pgtype.UUID {

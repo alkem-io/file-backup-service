@@ -20,10 +20,6 @@ const (
 	CodecZstd Codec = "zstd"
 )
 
-// DefaultMinGain is the minimum fractional size reduction for CompressAdaptive to
-// keep the compressed form (3%).
-const DefaultMinGain = 0.03
-
 // Encode streams r into w applying codec.
 func Encode(w io.Writer, r io.Reader, codec Codec) error {
 	switch codec {
@@ -50,19 +46,16 @@ func Encode(w io.Writer, r io.Reader, codec Codec) error {
 	}
 }
 
-// CompressAdaptive returns zstd(data) when it is at least minGain smaller than
-// data (the bool reports that compression was kept); otherwise it returns data
-// unchanged. This is the "keep only if meaningfully smaller" rule — the stored
-// form is always self-describing via the hash-arbiter on restore.
-func CompressAdaptive(data []byte, minGain float64) ([]byte, bool, error) {
-	var buf bytes.Buffer
-	if err := Encode(&buf, bytes.NewReader(data), CodecZstd); err != nil {
-		return nil, false, err
-	}
-	if float64(buf.Len()) <= float64(len(data))*(1-minGain) {
-		return buf.Bytes(), true, nil
-	}
-	return data, false, nil
+// ZstdReader returns a reader that zstd-compresses src on the fly (streamed via a
+// pipe, no full-object buffer). Close it after the consuming call to release the
+// worker goroutine — errors from src (e.g. a VerifyReader integrity failure)
+// propagate to the reader so a downstream Sink never commits bad data.
+func ZstdReader(src io.Reader) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		pw.CloseWithError(Encode(pw, src, CodecZstd))
+	}()
+	return pr
 }
 
 // DecodeArbiter reverses the transform using the content hash as the sole

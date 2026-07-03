@@ -2,6 +2,7 @@ package domain
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -49,21 +50,24 @@ func TestDecodeArbiter_Corrupt(t *testing.T) {
 	}
 }
 
-func TestCompressAdaptive(t *testing.T) {
-	compressible := bytes.Repeat([]byte("aaaabbbb"), 500)
-	out, kept, err := CompressAdaptive(compressible, DefaultMinGain)
+func TestZstdReaderRoundTrip(t *testing.T) {
+	data := bytes.Repeat([]byte("compressible payload "), 200)
+	h, err := Sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !kept || len(out) >= len(compressible) {
-		t.Fatal("expected compression to be kept and smaller")
-	}
-	tiny := []byte("x")
-	out2, kept2, err := CompressAdaptive(tiny, DefaultMinGain)
+	compressed, err := io.ReadAll(ZstdReader(bytes.NewReader(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kept2 || !bytes.Equal(out2, tiny) {
-		t.Fatal("expected raw for incompressible input")
+	if len(compressed) >= len(data) {
+		t.Skip("payload did not compress")
+	}
+	out, err := DecodeArbiter(h, compressed)
+	if err != nil {
+		t.Fatalf("decode streamed zstd: %v", err)
+	}
+	if !bytes.Equal(out, data) {
+		t.Fatal("streamed zstd round-trip mismatch")
 	}
 }

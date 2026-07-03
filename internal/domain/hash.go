@@ -4,6 +4,7 @@ import (
 	"crypto/sha3"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 )
 
@@ -24,4 +25,36 @@ func Verify(want string, r io.Reader) (bool, error) {
 		return false, err
 	}
 	return got == want, nil
+}
+
+// VerifyReader streams bytes through while hashing them; at EOF it returns an
+// error if the accumulated SHA3-256 does not match want — so a downstream writer
+// (a Sink) sees the error mid-stream and never commits corrupt or wrong-hash
+// data. Total is the plaintext byte count seen so far. This makes integrity a
+// property of the stream, with no whole-object buffering.
+type VerifyReader struct {
+	r     io.Reader
+	h     hash.Hash
+	want  string
+	Total int64
+}
+
+// NewVerifyReader wraps r, verifying against want.
+func NewVerifyReader(r io.Reader, want string) *VerifyReader {
+	return &VerifyReader{r: r, h: sha3.New256(), want: want}
+}
+
+// Read implements io.Reader.
+func (v *VerifyReader) Read(p []byte) (int, error) {
+	n, err := v.r.Read(p)
+	if n > 0 {
+		_, _ = v.h.Write(p[:n])
+		v.Total += int64(n)
+	}
+	if err == io.EOF {
+		if got := hex.EncodeToString(v.h.Sum(nil)); got != v.want {
+			return n, fmt.Errorf("integrity: stream hash %s != %s", got, v.want)
+		}
+	}
+	return n, err
 }

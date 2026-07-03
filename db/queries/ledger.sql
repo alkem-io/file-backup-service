@@ -11,3 +11,7 @@ DO UPDATE SET state = EXCLUDED.state, "storedBytes" = EXCLUDED."storedBytes", "v
 
 -- name: GetObject :one
 SELECT * FROM file_backup_object WHERE "externalID" = $1;
+
+-- name: GetTargetStatus :one
+SELECT state, "storedBytes" FROM file_backup_target_status
+WHERE "externalID" = $1 AND target = $2;

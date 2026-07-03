@@ -29,6 +29,28 @@ func (q *Queries) GetObject(ctx context.Context, externalid string) (FileBackupO
 	return i, err
 }
 
+const getTargetStatus = `-- name: GetTargetStatus :one
+SELECT state, "storedBytes" FROM file_backup_target_status
+WHERE "externalID" = $1 AND target = $2
+`
+
+type GetTargetStatusParams struct {
+	ExternalID string `json:"externalID"`
+	Target     string `json:"target"`
+}
+
+type GetTargetStatusRow struct {
+	State       string      `json:"state"`
+	StoredBytes pgtype.Int8 `json:"storedBytes"`
+}
+
+func (q *Queries) GetTargetStatus(ctx context.Context, arg GetTargetStatusParams) (GetTargetStatusRow, error) {
+	row := q.db.QueryRow(ctx, getTargetStatus, arg.ExternalID, arg.Target)
+	var i GetTargetStatusRow
+	err := row.Scan(&i.State, &i.StoredBytes)
+	return i, err
+}
+
 const upsertObject = `-- name: UpsertObject :exec
 INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate", "mimeType")
 VALUES ($1, $2, $3, $4, $5)

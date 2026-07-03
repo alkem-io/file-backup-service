@@ -42,15 +42,13 @@ func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 	}
 }
 
-// Store writes bytes for hash if absent (atomic temp+rename).
+// Store writes bytes for hash (atomic temp+rename). Dedup is the pipeline's job
+// (via the ledger); Store always writes so the stream is consumed and the real
+// byte count is returned — an identical existing object is just overwritten
+// atomically.
 //
 // TODO(T012): chmod to the configured mode (664) after rename.
-func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, _ int64) (int64, error) {
-	if ok, err := s.Exists(ctx, hash); err != nil {
-		return 0, err
-	} else if ok {
-		return 0, nil // dedup
-	}
+func (s *Sink) Store(_ context.Context, hash string, r io.Reader, _ int64) (int64, error) {
 	dest := s.pathFor(hash)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
 		return 0, fmt.Errorf("mkdir: %w", err)

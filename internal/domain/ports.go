@@ -42,4 +42,8 @@ type Ledger interface {
 	UpsertObject(ctx context.Context, e ObjectMeta) error
 	// UpsertTargetStatus records per-(object,target) completion.
 	UpsertTargetStatus(ctx context.Context, externalID, target, state string, storedBytes int64) error
+	// TargetState returns the recorded (state, storedBytes) for (externalID,
+	// target), or ("", 0, nil) when unknown. Used for dedup without touching the
+	// target (works with PutObject-only WORM credentials).
+	TargetState(ctx context.Context, externalID, target string) (string, int64, error)
 }
