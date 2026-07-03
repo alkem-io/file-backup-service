@@ -23,7 +23,7 @@ type Deps struct {
 	Pipeline *domain.Pipeline
 	// ListenPool is used for LISTEN on the Alkemio DB (best-effort wakeups).
 	ListenPool *pgxpool.Pool
-	// Concurrency is the number of in-flight objects per drain batch.
+	// Concurrency is the number of concurrent self-claiming worker goroutines.
 	Concurrency int
 	// PollEvery is the polling floor.
 	PollEvery time.Duration
@@ -62,30 +62,61 @@ func New(d Deps) *Consumer {
 	return &Consumer{d: d}
 }
 
-// Run starts a fixed pool of Concurrency workers fed by a dispatcher, plus the
-// LISTEN and reaper goroutines. On ctx cancellation the dispatcher stops, the
-// work channel closes, and Run blocks until every worker finishes its in-flight
-// object — a clean graceful drain (no batch barrier, no stranded goroutines).
+// Run starts a fixed pool of Concurrency self-claiming workers plus the LISTEN and
+// reaper goroutines, and blocks until every one returns on ctx cancellation — a
+// clean graceful drain with no stranded rows or goroutines. Awaiting listen/reap
+// too means the caller's pools aren't closed under a still-running goroutine.
 func (c *Consumer) Run(ctx context.Context) error {
 	wake := make(chan struct{}, 1)
-	go c.listen(ctx, wake)
-	go c.reap(ctx)
-
-	work := make(chan domain.OutboxEntry)
 	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); c.listen(ctx, wake) }()
+	go func() { defer wg.Done(); c.reap(ctx) }()
 	for i := 0; i < c.d.Concurrency; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for e := range work {
-				c.process(ctx, e)
-			}
-		}()
+		go func() { defer wg.Done(); c.worker(ctx, wake) }()
 	}
-	c.dispatch(ctx, wake, work)
-	close(work)
 	wg.Wait()
 	return ctx.Err()
+}
+
+// worker claims and processes ONE object at a time until ctx is cancelled.
+// Claiming per-object (not a Concurrency-sized batch) keeps claimedAt≈process
+// start, so the reaper never mistakes a still-queued row for a crashed one, and a
+// graceful shutdown strands nothing — a worker only ever holds the single row it
+// is actively processing, which process() releases on cancel. On a successful
+// claim it wakes a sibling so a NOTIFY burst fans out across all workers instead
+// of one worker draining it solo.
+func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
+	ticker := time.NewTicker(c.d.PollEvery)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		entries, err := c.d.Outbox.Claim(ctx, 1)
+		if err != nil {
+			c.d.Logger.Error("claim outbox", zap.Error(err))
+			backoff(ctx) // don't hot-loop a broken DB
+			continue
+		}
+		if len(entries) == 1 {
+			signal(wake) // cascade the drain: wake a sibling to grab the next row
+			c.process(ctx, entries[0])
+			continue // immediately try for the next
+		}
+		select { // outbox empty — wait for a NOTIFY wakeup or the poll floor
+		case <-ctx.Done():
+			return
+		case <-wake:
+		case <-ticker.C:
+		}
+	}
+}
+
+// signal does a non-blocking send — a coalescing wakeup.
+func signal(ch chan<- struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
 }
 
 // listen LISTENs for NOTIFY and signals wake. Best-effort: the polling floor and
@@ -97,59 +128,22 @@ func (c *Consumer) listen(ctx context.Context, wake chan<- struct{}) {
 	for ctx.Err() == nil {
 		conn, err := c.d.ListenPool.Acquire(ctx)
 		if err != nil {
-			sleep(ctx, time.Second)
+			backoff(ctx)
 			continue
 		}
 		if _, err := conn.Exec(ctx, "LISTEN file_backup_outbox"); err != nil {
 			conn.Release()
-			sleep(ctx, time.Second)
+			backoff(ctx)
 			continue
 		}
 		for ctx.Err() == nil {
 			if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
-				sleep(ctx, time.Second) // avoid busy re-acquire on a broken notify conn
+				backoff(ctx) // avoid busy re-acquire on a broken notify conn
 				break
 			}
-			select {
-			case wake <- struct{}{}:
-			default:
-			}
+			signal(wake)
 		}
 		conn.Release()
-	}
-}
-
-// dispatch claims pending entries and feeds the worker pool, blocking on a free
-// worker (natural backpressure) — so a slow object never idles the other workers
-// (no batch barrier). When the outbox is empty it waits on a NOTIFY wakeup or the
-// polling floor. Returns promptly on ctx cancellation so shutdown is clean.
-func (c *Consumer) dispatch(ctx context.Context, wake <-chan struct{}, work chan<- domain.OutboxEntry) {
-	ticker := time.NewTicker(c.d.PollEvery)
-	defer ticker.Stop()
-	for ctx.Err() == nil {
-		for ctx.Err() == nil {
-			entries, err := c.d.Outbox.Claim(ctx, c.d.Concurrency)
-			if err != nil {
-				c.d.Logger.Error("claim outbox", zap.Error(err))
-				break
-			}
-			if len(entries) == 0 {
-				break
-			}
-			for _, e := range entries {
-				select {
-				case work <- e:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-wake:
-		case <-ticker.C:
-		}
 	}
 }
 
@@ -217,8 +211,19 @@ func (c *Consumer) fail(ctx context.Context, id int64, reason string) {
 // ~StaleTTL rather than up to 2×.
 func (c *Consumer) reap(ctx context.Context) {
 	sweep := func() {
-		if err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL); err != nil {
+		deadLettered, err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL)
+		if err != nil {
 			c.d.Logger.Error("reap stale", zap.Error(err))
+			return
+		}
+		// A crash-loop dead-letter happens HERE (not via Fail), so it must fire the
+		// same observer/metric — otherwise the exact case the delivery-count bound
+		// exists for is invisible to alerting.
+		if deadLettered > 0 {
+			c.d.Logger.Error("crash-loop dead-lettered", zap.Int("count", deadLettered))
+			for i := 0; i < deadLettered && c.d.OnDeadLetter != nil; i++ {
+				c.d.OnDeadLetter()
+			}
 		}
 	}
 	interval := c.d.StaleTTL / 4
@@ -238,8 +243,10 @@ func (c *Consumer) reap(ctx context.Context) {
 	}
 }
 
-func sleep(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
+// backoff waits ~1s or until ctx is cancelled — avoids hot-looping a transient
+// DB / notify error.
+func backoff(ctx context.Context) {
+	t := time.NewTimer(time.Second)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():

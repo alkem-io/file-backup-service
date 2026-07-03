@@ -93,14 +93,21 @@ const maxAttempts = 10
 // (counted by the reaper). Set well above any slow object's expected reap count.
 const maxDeliveries = 50
 
-// Probe verifies the outbox is reachable via the scoped role (table + SELECT).
-// An empty table (ErrNoRows) is success — only a missing table / lost permission
-// is an error.
+// Probe verifies the outbox is reachable via the scoped role AND carries every
+// column the consumer depends on. Selecting the actual columns (not SELECT 1)
+// turns a stale/missing server migration into a loud startup failure instead of a
+// green-health silent stall where every Claim errors on a missing column. An empty
+// table (ErrNoRows) is success.
 func (r *OutboxRepo) Probe(ctx context.Context) error {
-	var one int
-	err := r.p.QueryRow(ctx, `SELECT 1 FROM file_backup_outbox LIMIT 1`).Scan(&one)
+	var (
+		id   int64
+		cols any
+	)
+	const q = `SELECT id, "visibleAt", deliveries, attempts, "claimedAt", size
+	FROM file_backup_outbox LIMIT 1`
+	err := r.p.QueryRow(ctx, q).Scan(&id, &cols, &cols, &cols, &cols, &cols)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("outbox probe: %w", err)
+		return fmt.Errorf("outbox probe (scoped role / schema drift?): %w", err)
 	}
 	return nil
 }
@@ -121,15 +128,22 @@ WHERE id=$1 AND status='in_progress'`
 // counts them via `deliveries` and dead-letters a crash-looping object once it
 // exceeds maxDeliveries, so a poison object that repeatedly kills the worker
 // can't loop forever while a slow object (never reaped) is never penalised.
-func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) error {
-	const q = `UPDATE file_backup_outbox
-SET deliveries = deliveries + 1,
-    status = CASE WHEN deliveries + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
-    "lastError" = CASE WHEN deliveries + 1 >= $2 THEN 'crash-loop: exceeded max deliveries' ELSE "lastError" END,
-    "claimedAt" = NULL
-WHERE status='in_progress' AND "claimedAt" < now() - make_interval(secs => $1)`
-	if _, err := r.p.Exec(ctx, q, ttl.Seconds(), maxDeliveries); err != nil {
-		return fmt.Errorf("reap stale: %w", err)
+func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) (int, error) {
+	// Count the rows this sweep pushed to dead_letter so the caller fires the
+	// dead-letter observer — a crash-loop dead-letter happens here, not via Fail.
+	const q = `WITH reaped AS (
+    UPDATE file_backup_outbox
+    SET deliveries = deliveries + 1,
+        status = CASE WHEN deliveries + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
+        "lastError" = CASE WHEN deliveries + 1 >= $2 THEN 'crash-loop: exceeded max deliveries' ELSE "lastError" END,
+        "claimedAt" = NULL
+    WHERE status='in_progress' AND "claimedAt" < now() - make_interval(secs => $1)
+    RETURNING status
+)
+SELECT count(*) FILTER (WHERE status = 'dead_letter') FROM reaped`
+	var deadLettered int
+	if err := r.p.QueryRow(ctx, q, ttl.Seconds(), maxDeliveries).Scan(&deadLettered); err != nil {
+		return 0, fmt.Errorf("reap stale: %w", err)
 	}
-	return nil
+	return deadLettered, nil
 }

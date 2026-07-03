@@ -27,13 +27,17 @@ type Outbox interface {
 	// Fail records a failure — re-queues, or dead-letters past the attempt limit.
 	// Returns true when the entry was moved to dead-letter.
 	Fail(ctx context.Context, id int64, reason string) (bool, error)
-	// ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
-	ReapStale(ctx context.Context, ttl time.Duration) error
+	// ReapStale returns entries stuck in_progress past ttl to pending (crash safety)
+	// and dead-letters crash-loopers; it returns the number dead-lettered so the
+	// caller can fire the dead-letter observer.
+	ReapStale(ctx context.Context, ttl time.Duration) (int, error)
 	// Release returns a claim to pending WITHOUT counting an attempt — used on
 	// graceful shutdown, where a cancelled in-flight object is not a failure.
 	Release(ctx context.Context, id int64) error
-	// Probe verifies the outbox is reachable (table exists + SELECT permission) so
-	// a scoped-role/schema misconfig fails loudly at startup, not as a silent no-op.
+	// Probe verifies the outbox is reachable AND has the columns the consumer
+	// depends on (visibleAt/deliveries/attempts/claimedAt/size) so a scoped-role or
+	// schema/contract drift fails loudly at startup, not as a green-health silent
+	// stall where every Claim errors.
 	Probe(ctx context.Context) error
 }
 
