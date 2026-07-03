@@ -27,11 +27,13 @@ type Pipeline struct {
 	Targets []Target
 	// MinGain is the adaptive-compression keep threshold.
 	MinGain float64
+	// Metrics receives observations (Nop if unset).
+	Metrics Metrics
 }
 
 // NewPipeline constructs a Pipeline with the default compression threshold.
 func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
-	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, MinGain: DefaultMinGain}
+	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, MinGain: DefaultMinGain, Metrics: Nop{}}
 }
 
 // BackupOne fetches the object, verifies it against its content hash, and stores
@@ -65,8 +67,10 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 }
 
 func (p *Pipeline) storeOne(ctx context.Context, t Target, hash string, data []byte) error {
+	name := t.Sink.Name()
 	if present, err := t.Sink.Exists(ctx, hash); err == nil && present {
-		return p.Ledger.UpsertTargetStatus(ctx, hash, t.Sink.Name(), "stored", int64(len(data)))
+		p.Metrics.ObjectDedup(name)
+		return p.Ledger.UpsertTargetStatus(ctx, hash, name, "stored", int64(len(data)))
 	}
 	payload := data
 	if t.Codec == CodecZstd {
@@ -76,8 +80,10 @@ func (p *Pipeline) storeOne(ctx context.Context, t Target, hash string, data []b
 	}
 	n, err := t.Sink.Store(ctx, hash, bytes.NewReader(payload), int64(len(payload)))
 	if err != nil {
-		_ = p.Ledger.UpsertTargetStatus(ctx, hash, t.Sink.Name(), "failed", 0)
+		p.Metrics.ObjectFailed(name)
+		_ = p.Ledger.UpsertTargetStatus(ctx, hash, name, "failed", 0)
 		return err
 	}
-	return p.Ledger.UpsertTargetStatus(ctx, hash, t.Sink.Name(), "stored", n)
+	p.Metrics.ObjectStored(name, n)
+	return p.Ledger.UpsertTargetStatus(ctx, hash, name, "stored", n)
 }

@@ -16,6 +16,7 @@ import (
 
 	consumer "github.com/alkem-io/file-backup-service/internal/adapter/inbound/consumer"
 	httpapi "github.com/alkem-io/file-backup-service/internal/adapter/inbound/http"
+	"github.com/alkem-io/file-backup-service/internal/adapter/inbound/metrics"
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db"
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/fileservice"
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/sink/filesystem"
@@ -29,27 +30,37 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	cmd := os.Args[1]
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-	cfgPath := fs.String("config", "config.json", "path to the config file")
-	_ = fs.Parse(os.Args[2:])
-
-	switch cmd {
+	args := os.Args[2:]
+	var err error
+	switch os.Args[1] {
 	case "serve":
-		if err := serve(*cfgPath); err != nil && !errors.Is(err, context.Canceled) {
-			fatal(err)
+		err = serve(configFlag("serve", args))
+		if errors.Is(err, context.Canceled) {
+			err = nil
 		}
 	case "migrate":
-		if err := runMigrate(*cfgPath); err != nil {
-			fatal(err)
-		}
-	case "backfill", "restore", "verify", "reconcile", "drill":
-		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", cmd)
+		err = runMigrate(configFlag("migrate", args))
+	case "restore":
+		err = runRestore(args)
+	case "verify":
+		err = runVerify(args)
+	case "backfill", "reconcile", "drill":
+		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
 		os.Exit(1)
 	default:
 		usage()
 		os.Exit(2)
 	}
+	if err != nil {
+		fatal(err)
+	}
+}
+
+func configFlag(name string, args []string) string {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	cfgPath := fs.String("config", "config.json", "path to the config file")
+	_ = fs.Parse(args)
+	return *cfgPath
 }
 
 func runMigrate(cfgPath string) error {
@@ -74,14 +85,14 @@ func serve(cfgPath string) error {
 	}
 	logger, _ := zap.NewProduction()
 	defer func() { _ = logger.Sync() }()
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Degraded (health-only) mode when the databases are not configured.
+	mx := metrics.New()
+
 	if cfg.AlkemioDB == "" || cfg.LedgerDB == "" {
 		logger.Warn("databases not configured — running health-only (no backup)")
-		srv := startHTTP(cfg.MetricsPort, &httpapi.HealthHandler{}, logger)
+		srv := startHTTP(cfg.MetricsPort, httpapi.Deps{Health: &httpapi.HealthHandler{}, Metrics: mx.Handler(), Logger: logger}, logger)
 		defer shutdown(srv)
 		<-ctx.Done()
 		return ctx.Err()
@@ -102,11 +113,8 @@ func serve(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	pipeline := domain.NewPipeline(
-		fileservice.New(cfg.FileServiceBase, nil),
-		db.NewLedgerRepo(ledgerPool),
-		targets,
-	)
+	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), db.NewLedgerRepo(ledgerPool), targets)
+	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:      db.NewOutboxRepo(alkemioPool),
 		Pipeline:    pipeline,
@@ -115,25 +123,78 @@ func serve(cfgPath string) error {
 		Logger:      logger,
 	})
 
-	srv := startHTTP(cfg.MetricsPort, &httpapi.HealthHandler{Outbox: alkemioPool, Ledger: ledgerPool}, logger)
+	srv := startHTTP(cfg.MetricsPort, httpapi.Deps{
+		Health:  &httpapi.HealthHandler{Outbox: alkemioPool, Ledger: ledgerPool},
+		Metrics: mx.Handler(),
+		Logger:  logger,
+	}, logger)
 	defer shutdown(srv)
 
-	logger.Info("file-backup-service serving",
-		zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
+	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
 	return cons.Run(ctx)
+}
+
+func runRestore(args []string) error {
+	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.json", "config file")
+	hash := fs.String("hash", "", "content hash (externalID) to restore")
+	from := fs.String("from", "", "source target name")
+	to := fs.String("to", "/storage", "destination directory")
+	_ = fs.Parse(args)
+	if *hash == "" || *from == "" {
+		return errors.New("restore requires --hash and --from")
+	}
+	sink, err := sinkFor(*cfgPath, *from)
+	if err != nil {
+		return err
+	}
+	if err := domain.RestoreObject(context.Background(), sink, *hash, *to); err != nil {
+		return err
+	}
+	fmt.Printf("restored %s -> %s/%s\n", *hash, *to, *hash)
+	return nil
+}
+
+func runVerify(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.json", "config file")
+	hash := fs.String("hash", "", "content hash to verify")
+	from := fs.String("from", "", "source target name")
+	_ = fs.Parse(args)
+	if *hash == "" || *from == "" {
+		return errors.New("verify requires --hash and --from")
+	}
+	sink, err := sinkFor(*cfgPath, *from)
+	if err != nil {
+		return err
+	}
+	if err := domain.VerifyObject(context.Background(), sink, *hash); err != nil {
+		return err
+	}
+	fmt.Printf("verified %s on %s\n", *hash, *from)
+	return nil
+}
+
+// sinkFor loads config and builds the single named target's sink.
+func sinkFor(cfgPath, name string) (domain.Sink, error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+	for _, t := range cfg.Targets {
+		if t.Name == name {
+			return buildSink(t)
+		}
+	}
+	return nil, fmt.Errorf("target %q not found in config", name)
 }
 
 func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 	targets := make([]domain.Target, 0, len(cfgs))
 	for _, t := range cfgs {
-		var sink domain.Sink
-		switch t.Type {
-		case "filesystem":
-			sink = filesystem.New(t.Name, t.Path)
-		case "s3":
-			sink = s3.New(t.Name, t.Endpoint, t.Bucket, t.Prefix)
-		default:
-			return nil, fmt.Errorf("target %q: unknown type %q", t.Name, t.Type)
+		sink, err := buildSink(t)
+		if err != nil {
+			return nil, err
 		}
 		codec := domain.CodecNone
 		if t.Compression == string(domain.CodecZstd) {
@@ -144,10 +205,24 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 	return targets, nil
 }
 
-func startHTTP(port int, health *httpapi.HealthHandler, logger *zap.Logger) *http.Server {
+func buildSink(t config.Target) (domain.Sink, error) {
+	switch t.Type {
+	case "filesystem":
+		return filesystem.New(t.Name, t.Path), nil
+	case "s3":
+		return s3.New(s3.Config{
+			Name: t.Name, Endpoint: t.Endpoint, Bucket: t.Bucket, Prefix: t.Prefix,
+			AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,
+		})
+	default:
+		return nil, fmt.Errorf("target %q: unknown type %q", t.Name, t.Type)
+	}
+}
+
+func startHTTP(port int, deps httpapi.Deps, logger *zap.Logger) *http.Server {
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           httpapi.NewRouter(httpapi.Deps{Health: health, Logger: logger}),
+		Handler:           httpapi.NewRouter(deps),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -170,5 +245,5 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: file-backup-service <serve|migrate|backfill|restore|verify|reconcile|drill> [--config path]")
+	fmt.Fprintln(os.Stderr, "usage: file-backup-service <serve|migrate|restore|verify|backfill|reconcile|drill> [flags]")
 }

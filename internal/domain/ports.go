@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // OutboxEntry is a claimed backup-outbox row (Alkemio DB).
 type OutboxEntry struct {
@@ -21,6 +24,8 @@ type Outbox interface {
 	// Fail records a failure — re-queues with backoff, or dead-letters past the
 	// attempt limit.
 	Fail(ctx context.Context, id int64, reason string) error
+	// ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
+	ReapStale(ctx context.Context, ttl time.Duration) error
 }
 
 // ObjectMeta are the ledger breadcrumbs for one backed-up object.

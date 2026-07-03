@@ -19,6 +19,11 @@ type Target struct {
 	Compression    string `json:"compression,omitempty"` // "none" | "zstd"
 	Immutable      bool   `json:"immutable,omitempty"`
 	CredentialsRef string `json:"credentialsRef,omitempty"`
+	// S3 target credentials + options (templated from secrets in k8s).
+	AccessKey string `json:"accessKey,omitempty"`
+	SecretKey string `json:"secretKey,omitempty"`
+	UseSSL    bool   `json:"useSSL,omitempty"`
+	SSE       bool   `json:"sse,omitempty"` // server-side encryption at rest
 }
 
 // Config is the worker configuration.

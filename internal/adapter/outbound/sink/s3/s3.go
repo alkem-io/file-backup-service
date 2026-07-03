@@ -1,39 +1,110 @@
-// Package s3 implements the Sink port over S3-compatible object storage.
-//
-// TODO(T011): implement with aws-sdk-go-v2 (PutObject + HeadObject, SSE,
-// object-lock on the immutable target, PutObject-only creds, 2-level sharding).
+// Package s3 implements the Sink port over S3-compatible object storage
+// (Scaleway Object Storage), with server-side encryption and 2-level hex
+// sharding. Object-lock/WORM retention is a bucket-level policy (infra-ops); the
+// worker's credentials are PutObject-only on the immutable target.
 package s3
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
+	"path"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/encrypt"
 )
 
-var errNotImplemented = errors.New("s3 sink: not implemented (TODO T011)")
+// Config configures an S3 sink.
+type Config struct {
+	Name      string
+	Endpoint  string
+	Bucket    string
+	Prefix    string
+	AccessKey string
+	SecretKey string
+	UseSSL    bool
+	SSE       bool
+}
 
 // Sink is the S3-compatible target.
 type Sink struct {
-	name string
+	name   string
+	client *minio.Client
+	bucket string
+	prefix string
+	sse    encrypt.ServerSide
 }
 
-// New constructs an S3 Sink. The endpoint/bucket/prefix/credential arguments are
-// accepted here and wired in T011.
-func New(name string, _, _, _ string) *Sink { return &Sink{name: name} }
+// New constructs an S3 Sink.
+func New(cfg Config) (*Sink, error) {
+	client, err := minio.New(cfg.Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure: cfg.UseSSL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("s3 client %q: %w", cfg.Name, err)
+	}
+	s := &Sink{name: cfg.Name, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix}
+	if cfg.SSE {
+		s.sse = encrypt.NewSSE()
+	}
+	return s, nil
+}
 
 // Name returns the target name.
 func (s *Sink) Name() string { return s.name }
 
-// Store is not yet implemented.
-func (s *Sink) Store(context.Context, string, io.Reader, int64) (int64, error) {
-	return 0, errNotImplemented
+func (s *Sink) key(hash string) string {
+	if len(hash) >= 4 {
+		return path.Join(s.prefix, hash[0:2], hash[2:4], hash)
+	}
+	return path.Join(s.prefix, hash)
 }
 
-// Exists is not yet implemented.
-func (s *Sink) Exists(context.Context, string) (bool, error) { return false, errNotImplemented }
+func (s *Sink) putOpts() minio.PutObjectOptions {
+	opts := minio.PutObjectOptions{}
+	if s.sse != nil {
+		opts.ServerSideEncryption = s.sse
+	}
+	return opts
+}
 
-// Fetch is not yet implemented.
-func (s *Sink) Fetch(context.Context, string) (io.ReadCloser, error) { return nil, errNotImplemented }
+// Exists reports whether the object is present.
+func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
+	_, err := s.client.StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
+	if err != nil {
+		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat: %w", err)
+	}
+	return true, nil
+}
 
-// PutManifest is not yet implemented.
-func (s *Sink) PutManifest(context.Context, string, io.Reader) error { return errNotImplemented }
+// Store uploads bytes for hash (SSE applied; bucket default retention provides WORM).
+func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, size int64) (int64, error) {
+	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), r, size, s.putOpts())
+	if err != nil {
+		return 0, fmt.Errorf("put: %w", err)
+	}
+	return info.Size, nil
+}
+
+// Fetch streams the stored object.
+func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
+	obj, err := s.client.GetObject(ctx, s.bucket, s.key(hash), minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get: %w", err)
+	}
+	return obj, nil
+}
+
+// PutManifest writes a ledger snapshot object under _manifest/.
+func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
+	key := path.Join(s.prefix, "_manifest", name)
+	if _, err := s.client.PutObject(ctx, s.bucket, key, r, -1, s.putOpts()); err != nil {
+		return fmt.Errorf("put manifest: %w", err)
+	}
+	return nil
+}

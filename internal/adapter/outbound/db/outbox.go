@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
@@ -71,3 +72,14 @@ WHERE id = $1`
 
 // maxAttempts is the dead-letter threshold (configurable later — FR-006).
 const maxAttempts = 10
+
+// ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
+func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) error {
+	const q = `UPDATE file_backup_outbox
+SET status='pending', "claimedAt"=NULL
+WHERE status='in_progress' AND "claimedAt" < now() - make_interval(secs => $1)`
+	if _, err := r.p.Exec(ctx, q, ttl.Seconds()); err != nil {
+		return fmt.Errorf("reap stale: %w", err)
+	}
+	return nil
+}

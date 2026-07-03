@@ -26,6 +26,9 @@ type Deps struct {
 	Concurrency int
 	// PollEvery is the polling floor.
 	PollEvery time.Duration
+	// StaleTTL is how long a claimed entry may stay in_progress before the reaper
+	// returns it to pending.
+	StaleTTL time.Duration
 	// Logger is the structured logger.
 	Logger *zap.Logger
 }
@@ -41,6 +44,9 @@ func New(d Deps) *Consumer {
 	if d.PollEvery <= 0 {
 		d.PollEvery = 10 * time.Second
 	}
+	if d.StaleTTL <= 0 {
+		d.StaleTTL = 15 * time.Minute
+	}
 	if d.Logger == nil {
 		d.Logger = zap.NewNop()
 	}
@@ -51,6 +57,7 @@ func New(d Deps) *Consumer {
 func (c *Consumer) Run(ctx context.Context) error {
 	wake := make(chan struct{}, 1)
 	go c.listen(ctx, wake)
+	go c.reap(ctx)
 
 	c.drain(ctx) // startup backlog drain
 	ticker := time.NewTicker(c.d.PollEvery)
@@ -135,6 +142,22 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 	default:
 		if derr := c.d.Outbox.MarkDone(ctx, e.ID); derr != nil {
 			c.d.Logger.Error("mark done", zap.Int64("id", e.ID), zap.Error(derr))
+		}
+	}
+}
+
+// reap periodically returns stale in_progress entries to pending.
+func (c *Consumer) reap(ctx context.Context) {
+	t := time.NewTicker(c.d.StaleTTL)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL); err != nil {
+				c.d.Logger.Error("reap stale", zap.Error(err))
+			}
 		}
 	}
 }

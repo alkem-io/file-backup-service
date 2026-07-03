@@ -33,6 +33,8 @@ func ServeLive(w http.ResponseWriter, _ *http.Request) {
 type Deps struct {
 	// Health is the readiness handler (pings dependencies).
 	Health *HealthHandler
+	// Metrics is the Prometheus handler (optional).
+	Metrics http.Handler
 	// Logger is the structured logger.
 	Logger *zap.Logger
 }
@@ -46,9 +48,9 @@ func NewRouter(deps Deps) *chi.Mux {
 	r.Get("/live", ServeLive)
 	// Readiness (K8s readinessProbe): checks the outbox + ledger DBs.
 	r.Method(http.MethodGet, "/health", deps.Health)
-	// Metrics. TODO(T031): serve Prometheus metrics via promhttp.
-	r.Get("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+	// Metrics (Prometheus).
+	if deps.Metrics != nil {
+		r.Handle("/metrics", deps.Metrics)
+	}
 	return r
 }
