@@ -1,44 +1,84 @@
-// Package config loads the file-backup-service worker configuration.
+// Package config loads the file-backup-service worker configuration: a YAML base
+// (structure, incl. the symmetric target list) overlaid by 12-factor environment
+// variables. Env wins; secrets (DB passwords, S3 keys) come from env only.
+//
+//	Scalars:     FBS_FILESERVICEBASE, FBS_CONCURRENCY, FBS_METRICSPORT, ...
+//	DB parts:    FBS_ALKEMIODB_HOST/PORT/USER/PASSWORD/DBNAME/SSLMODE, FBS_LEDGERDB_*
+//	Per target:  FBS_TARGET_<NAME>_ACCESSKEY / _SECRETKEY / _BUCKET / ...
+//	             (<NAME> = target name upcased, non-alphanumerics -> '_')
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-// Target is one configured backup sink.
+const envPrefix = "FBS_"
+
+// Target is one configured backup sink (symmetric — no required/optional).
 type Target struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"` // "s3" | "filesystem"
-	Endpoint    string `json:"endpoint,omitempty"`
-	Region      string `json:"region,omitempty"` // s3 region (Scaleway can't auto-discover on PutObject-only creds)
-	Bucket      string `json:"bucket,omitempty"`
-	Prefix      string `json:"prefix,omitempty"`
-	Path        string `json:"path,omitempty"`
-	Compression string `json:"compression,omitempty"` // "" | "none" | "zstd"
-	// S3 target credentials + options (templated from secrets in k8s).
-	AccessKey string `json:"accessKey,omitempty"`
-	SecretKey string `json:"secretKey,omitempty"`
-	UseSSL    bool   `json:"useSSL,omitempty"`
-	SSE       bool   `json:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
-	Insecure  bool   `json:"insecure,omitempty"` // conscious opt-out of the TLS+SSE requirement (local dev only)
+	Name        string `yaml:"name"`
+	Type        string `yaml:"type"` // "s3" | "filesystem"
+	Endpoint    string `yaml:"endpoint,omitempty"`
+	Region      string `yaml:"region,omitempty"` // s3 region (Scaleway can't auto-discover on PutObject-only creds)
+	Bucket      string `yaml:"bucket,omitempty"`
+	Prefix      string `yaml:"prefix,omitempty"`
+	Path        string `yaml:"path,omitempty"`
+	Compression string `yaml:"compression,omitempty"` // "" | "none" | "zstd"
+	AccessKey   string `yaml:"accessKey,omitempty"`   // secret — normally injected via env
+	SecretKey   string `yaml:"secretKey,omitempty"`   // secret — normally injected via env
+	UseSSL      bool   `yaml:"useSSL,omitempty"`
+	SSE         bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
+	Insecure    bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
+}
+
+// DBConfig is a Postgres connection built from parts (so deployments can reuse
+// the shared DATABASE_HOST/PORT via env and keep the password in a secret).
+type DBConfig struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	DBName   string `yaml:"dbName"`
+	SSLMode  string `yaml:"sslMode"`
+}
+
+// DSN renders a libpq keyword DSN (accepted by both pgxpool and the migrate step).
+func (d DBConfig) DSN() string {
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode)
+}
+
+func (d DBConfig) validate(name string) error {
+	switch {
+	case d.Host == "":
+		return fmt.Errorf("%s.host is required", name)
+	case d.User == "":
+		return fmt.Errorf("%s.user is required", name)
+	case d.DBName == "":
+		return fmt.Errorf("%s.dbName is required", name)
+	}
+	return nil
 }
 
 // Config is the worker configuration.
 type Config struct {
-	FileServiceBase     string   `json:"fileServiceBase"`
-	AlkemioDB           string   `json:"alkemioDB"` // scoped role: outbox SELECT/UPDATE
-	LedgerDB            string   `json:"ledgerDB"`  // this service's own database
-	Targets             []Target `json:"targets"`
-	Concurrency         int      `json:"concurrency"`
-	BackfillRatePerSec  int      `json:"backfillRatePerSec"`
-	MetricsPort         int      `json:"metricsPort"`
-	PerObjectTimeoutSec int      `json:"perObjectTimeoutSec"` // per-object backup deadline
-	StaleTTLSec         int      `json:"staleTTLSec"`         // reap in_progress older than this
-	PollEverySec        int      `json:"pollEverySec"`        // polling floor
+	FileServiceBase     string   `yaml:"fileServiceBase"`
+	AlkemioDB           DBConfig `yaml:"alkemioDB"`
+	LedgerDB            DBConfig `yaml:"ledgerDB"`
+	Targets             []Target `yaml:"targets"`
+	Concurrency         int      `yaml:"concurrency"`
+	BackfillRatePerSec  int      `yaml:"backfillRatePerSec"`
+	MetricsPort         int      `yaml:"metricsPort"`
+	PerObjectTimeoutSec int      `yaml:"perObjectTimeoutSec"`
+	StaleTTLSec         int      `yaml:"staleTTLSec"`
+	PollEverySec        int      `yaml:"pollEverySec"`
 }
 
 // PerObjectTimeout is the per-object backup deadline.
@@ -52,18 +92,72 @@ func (c *Config) StaleTTL() time.Duration { return time.Duration(c.StaleTTLSec) 
 // PollEvery is the polling floor.
 func (c *Config) PollEvery() time.Duration { return time.Duration(c.PollEverySec) * time.Second }
 
-// Load reads a JSON config file, applies defaults, and validates it.
-//
-// TODO(008): switch to YAML (matches quickstart) once a yaml dependency lands.
+// Load reads YAML from path (if present — env-only is also valid), overlays env
+// (FBS_* scalars/DB, FBS_TARGET_<NAME>_* per target), then applies defaults.
+// Validation is a serve-time concern (Config.Validate).
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path) //nolint:gosec // operator-supplied config path
-	if err != nil {
-		return nil, fmt.Errorf("read config %q: %w", path, err)
-	}
 	var c Config
-	if err := json.Unmarshal(b, &c); err != nil {
-		return nil, fmt.Errorf("parse config %q: %w", path, err)
+	if path != "" {
+		b, err := os.ReadFile(path) //nolint:gosec // operator-supplied config path
+		switch {
+		case err == nil:
+			if err := yaml.Unmarshal(b, &c); err != nil {
+				return nil, fmt.Errorf("parse config %q: %w", path, err)
+			}
+		case errors.Is(err, os.ErrNotExist):
+			// env-only configuration is valid
+		default:
+			return nil, fmt.Errorf("read config %q: %w", path, err)
+		}
 	}
+	c.applyEnv()
+	c.applyDefaults()
+	return &c, nil
+}
+
+func (c *Config) applyEnv() {
+	setStr(&c.FileServiceBase, envPrefix+"FILESERVICEBASE")
+	setInt(&c.Concurrency, envPrefix+"CONCURRENCY")
+	setInt(&c.BackfillRatePerSec, envPrefix+"BACKFILLRATEPERSEC")
+	setInt(&c.MetricsPort, envPrefix+"METRICSPORT")
+	setInt(&c.PerObjectTimeoutSec, envPrefix+"PEROBJECTTIMEOUTSEC")
+	setInt(&c.StaleTTLSec, envPrefix+"STALETTLSEC")
+	setInt(&c.PollEverySec, envPrefix+"POLLEVERYSEC")
+	applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_")
+	applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_")
+	c.applyTargetEnv()
+}
+
+func applyDBEnv(d *DBConfig, p string) {
+	setStr(&d.Host, p+"HOST")
+	setInt(&d.Port, p+"PORT")
+	setStr(&d.User, p+"USER")
+	setStr(&d.Password, p+"PASSWORD")
+	setStr(&d.DBName, p+"DBNAME")
+	setStr(&d.SSLMode, p+"SSLMODE")
+}
+
+// applyTargetEnv overlays per-target fields from FBS_TARGET_<NAME>_<FIELD> — the
+// path by which per-target secrets (ACCESSKEY/SECRETKEY) are injected from k8s
+// secrets, and any structural field can be overridden.
+func (c *Config) applyTargetEnv() {
+	for i := range c.Targets {
+		p := envPrefix + "TARGET_" + envToken(c.Targets[i].Name) + "_"
+		setStr(&c.Targets[i].Endpoint, p+"ENDPOINT")
+		setStr(&c.Targets[i].Region, p+"REGION")
+		setStr(&c.Targets[i].Bucket, p+"BUCKET")
+		setStr(&c.Targets[i].Prefix, p+"PREFIX")
+		setStr(&c.Targets[i].Path, p+"PATH")
+		setStr(&c.Targets[i].Compression, p+"COMPRESSION")
+		setStr(&c.Targets[i].AccessKey, p+"ACCESSKEY")
+		setStr(&c.Targets[i].SecretKey, p+"SECRETKEY")
+		setBool(&c.Targets[i].UseSSL, p+"USESSL")
+		setBool(&c.Targets[i].SSE, p+"SSE")
+		setBool(&c.Targets[i].Insecure, p+"INSECURE")
+	}
+}
+
+func (c *Config) applyDefaults() {
 	if c.Concurrency == 0 {
 		c.Concurrency = 8
 	}
@@ -79,10 +173,50 @@ func Load(path string) (*Config, error) {
 	if c.PollEverySec == 0 {
 		c.PollEverySec = 10
 	}
-	// Validation is NOT run here — it is a serve-time concern. migrate / restore /
-	// verify need only a subset (the ledger DSN, or one named target), and must
-	// not be rejected for missing serve-only fields.
-	return &c, nil
+	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
+		if d.Port == 0 {
+			d.Port = 5432
+		}
+		if d.SSLMode == "" {
+			d.SSLMode = "require"
+		}
+	}
+}
+
+// envToken upcases a target name and replaces non-alphanumerics with '_' so it is
+// a valid env-var segment.
+func envToken(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(name) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+func setStr(dst *string, key string) {
+	if v, ok := os.LookupEnv(key); ok {
+		*dst = v
+	}
+}
+
+func setInt(dst *int, key string) {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			*dst = n
+		}
+	}
+}
+
+func setBool(dst *bool, key string) {
+	if v, ok := os.LookupEnv(key); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			*dst = b
+		}
+	}
 }
 
 // Validate checks the full serve configuration. Call it from serve, not Load.
@@ -90,11 +224,11 @@ func (c *Config) Validate() error {
 	if c.FileServiceBase == "" {
 		return errors.New("fileServiceBase is required")
 	}
-	if c.AlkemioDB == "" {
-		return errors.New("alkemioDB is required")
+	if err := c.AlkemioDB.validate("alkemioDB"); err != nil {
+		return err
 	}
-	if c.LedgerDB == "" {
-		return errors.New("ledgerDB is required")
+	if err := c.LedgerDB.validate("ledgerDB"); err != nil {
+		return err
 	}
 	if len(c.Targets) == 0 {
 		return errors.New("at least one target is required")
@@ -131,7 +265,7 @@ func validateTarget(i int, t Target, seen map[string]bool) error {
 		}
 		if !t.Insecure && (!t.UseSSL || !t.SSE) {
 			return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+
-				"set \"insecure\": true only for local dev", t.Name)
+				"set insecure=true only for local dev", t.Name)
 		}
 	default:
 		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)

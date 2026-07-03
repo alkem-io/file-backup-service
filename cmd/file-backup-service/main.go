@@ -58,7 +58,7 @@ func main() {
 
 func configFlag(name string, args []string) string {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	cfgPath := fs.String("config", "config.json", "path to the config file")
+	cfgPath := fs.String("config", "config.yaml", "path to the config file")
 	_ = fs.Parse(args)
 	return *cfgPath
 }
@@ -68,10 +68,10 @@ func runMigrate(cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.LedgerDB == "" {
-		return errors.New("ledgerDB not configured")
+	if cfg.LedgerDB.Host == "" || cfg.LedgerDB.DBName == "" {
+		return errors.New("ledgerDB.host and ledgerDB.dbName are required for migrate")
 	}
-	if err := db.Migrate(cfg.LedgerDB); err != nil {
+	if err := db.Migrate(cfg.LedgerDB.DSN()); err != nil {
 		return err
 	}
 	fmt.Println("ledger migrations applied")
@@ -96,12 +96,12 @@ func serve(cfgPath string) error {
 	// config.Load guarantees both DSNs and >=1 target — no silent no-op mode.
 	// Size for: 1 permanent LISTEN + up to Concurrency in-flight bookkeeping +
 	// health + margin, so a NOTIFY burst can't starve MarkDone/Fail.
-	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB, int32(cfg.Concurrency)+8) //nolint:gosec // Concurrency is a small operator-set value
+	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), int32(cfg.Concurrency)+8) //nolint:gosec // Concurrency is a small operator-set value
 	if err != nil {
 		return fmt.Errorf("alkemio pool: %w", err)
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB, int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is a small operator-set value
+	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is a small operator-set value
 	if err != nil {
 		return fmt.Errorf("ledger pool: %w", err)
 	}
@@ -145,7 +145,7 @@ func serve(cfgPath string) error {
 
 func runRestore(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.json", "config file")
+	cfgPath := fs.String("config", "config.yaml", "config file")
 	hash := fs.String("hash", "", "content hash (externalID) to restore")
 	from := fs.String("from", "", "source target name")
 	to := fs.String("to", "/storage", "destination directory")
@@ -166,7 +166,7 @@ func runRestore(args []string) error {
 
 func runVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.json", "config file")
+	cfgPath := fs.String("config", "config.yaml", "config file")
 	hash := fs.String("hash", "", "content hash to verify")
 	from := fs.String("from", "", "source target name")
 	scratch := fs.String("scratch", ".", "scratch dir for the streamed decode (must be real disk, not tmpfs)")

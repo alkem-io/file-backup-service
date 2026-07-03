@@ -1,0 +1,48 @@
+# file-backup-service configuration.
+#
+# YAML defines the structure; environment variables (FBS_*) override any scalar
+# and inject secrets. Env wins. In k8s, mount this (or a ConfigMap) for the
+# structure and inject secrets/DB-host via env from the shared alkemio-config +
+# secrets — e.g. FBS_ALKEMIODB_HOST from DATABASE_HOST, passwords + S3 keys from
+# a Secret. Never commit real secrets here.
+
+fileServiceBase: http://alkemio-file-service   # FBS_FILESERVICEBASE
+
+# Outbox — scoped SELECT/UPDATE role on the Alkemio DB.
+# Password via FBS_ALKEMIODB_PASSWORD; host/port can reuse the shared
+# DATABASE_HOST/PORT via FBS_ALKEMIODB_HOST / FBS_ALKEMIODB_PORT.
+alkemioDB:
+  host: alkemio-postgres
+  port: 5432
+  user: filebackup_consumer
+  dbName: alkemio
+  sslMode: require
+
+# This service's own ledger DB. Password via FBS_LEDGERDB_PASSWORD.
+ledgerDB:
+  host: alkemio-postgres
+  port: 5432
+  user: filebackup
+  dbName: filebackup
+  sslMode: require
+
+concurrency: 8            # FBS_CONCURRENCY
+perObjectTimeoutSec: 1800 # per-object backup deadline (FBS_PEROBJECTTIMEOUTSEC)
+staleTTLSec: 3600         # must exceed perObjectTimeoutSec (FBS_STALETTLSEC)
+metricsPort: 4004         # FBS_METRICSPORT
+
+# Symmetric targets — every object goes to every target; "done" requires all.
+# Secrets injected per target by name: FBS_TARGET_<NAME>_ACCESSKEY / _SECRETKEY
+# (<NAME> = the name upcased, non-alphanumerics -> '_').
+targets:
+  - name: offsite                    # FBS_TARGET_OFFSITE_ACCESSKEY / _SECRETKEY
+    type: s3
+    endpoint: s3.fr-par.scw.cloud
+    region: fr-par
+    bucket: alkemio-backup
+    useSSL: true                     # required for s3 (TLS)
+    sse: true                        # required for s3 (encryption at rest)
+    # compression: zstd              # optional per-target
+  - name: local2
+    type: filesystem
+    path: /backup
