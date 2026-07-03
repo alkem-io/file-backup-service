@@ -64,14 +64,20 @@ target restorable with nothing but bytes + a hash check.
 - Never a delete path to the primary store or the immutable target; never GC by default (retain-all)
 - Use `actorId` internally, never `userId`
 
-## Configuration (env / config file)
+## Configuration (YAML base + env overrides)
 
-- `FILE_SERVICE_BASE` — base URL for `GET /internal/file/{id}/content`
-- `ALKEMIO_DB_DSN` — scoped role for the outbox (SELECT/UPDATE only)
-- `LEDGER_DB_DSN` — this service's own ledger database
-- `TARGETS` — list of **symmetric** sinks (type, endpoint/bucket/path, compression, immutable, credentialsRef); every object goes to every target, "done" requires all
-- `CONCURRENCY`, `BACKFILL_RATE_PER_SEC`, retry/attempt limits, reconciliation schedule, RPO SLO
-- `METRICS_PORT` — health/metrics listen port (default 4004)
+A **YAML** file (`config.yaml`; see `config.example.yaml`) defines the structure —
+including the **symmetric** target list (every object goes to every target, "done"
+requires all). **Environment variables (`FBS_*`) override any scalar and inject
+secrets**; env wins (12-factor), matching the house style (`file-service` is
+env-configured from `alkemio-config` + secrets). Secrets (DB passwords, S3 keys)
+come from env only. `internal/config`.
+
+- `fileServiceBase` / `FBS_FILESERVICEBASE` — base URL for `GET /internal/file/{id}/content`
+- `alkemioDB` (host/port/user/password/dbName/sslMode → a libpq DSN) — the outbox, scoped SELECT/UPDATE role. Env: `FBS_ALKEMIODB_HOST` (reuse the shared `DATABASE_HOST`), `FBS_ALKEMIODB_PASSWORD`, …
+- `ledgerDB` (same shape) — this service's own DB (`filebackup`). Env: `FBS_LEDGERDB_*`
+- `targets[]` — each `{name, type, endpoint/bucket/region/path, compression, useSSL, sse}`. Per-target secrets/overrides: `FBS_TARGET_<NAME>_ACCESSKEY` / `_SECRETKEY` / `_BUCKET` / … (`<NAME>` = name upcased, non-alphanumerics → `_`)
+- `concurrency`, `perObjectTimeoutSec`, `staleTTLSec`, `pollEverySec`, `backfillRatePerSec`, `metricsPort` (default 4004) — all `FBS_*`-overridable
 
 ## Full Constitution
 
