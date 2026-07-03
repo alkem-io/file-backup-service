@@ -34,13 +34,15 @@ func (f *fakeLedger) UpsertObject(_ context.Context, m ObjectMeta) error {
 	f.objects[m.ExternalID] = true
 	return nil
 }
-func (f *fakeLedger) UpsertTargetStatus(_ context.Context, externalID, target, state string, _ int64) error {
+func (f *fakeLedger) RecordTargetStatuses(_ context.Context, externalID string, statuses []TargetStatus) error {
 	if !f.objects[externalID] {
 		f.fkError = true
 		return fmt.Errorf("fk violation: object %s absent", externalID)
 	}
-	f.states[externalID+"/"+target] = state
-	f.statuses++
+	for _, s := range statuses {
+		f.states[externalID+"/"+s.Target] = s.State
+		f.statuses++
+	}
 	return nil
 }
 func (f *fakeLedger) StoredTargets(context.Context, string) (map[string]bool, error) {

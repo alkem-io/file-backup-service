@@ -29,14 +29,31 @@ func (r *LedgerRepo) UpsertObject(ctx context.Context, e domain.ObjectMeta) erro
 	})
 }
 
-// UpsertTargetStatus records per-(object,target) completion.
-func (r *LedgerRepo) UpsertTargetStatus(ctx context.Context, externalID, target, state string, storedBytes int64) error {
-	return r.q.UpsertTargetStatus(ctx, queries.UpsertTargetStatusParams{
-		ExternalID:  externalID,
-		Target:      target,
-		State:       state,
-		StoredBytes: pgtype.Int8{Int64: storedBytes, Valid: true},
+// RecordTargetStatuses writes every per-target status in one batched round-trip.
+func (r *LedgerRepo) RecordTargetStatuses(ctx context.Context, externalID string, statuses []domain.TargetStatus) error {
+	if len(statuses) == 0 {
+		return nil
+	}
+	params := make([]queries.BatchUpsertTargetStatusParams, len(statuses))
+	for i, s := range statuses {
+		params[i] = queries.BatchUpsertTargetStatusParams{
+			ExternalID:  externalID,
+			Target:      s.Target,
+			State:       s.State,
+			StoredBytes: pgtype.Int8{Int64: s.StoredBytes, Valid: true},
+		}
+	}
+	var firstErr error
+	// Exec closes the underlying batch results; capture the first per-query error.
+	r.q.BatchUpsertTargetStatus(ctx, params).Exec(func(_ int, err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	})
+	if firstErr != nil {
+		return fmt.Errorf("batch target status: %w", firstErr)
+	}
+	return nil
 }
 
 // StoredTargets returns the set of target names already in state='stored' for

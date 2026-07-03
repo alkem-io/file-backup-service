@@ -3,7 +3,7 @@ INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedD
 VALUES ($1, $2, $3, $4)
 ON CONFLICT ("externalID") DO NOTHING;
 
--- name: UpsertTargetStatus :exec
+-- name: BatchUpsertTargetStatus :batchexec
 INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
 VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'stored' THEN now() ELSE NULL END)
 ON CONFLICT ("externalID", target)

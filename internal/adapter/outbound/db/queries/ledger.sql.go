@@ -62,35 +62,3 @@ func (q *Queries) UpsertObject(ctx context.Context, arg UpsertObjectParams) erro
 	)
 	return err
 }
-
-const upsertTargetStatus = `-- name: UpsertTargetStatus :exec
-INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
-VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'stored' THEN now() ELSE NULL END)
-ON CONFLICT ("externalID", target)
-DO UPDATE SET
-  -- never downgrade a durable 'stored' row to 'failed'
-  state = CASE WHEN file_backup_target_status.state = 'stored' AND EXCLUDED.state <> 'stored'
-               THEN file_backup_target_status.state ELSE EXCLUDED.state END,
-  -- storedBytes / verifiedAt only advance on a fresh successful store
-  "storedBytes" = CASE WHEN EXCLUDED.state = 'stored' THEN EXCLUDED."storedBytes"
-                       ELSE file_backup_target_status."storedBytes" END,
-  "verifiedAt" = CASE WHEN EXCLUDED.state = 'stored' THEN now()
-                      ELSE file_backup_target_status."verifiedAt" END
-`
-
-type UpsertTargetStatusParams struct {
-	ExternalID  string      `json:"externalID"`
-	Target      string      `json:"target"`
-	State       string      `json:"state"`
-	StoredBytes pgtype.Int8 `json:"storedBytes"`
-}
-
-func (q *Queries) UpsertTargetStatus(ctx context.Context, arg UpsertTargetStatusParams) error {
-	_, err := q.db.Exec(ctx, upsertTargetStatus,
-		arg.ExternalID,
-		arg.Target,
-		arg.State,
-		arg.StoredBytes,
-	)
-	return err
-}

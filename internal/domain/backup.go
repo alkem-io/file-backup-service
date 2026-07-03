@@ -77,19 +77,6 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		return true, nil // every target already has it
 	}
 
-	// Record the object row up front (idempotent) from the outbox size, so a
-	// target_status write never FK-violates AND an object that fails on every
-	// target still leaves a ledger trace — failure telemetry no longer requires a
-	// prior success.
-	if err := p.Ledger.UpsertObject(ctx, ObjectMeta{
-		ExternalID:        e.ExternalID,
-		Size:              e.Size,
-		CreatedBy:         e.CreatedBy,
-		SourceCreatedDate: e.CreatedDate,
-	}); err != nil {
-		return false, fmt.Errorf("ledger object: %w", err)
-	}
-
 	results, verified, ferr := p.fanOut(ctx, e, pending)
 	if ferr != nil {
 		return false, ferr // source integrity / cancellation — outbox retries
@@ -101,29 +88,35 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
 	defer cancel()
 
-	// Correct the object size to the VERIFIED plaintext byte count — the outbox size
-	// is the producer's unverified hearsay; the hash guarantees these exact bytes.
+	// Record the object row (FK parent for the statuses) with the VERIFIED plaintext
+	// size when we have it — the outbox size is the producer's unverified hearsay;
+	// the hash guarantees these bytes. On an all-targets-fail (verified<0) fall back
+	// to the outbox size so the object + its failed statuses still leave a trace.
+	objSize := e.Size
 	if verified >= 0 {
-		if err := p.Ledger.UpsertObject(bctx, ObjectMeta{
-			ExternalID: e.ExternalID, Size: verified, CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
-		}); err != nil {
-			return false, fmt.Errorf("ledger object size: %w", err)
-		}
+		objSize = verified
+	}
+	if err := p.Ledger.UpsertObject(bctx, ObjectMeta{
+		ExternalID: e.ExternalID, Size: objSize, CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
+	}); err != nil {
+		return false, fmt.Errorf("ledger object: %w", err)
 	}
 
+	statuses := make([]TargetStatus, len(pending))
 	allStored := true
 	for i, t := range pending {
 		name := t.Sink.Name()
 		if results[i].err != nil {
 			p.Metrics.ObjectFailed(name)
-			_ = p.Ledger.UpsertTargetStatus(bctx, e.ExternalID, name, StateFailed, 0)
+			statuses[i] = TargetStatus{Target: name, State: StateFailed}
 			allStored = false
 			continue
 		}
 		p.Metrics.ObjectStored(name, results[i].stored)
-		if err := p.Ledger.UpsertTargetStatus(bctx, e.ExternalID, name, StateStored, results[i].stored); err != nil {
-			return false, fmt.Errorf("ledger target status: %w", err)
-		}
+		statuses[i] = TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored}
+	}
+	if err := p.Ledger.RecordTargetStatuses(bctx, e.ExternalID, statuses); err != nil {
+		return false, fmt.Errorf("ledger target status: %w", err)
 	}
 	return allStored, nil
 }
