@@ -297,6 +297,12 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// ValidateTarget checks a single target in isolation — used by the restore/verify
+// CLI, which don't run full serve validation.
+func ValidateTarget(t Target) error {
+	return validateTarget(0, t, map[string]bool{})
+}
+
 func validateTarget(i int, t Target, seen map[string]bool) error {
 	if t.Name == "" {
 		return fmt.Errorf("target[%d]: name is required", i)

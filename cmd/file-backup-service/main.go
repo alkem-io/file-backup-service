@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -143,11 +144,14 @@ func serve(cfgPath string) error {
 		Logger:           logger,
 	})
 
-	srv := startHTTP(cfg.MetricsPort, httpapi.Deps{
+	srv, err := startHTTP(cfg.MetricsPort, httpapi.Deps{
 		Health:  &httpapi.HealthHandler{Outbox: outbox, Ledger: ledger},
 		Metrics: mx.Handler(),
 		Logger:  logger,
 	}, logger)
+	if err != nil {
+		return err
+	}
 	defer shutdown(srv)
 
 	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
@@ -168,7 +172,9 @@ func runRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := domain.RestoreObject(context.Background(), sink, *hash, *to); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := domain.RestoreObject(ctx, sink, *hash, *to); err != nil {
 		return err
 	}
 	fmt.Printf("restored %s -> %s/%s\n", *hash, *to, *hash)
@@ -188,14 +194,18 @@ func runVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := domain.VerifyObject(context.Background(), sink, *hash); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := domain.VerifyObject(ctx, sink, *hash); err != nil {
 		return err
 	}
 	fmt.Printf("verified %s on %s\n", *hash, *from)
 	return nil
 }
 
-// sinkFor loads config and builds the single named target's sink.
+// sinkFor loads config, validates the named target, and builds its sink. It
+// validates the single target (not full serve config) so a DR restore fails with a
+// clear config error (bad type/region/missing bucket) instead of a raw minio/os one.
 func sinkFor(cfgPath, name string) (domain.Sink, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -203,6 +213,9 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 	}
 	for _, t := range cfg.Targets {
 		if t.Name == name {
+			if err := config.ValidateTarget(t); err != nil {
+				return nil, fmt.Errorf("invalid target %q: %w", name, err)
+			}
 			return buildSink(t)
 		}
 	}
@@ -239,7 +252,7 @@ func buildSink(t config.Target) (domain.Sink, error) {
 	}
 }
 
-func startHTTP(port int, deps httpapi.Deps, logger *zap.Logger) *http.Server {
+func startHTTP(port int, deps httpapi.Deps, logger *zap.Logger) (*http.Server, error) {
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
 		Handler:           httpapi.NewRouter(deps),
@@ -248,12 +261,18 @@ func startHTTP(port int, deps httpapi.Deps, logger *zap.Logger) *http.Server {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	// Bind synchronously so a bad/taken port fails serve loudly, rather than being
+	// logged-and-ignored while the worker runs on with no /health or /metrics.
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("http listen on %s: %w", srv.Addr, err)
+	}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("http server", zap.Error(err))
 		}
 	}()
-	return srv
+	return srv, nil
 }
 
 func shutdown(srv *http.Server) {

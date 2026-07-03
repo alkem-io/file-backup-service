@@ -97,6 +97,9 @@ func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
 	for ctx.Err() == nil {
 		entries, err := c.d.Outbox.Claim(ctx, 1)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return // graceful shutdown cancelled the in-flight claim — not an error
+			}
 			c.d.Logger.Error("claim outbox", zap.Error(err))
 			backoff(ctx) // don't hot-loop a broken DB
 			continue
@@ -236,7 +239,9 @@ func (c *Consumer) reap(ctx context.Context) {
 	sweep := func() {
 		deadLettered, err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL)
 		if err != nil {
-			c.d.Logger.Error("reap stale", zap.Error(err))
+			if !errors.Is(err, context.Canceled) { // shutdown, not a real error
+				c.d.Logger.Error("reap stale", zap.Error(err))
+			}
 			return
 		}
 		// A crash-loop dead-letter happens HERE (not via Fail), so it must fire the
