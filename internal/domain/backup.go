@@ -141,11 +141,7 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 				defer func() { _ = zr.Close() }()
 				reader = zr
 			}
-			// size = -1 is load-bearing, not merely "unknown". Commit is gated on
-			// the dispatcher closing the pipes AFTER VerifyReader checks the hash;
-			// a known byte-count would let a sink finalize (e.g. minio single-PUT)
-			// on length alone, before verification, committing unverified bytes.
-			stored, serr := t.Sink.Store(ctx, e.ExternalID, reader, -1)
+			stored, serr := storeWithCtx(ctx, t.Sink, e.ExternalID, reader)
 			results[i] = targetResult{stored: stored, err: serr}
 			// Unblock the dispatcher if Store bailed before draining the pipe.
 			_ = pr.CloseWithError(serr)
@@ -177,6 +173,32 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		return results, fmt.Errorf("source read: %w", copyErr)
 	}
 	return results, nil
+}
+
+// storeWithCtx runs Sink.Store but honors ctx even when the sink does not (e.g. a
+// filesystem sink blocked in a hung fsync/write): on ctx cancellation it returns
+// the ctx error and abandons the inner Store goroutine, so wg.Wait / the
+// dispatcher unblock and the worker slot is freed rather than pinned forever.
+//
+// size = -1 is load-bearing: commit is gated on the dispatcher closing the pipes
+// AFTER VerifyReader checks the hash; a known byte-count would let a sink finalize
+// (e.g. minio single-PUT) on length alone, before verification.
+func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int64, error) {
+	type result struct {
+		n   int64
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := sink.Store(ctx, hash, r, -1)
+		ch <- result{n, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case res := <-ch:
+		return res.n, res.err
+	}
 }
 
 // fanoutWriter writes each chunk to every still-live target pipe. A pipe write
