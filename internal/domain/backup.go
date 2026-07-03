@@ -119,6 +119,10 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 				defer func() { _ = zr.Close() }()
 				reader = zr
 			}
+			// size = -1 is load-bearing, not merely "unknown". Commit is gated on
+			// the dispatcher closing the pipes AFTER VerifyReader checks the hash;
+			// a known byte-count would let a sink finalize (e.g. minio single-PUT)
+			// on length alone, before verification, committing unverified bytes.
 			stored, serr := t.Sink.Store(ctx, e.ExternalID, reader, -1)
 			results[i] = targetResult{stored: stored, err: serr}
 			// Unblock the dispatcher if Store bailed before draining the pipe.
