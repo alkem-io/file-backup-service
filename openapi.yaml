@@ -37,11 +37,3 @@ paths:
       summary: |-
         ServeLive is the K8s liveness handler: returns 200 unconditionally so the
         probe reflects process-alive only, independent of DB/target availability.
-  /metrics:
-    get:
-      operationId: router.go:50:20
-      responses:
-        "200":
-          content:
-            application/json: {}
-          description: OK
