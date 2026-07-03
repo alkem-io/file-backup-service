@@ -107,18 +107,28 @@ func serve(cfgPath string) error {
 	}
 	defer ledgerPool.Close()
 
-	// Fail loudly if the scoped role can't reach the outbox, rather than a silent
-	// no-op with /health green.
+	// Fail loudly at startup if any external dependency is unusable, rather than a
+	// silent no-op with /health green: the outbox (scoped role + schema), the ledger
+	// (schema/migrate), and every target sink (creds/bucket/path).
 	outbox := db.NewOutboxRepo(alkemioPool)
 	if err := outbox.Probe(ctx); err != nil {
 		return fmt.Errorf("outbox not accessible (scoped role / schema?): %w", err)
+	}
+	ledger := db.NewLedgerRepo(ledgerPool)
+	if err := ledger.Probe(ctx); err != nil {
+		return fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
 	}
 
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err
 	}
-	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), db.NewLedgerRepo(ledgerPool), targets)
+	for _, t := range targets {
+		if err := t.Sink.Preflight(ctx); err != nil {
+			return fmt.Errorf("target preflight failed: %w", err)
+		}
+	}
+	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), ledger, targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
@@ -134,7 +144,7 @@ func serve(cfgPath string) error {
 	})
 
 	srv := startHTTP(cfg.MetricsPort, httpapi.Deps{
-		Health:  &httpapi.HealthHandler{Outbox: alkemioPool, Ledger: ledgerPool},
+		Health:  &httpapi.HealthHandler{Outbox: outbox, Ledger: ledger},
 		Metrics: mx.Handler(),
 		Logger:  logger,
 	}, logger)

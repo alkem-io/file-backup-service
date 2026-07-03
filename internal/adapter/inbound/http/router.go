@@ -1,5 +1,5 @@
 // Package http exposes the worker's small HTTP surface: liveness, readiness,
-// and (later) metrics. There are no public, authorization-guarded endpoints.
+// and metrics. There are no public, authorization-guarded endpoints.
 package http
 
 import (
@@ -11,27 +11,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// writeJSON is the single JSON-response encoder for this package's handlers.
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 // LiveResponse is the body returned by GET /live.
 type LiveResponse struct {
 	Status string `json:"status"`
 }
 
-// Render writes the response as JSON with HTTP 200.
-func (r LiveResponse) Render(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(r)
-}
-
 // ServeLive is the K8s liveness handler: returns 200 unconditionally so the
 // probe reflects process-alive only, independent of DB/target availability.
 func ServeLive(w http.ResponseWriter, _ *http.Request) {
-	LiveResponse{Status: "alive"}.Render(w)
+	writeJSON(w, http.StatusOK, LiveResponse{Status: "alive"})
 }
 
 // Deps contains the router's dependencies.
 type Deps struct {
-	// Health is the readiness handler (pings dependencies).
+	// Health is the readiness handler (probes dependencies). Required.
 	Health *HealthHandler
 	// Metrics is the Prometheus handler (optional).
 	Metrics http.Handler
@@ -46,8 +46,10 @@ func NewRouter(deps Deps) *chi.Mux {
 
 	// Liveness (K8s livenessProbe): process-alive only, no dependency checks.
 	r.Get("/live", ServeLive)
-	// Readiness (K8s readinessProbe): checks the outbox + ledger DBs.
-	r.Method(http.MethodGet, "/health", deps.Health)
+	// Readiness (K8s readinessProbe): probes the outbox + ledger DBs.
+	if deps.Health != nil {
+		r.Method(http.MethodGet, "/health", deps.Health)
+	}
 	// Metrics (Prometheus).
 	if deps.Metrics != nil {
 		r.Handle("/metrics", deps.Metrics)

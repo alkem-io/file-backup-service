@@ -58,6 +58,18 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	return nil
 }
 
+// Probe verifies both ledger tables exist + are readable via the pool's role. A
+// missing table (skipped migration) errors; an empty table is success.
+func (r *LedgerRepo) Probe(ctx context.Context) error {
+	var a, b any
+	const q = `SELECT (SELECT 1 FROM file_backup_object LIMIT 1),
+	                  (SELECT 1 FROM file_backup_target_status LIMIT 1)`
+	if err := r.p.QueryRow(ctx, q).Scan(&a, &b); err != nil {
+		return fmt.Errorf("ledger probe (schema/migrate?): %w", err)
+	}
+	return nil
+}
+
 // StoredTargets returns the set of target names already in state='stored' for
 // externalID (one query — the dedup source of truth).
 func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[string]bool, error) {

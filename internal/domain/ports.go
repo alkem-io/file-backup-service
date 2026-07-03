@@ -69,4 +69,8 @@ type Ledger interface {
 	// externalID, in one query — the dedup source of truth (never re-reads a
 	// target, so it works with PutObject-only WORM credentials).
 	StoredTargets(ctx context.Context, externalID string) (map[string]bool, error)
+	// Probe verifies the ledger tables exist + are readable, so a skipped/misordered
+	// migration fails loudly at startup and via readiness, not as a green-health
+	// stall where every RecordBackup errors "relation does not exist".
+	Probe(ctx context.Context) error
 }

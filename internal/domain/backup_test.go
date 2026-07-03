@@ -44,6 +44,7 @@ func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []Ta
 func (f *fakeLedger) StoredTargets(context.Context, string) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }
+func (f *fakeLedger) Probe(context.Context) error { return nil }
 
 type memSink struct {
 	name  string
@@ -67,6 +68,7 @@ func (m *memSink) Fetch(_ context.Context, h string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(m.store[h])), nil
 }
 func (m *memSink) PutManifest(context.Context, string, io.Reader) error { return nil }
+func (m *memSink) Preflight(context.Context) error                      { return nil }
 
 func TestPipelineBackupOne(t *testing.T) {
 	data := []byte("back me up")
@@ -210,6 +212,7 @@ func (n *nonConsumingSink) Fetch(context.Context, string) (io.ReadCloser, error)
 	return nil, fmt.Errorf("unavailable")
 }
 func (n *nonConsumingSink) PutManifest(context.Context, string, io.Reader) error { return nil }
+func (n *nonConsumingSink) Preflight(context.Context) error                      { return nil }
 
 // TestPipelineNonConsumingSinkFails: a sink that returns success without reading
 // the verified stream must be forced to failed (dead-pipe cross-check), so the
@@ -310,6 +313,7 @@ func (f *failSink) Fetch(context.Context, string) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("unavailable")
 }
 func (f *failSink) PutManifest(context.Context, string, io.Reader) error { return nil }
+func (f *failSink) Preflight(context.Context) error                      { return nil }
 
 // TestPipelineTargetIsolation: targets are symmetric — a flaky target must not
 // abort the others (they still receive the object), and the object must NOT be

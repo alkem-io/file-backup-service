@@ -26,10 +26,16 @@ type Sink interface {
 	Store(ctx context.Context, hash string, r io.Reader, size int64) (int64, error)
 	// Exists reports whether the object is already present.
 	Exists(ctx context.Context, hash string) (bool, error)
-	// Fetch returns the ORIGINAL bytes (transform reversed via the hash-arbiter).
+	// Fetch returns the bytes AS STORED (still transformed). The caller reverses the
+	// per-target codec via the hash-arbiter (raw-first, else bounded zstd) — see
+	// restore.decodeStream; the sink does not decode.
 	Fetch(ctx context.Context, hash string) (io.ReadCloser, error)
 	// PutManifest writes a periodic ledger snapshot object.
 	PutManifest(ctx context.Context, name string, r io.Reader) error
+	// Preflight verifies the target is reachable + writable with the configured
+	// credentials, so a misconfig fails loudly at startup instead of dead-lettering
+	// every object.
+	Preflight(ctx context.Context) error
 }
 
 // Source fetches an object's bytes by file id (the file-service content API).

@@ -2,16 +2,17 @@ package http
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 )
 
-// Pinger performs an active round-trip to a dependency (pgxpool.Pool satisfies
-// this directly). Implementations MUST honor ctx cancellation.
-type Pinger interface {
-	// Ping checks the dependency is reachable.
-	Ping(ctx context.Context) error
+// Prober verifies a dependency is USABLE — the schema is reachable via the scoped
+// role, not merely that a connection opens. A bare Ping stays green after a runtime
+// role revocation or schema drift while every claim fails; a Probe flips readiness.
+type Prober interface {
+	// Probe returns nil iff the dependency is currently usable.
+	Probe(ctx context.Context) error
 }
 
 // HealthResponse is the body of GET /health.
@@ -20,45 +21,80 @@ type HealthResponse struct {
 	Details map[string]string `json:"details"`
 }
 
-// Render writes the response as JSON with the given status code.
-func (r HealthResponse) Render(w http.ResponseWriter, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(r)
+// HealthHandler reports readiness by probing the outbox and ledger. The verdict is
+// cached for a short TTL so a K8s probe scraping every few seconds does not drive a
+// DB round-trip per request, and the two probes run concurrently so a slow DB can't
+// stack their timeouts past the probe budget.
+type HealthHandler struct {
+	Outbox Prober
+	Ledger Prober
+	TTL    time.Duration // cache window; <=0 uses defaultHealthTTL
+
+	mu   sync.Mutex
+	at   time.Time
+	body HealthResponse
+	code int
 }
 
-// HealthHandler reports readiness by pinging the outbox and ledger databases.
-// Nil pingers are skipped (unwired in the scaffold).
-type HealthHandler struct {
-	// Outbox pings the Alkemio DB (outbox).
-	Outbox Pinger
-	// Ledger pings this service's own ledger DB.
-	Ledger Pinger
-}
+const (
+	probeTimeout     = 2 * time.Second
+	defaultHealthTTL = 5 * time.Second
+)
 
 // ServeHTTP implements the readiness probe.
 func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	details := map[string]string{}
-	healthy := true
-	check := func(name string, p Pinger) {
-		if p == nil {
-			return
-		}
-		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-		defer cancel()
-		if err := p.Ping(ctx); err != nil {
-			details[name] = "unreachable"
-			healthy = false
-			return
-		}
-		details[name] = "ok"
+	ttl := h.TTL
+	if ttl <= 0 {
+		ttl = defaultHealthTTL
 	}
-	check("outbox", h.Outbox)
-	check("ledger", h.Ledger)
+	h.mu.Lock()
+	fresh := !h.at.IsZero() && time.Since(h.at) < ttl
+	body, code := h.body, h.code
+	h.mu.Unlock()
 
-	status, code := "healthy", http.StatusOK
-	if !healthy {
-		status, code = "unhealthy", http.StatusServiceUnavailable
+	if !fresh {
+		body, code = h.probe(req.Context())
+		h.mu.Lock()
+		h.at, h.body, h.code = time.Now(), body, code
+		h.mu.Unlock()
 	}
-	HealthResponse{Status: status, Details: details}.Render(w, code)
+	writeJSON(w, code, body)
+}
+
+func (h *HealthHandler) probe(parent context.Context) (HealthResponse, int) {
+	checks := []struct {
+		name string
+		p    Prober
+	}{{"outbox", h.Outbox}, {"ledger", h.Ledger}}
+	details := make([]string, len(checks))
+
+	var wg sync.WaitGroup
+	for i, c := range checks {
+		wg.Add(1)
+		go func(i int, p Prober) {
+			defer wg.Done()
+			if p == nil { // a missing dependency is UNHEALTHY, never silently skipped
+				details[i] = "not configured"
+				return
+			}
+			ctx, cancel := context.WithTimeout(parent, probeTimeout)
+			defer cancel()
+			if err := p.Probe(ctx); err != nil {
+				details[i] = "unusable"
+				return
+			}
+			details[i] = "ok"
+		}(i, c.p)
+	}
+	wg.Wait()
+
+	out := HealthResponse{Status: "healthy", Details: map[string]string{}}
+	code := http.StatusOK
+	for i, c := range checks {
+		out.Details[c.name] = details[i]
+		if details[i] != "ok" {
+			out.Status, code = "unhealthy", http.StatusServiceUnavailable
+		}
+	}
+	return out, code
 }

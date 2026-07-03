@@ -28,6 +28,22 @@ func (s *Sink) pathFor(hash string) string {
 	return filepath.Join(s.root, filepath.FromSlash(fsutil.ShardKey(hash)))
 }
 
+// Preflight verifies the root exists and is writable, so a missing mount / wrong
+// path / read-only volume fails loudly at startup instead of dead-lettering every
+// object.
+func (s *Sink) Preflight(_ context.Context) error {
+	if err := os.MkdirAll(s.root, 0o755); err != nil { //nolint:gosec // backup store readable by the restore uid
+		return fmt.Errorf("filesystem preflight %q: mkdir %s: %w", s.name, s.root, err)
+	}
+	f, name, err := fsutil.CreateTemp(s.root, ".preflight")
+	if err != nil {
+		return fmt.Errorf("filesystem preflight %q: %s not writable: %w", s.name, s.root, err)
+	}
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
+}
+
 // Exists reports whether the object is present.
 func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 	_, err := os.Stat(s.pathFor(hash))
