@@ -49,8 +49,28 @@ func TestRestoreRoundTripZstd(t *testing.T) {
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("restored zstd bytes mismatch: %v", err)
 	}
-	if err := VerifyObject(context.Background(), sink, h, t.TempDir()); err != nil {
+	if err := VerifyObject(context.Background(), sink, h); err != nil {
 		t.Fatalf("verify: %v", err)
+	}
+}
+
+// TestRestoreRawStartingWithZstdMagic exercises the magic-collision fallback: a
+// raw-stored object whose plaintext begins with the zstd magic (e.g. a .zst upload
+// stored with CodecNone) must still restore, by re-reading as raw.
+func TestRestoreRawStartingWithZstdMagic(t *testing.T) {
+	data := append([]byte{0x28, 0xB5, 0x2F, 0xFD}, []byte(" not a real zstd frame payload")...)
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSink{name: "s", store: map[string][]byte{h: data}} // stored raw
+	dir := t.TempDir()
+	if err := RestoreObject(context.Background(), sink, h, dir); err != nil {
+		t.Fatalf("restore raw-with-zstd-magic: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, h)) //nolint:gosec // test temp path
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("restored bytes mismatch: %v", err)
 	}
 }
 

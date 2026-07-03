@@ -169,7 +169,6 @@ func runVerify(args []string) error {
 	cfgPath := fs.String("config", "config.yaml", "config file")
 	hash := fs.String("hash", "", "content hash to verify")
 	from := fs.String("from", "", "source target name")
-	scratch := fs.String("scratch", ".", "scratch dir for the streamed decode (must be real disk, not tmpfs)")
 	_ = fs.Parse(args)
 	if *hash == "" || *from == "" {
 		return errors.New("verify requires --hash and --from")
@@ -178,7 +177,7 @@ func runVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := domain.VerifyObject(context.Background(), sink, *hash, *scratch); err != nil {
+	if err := domain.VerifyObject(context.Background(), sink, *hash); err != nil {
 		return err
 	}
 	fmt.Printf("verified %s on %s\n", *hash, *from)
