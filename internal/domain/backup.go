@@ -148,10 +148,7 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		}(i, t, pr)
 	}
 
-	fw := &fanoutWriter{writers: make([]io.Writer, n), dead: make([]bool, n), liveIdx: make([]int, 0, n)}
-	for i := range writers {
-		fw.writers[i] = writers[i]
-	}
+	fw := &fanoutWriter{writers: writers, dead: make([]bool, n)}
 	// copyErr is set on a SOURCE failure: a VerifyReader hash mismatch (corrupt
 	// source) or ctx cancellation/timeout during the read.
 	_, copyErr := io.Copy(fw, vr)
@@ -168,30 +165,54 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		}
 	}
 	if copyErr != nil {
-		// Surface the real source error (integrity / cancellation) instead of
-		// letting it masquerade as N target-store failures.
-		return results, fmt.Errorf("source read: %w", copyErr)
+		// A cancelled/timed-out ctx is a real abort — surface it so the consumer
+		// releases (shutdown) or fails+backs-off (per-object timeout) rather than
+		// mislabeling it. With a live ctx, io.ErrClosedPipe means every target pipe
+		// died (all sinks failed), NOT a source problem: the per-target results
+		// already record each failure, so fall through and let BackupOne write the
+		// per-target failed status + metrics. Only a genuine source error (integrity
+		// mismatch, fetch read error) short-circuits as "source read".
+		switch {
+		case ctx.Err() != nil:
+			return results, fmt.Errorf("backup aborted: %w", ctx.Err())
+		case errors.Is(copyErr, io.ErrClosedPipe):
+			// all targets dead — results carry the per-target errors; not a source fault
+		default:
+			return results, fmt.Errorf("source read: %w", copyErr)
+		}
 	}
 	return results, nil
 }
 
-// storeWithCtx runs Sink.Store but honors ctx even when the sink does not (e.g. a
-// filesystem sink blocked in a hung fsync/write): on ctx cancellation it returns
-// the ctx error and abandons the inner Store goroutine, so wg.Wait / the
-// dispatcher unblock and the worker slot is freed rather than pinned forever.
+// storeWithCtx runs Sink.Store but honors ctx even when the sink cannot (a
+// filesystem sink blocked in a hung fsync/write on a wedged mount — a regular-file
+// syscall Go cannot interrupt by closing the fd): on ctx cancellation it returns
+// the ctx error and abandons the inner Store goroutine, so wg.Wait / the dispatcher
+// unblock and the worker slot is freed rather than pinned forever. The abandoned
+// goroutine is bounded (one per wedged object) and its eventual write is an
+// idempotent overwrite of identical content-addressed bytes — never corruption.
+//
+// The Store call is in its OWN goroutine, so a panicking sink is recovered HERE
+// (a recover() only catches its own goroutine) and converted to an error — the
+// per-target recover() in fanOut cannot reach across this goroutine boundary.
 //
 // size = -1 is load-bearing: commit is gated on the dispatcher closing the pipes
 // AFTER VerifyReader checks the hash; a known byte-count would let a sink finalize
 // (e.g. minio single-PUT) on length alone, before verification.
-func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int64, error) {
+func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (n int64, err error) {
 	type result struct {
 		n   int64
 		err error
 	}
-	ch := make(chan result, 1)
+	ch := make(chan result, 1) // buffered so an abandoned goroutine never blocks
 	go func() {
-		n, err := sink.Store(ctx, hash, r, -1)
-		ch <- result{n, err}
+		defer func() {
+			if rec := recover(); rec != nil {
+				ch <- result{0, fmt.Errorf("sink %s panicked: %v", sink.Name(), rec)}
+			}
+		}()
+		sn, serr := sink.Store(ctx, hash, r, -1)
+		ch <- result{sn, serr}
 	}()
 	select {
 	case <-ctx.Done():
@@ -202,56 +223,61 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int
 }
 
 // fanoutWriter writes each chunk to every still-live target pipe. A pipe write
-// error marks that target dead (its Store exited) and the rest continue; it
-// stops the source copy only once every target is gone.
+// error marks that target dead (its Store exited) and the rest continue; it stops
+// the source copy only once every target is gone. Write is called serially by the
+// single io.Copy driver, so f.dead is single-reader; the per-chunk goroutines each
+// touch only their own (disjoint) f.dead[i], published to the next Write by
+// wg.Wait — no data race.
 type fanoutWriter struct {
-	liveIdx []int // scratch reused per Write (dispatcher goroutine only)
-	writers []io.Writer
+	writers []*io.PipeWriter
 	dead    []bool
 }
 
 func (f *fanoutWriter) Write(p []byte) (int, error) {
-	live := f.liveIdx[:0]
-	for i := range f.writers {
-		if !f.dead[i] {
-			live = append(live, i)
-		}
-	}
-	switch len(live) {
-	case 0:
-		return 0, io.ErrClosedPipe
-	case 1: // fast path — no goroutines for a single target (the launch config)
-		if _, err := f.writers[live[0]].Write(p); err != nil {
-			f.dead[live[0]] = true
+	// Single-target fast path (the launch config): write inline, no goroutine.
+	if last := f.soleLive(); last >= 0 {
+		if _, err := f.writers[last].Write(p); err != nil {
+			f.dead[last] = true
 			return 0, io.ErrClosedPipe
 		}
 		return len(p), nil
 	}
-	// Write to all live targets concurrently so per-chunk latency is max(targets),
-	// not sum — a slow target no longer throttles the fast ones.
-	errs := make([]bool, len(f.writers))
+	// ≥2 live targets: write to all concurrently so per-chunk latency is
+	// max(targets), not sum — a slow target no longer throttles the fast ones.
 	var wg sync.WaitGroup
-	for _, i := range live {
+	for i := range f.writers {
+		if f.dead[i] {
+			continue
+		}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			if _, err := f.writers[i].Write(p); err != nil {
-				errs[i] = true // disjoint index, read after wg.Wait — no race
+				f.dead[i] = true // own index only
 			}
 		}(i)
 	}
 	wg.Wait()
-	alive := 0
 	for i := range f.writers {
-		if errs[i] {
-			f.dead[i] = true
-		}
 		if !f.dead[i] {
-			alive++
+			return len(p), nil
 		}
 	}
-	if alive == 0 {
-		return 0, io.ErrClosedPipe
+	return 0, io.ErrClosedPipe
+}
+
+// soleLive returns the index of the only live writer, or -1 if zero or ≥2 are
+// live (so the caller either short-circuits closed or takes the concurrent path).
+func (f *fanoutWriter) soleLive() int {
+	last := -1
+	for i := range f.writers {
+		if f.dead[i] {
+			continue
+		}
+		if last >= 0 {
+			return -1 // ≥2 live
+		}
+		last = i
 	}
-	return len(p), nil
+	return last
 }

@@ -11,6 +11,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -49,10 +51,24 @@ type DBConfig struct {
 	SSLMode  string `yaml:"sslMode"`
 }
 
-// DSN renders a libpq keyword DSN (accepted by both pgxpool and the migrate step).
+// DSN renders a postgres:// URL (accepted by both pgxpool and the migrate step).
+// A URL is used, not a libpq keyword string, so a password/user/dbname containing
+// a space, quote, '=', or other special byte is percent-encoded — a keyword DSN
+// would silently mis-parse it (e.g. a spaced password swallows the next keyword,
+// or `sslmode=disable` in a password downgrades TLS).
 func (d DBConfig) DSN() string {
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode)
+	userinfo := url.User(d.User)
+	if d.Password != "" {
+		userinfo = url.UserPassword(d.User, d.Password)
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     userinfo,
+		Host:     net.JoinHostPort(d.Host, strconv.Itoa(d.Port)),
+		Path:     "/" + d.DBName,
+		RawQuery: url.Values{"sslmode": {d.SSLMode}}.Encode(),
+	}
+	return u.String()
 }
 
 func (d DBConfig) validate(name string) error {
@@ -158,7 +174,7 @@ func (c *Config) applyTargetEnv() {
 }
 
 func (c *Config) applyDefaults() {
-	if c.Concurrency == 0 {
+	if c.Concurrency <= 0 { // floor negatives too, so pool sizing can't underflow
 		c.Concurrency = 8
 	}
 	if c.MetricsPort == 0 {
@@ -232,6 +248,9 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Targets) == 0 {
 		return errors.New("at least one target is required")
+	}
+	if c.Concurrency > 1024 { // keep pool sizing (int32(Concurrency)+8) sane and non-wrapping
+		return fmt.Errorf("concurrency (%d) is unreasonably high (max 1024)", c.Concurrency)
 	}
 	if c.StaleTTLSec <= c.PerObjectTimeoutSec {
 		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec (%d), else a running object is reaped",

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,8 +56,39 @@ targets:
 	if tgt.Bucket != "override-bucket" {
 		t.Fatalf("per-target scalar override failed: %q", tgt.Bucket)
 	}
-	if want := "host=h port=5432 user=u password=secretpw dbname=alkemio sslmode=require"; cfg.AlkemioDB.DSN() != want {
+	want := "postgres://u:secretpw@h:5432/alkemio?sslmode=require" //nolint:gosec // test fixture, not a real credential
+	if cfg.AlkemioDB.DSN() != want {
 		t.Fatalf("composed DSN mismatch: %q", cfg.AlkemioDB.DSN())
+	}
+}
+
+// TestDSNEscapesSpecialChars guards the finding that a keyword DSN silently
+// mis-parses a password with a space / '=' — the URL form must percent-encode it.
+func TestDSNEscapesSpecialChars(t *testing.T) {
+	d := DBConfig{Host: "h", Port: 5432, User: "u", Password: "p@ss w=rd", DBName: "alkemio", SSLMode: "require"}
+	dsn := d.DSN()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("DSN is not a parseable URL: %q: %v", dsn, err)
+	}
+	pw, _ := u.User.Password()
+	if pw != "p@ss w=rd" {
+		t.Fatalf("password did not round-trip through the DSN: got %q", pw)
+	}
+	if u.Host != "h:5432" || u.Path != "/alkemio" || u.Query().Get("sslmode") != "require" {
+		t.Fatalf("DSN fields wrong: %q", dsn)
+	}
+}
+
+// TestConcurrencyFloor: a negative concurrency must not survive into pool sizing.
+func TestConcurrencyFloor(t *testing.T) {
+	t.Setenv("FBS_CONCURRENCY", "-4")
+	cfg, err := Load(filepath.Join(t.TempDir(), "none.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Concurrency != 8 {
+		t.Fatalf("negative concurrency should floor to 8, got %d", cfg.Concurrency)
 	}
 }
 

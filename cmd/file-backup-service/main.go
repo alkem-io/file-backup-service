@@ -68,8 +68,8 @@ func runMigrate(cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.LedgerDB.Host == "" || cfg.LedgerDB.DBName == "" {
-		return errors.New("ledgerDB.host and ledgerDB.dbName are required for migrate")
+	if cfg.LedgerDB.Host == "" || cfg.LedgerDB.User == "" || cfg.LedgerDB.DBName == "" {
+		return errors.New("ledgerDB.host, ledgerDB.user and ledgerDB.dbName are required for migrate")
 	}
 	if err := db.Migrate(cfg.LedgerDB.DSN()); err != nil {
 		return err

@@ -20,21 +20,25 @@ func (f fakeSource) FetchContent(context.Context, string) (io.ReadCloser, error)
 // after the object row exists (file_backup_target_status REFERENCES file_backup_object).
 type fakeLedger struct {
 	objects  map[string]bool
+	states   map[string]string // externalID+"/"+target -> last state
 	statuses int
 	fkError  bool
 }
 
-func newFakeLedger() *fakeLedger { return &fakeLedger{objects: map[string]bool{}} }
+func newFakeLedger() *fakeLedger {
+	return &fakeLedger{objects: map[string]bool{}, states: map[string]string{}}
+}
 
 func (f *fakeLedger) UpsertObject(_ context.Context, m ObjectMeta) error {
 	f.objects[m.ExternalID] = true
 	return nil
 }
-func (f *fakeLedger) UpsertTargetStatus(_ context.Context, externalID, _, _ string, _ int64) error {
+func (f *fakeLedger) UpsertTargetStatus(_ context.Context, externalID, target, state string, _ int64) error {
 	if !f.objects[externalID] {
 		f.fkError = true
 		return fmt.Errorf("fk violation: object %s absent", externalID)
 	}
+	f.states[externalID+"/"+target] = state
 	f.statuses++
 	return nil
 }
@@ -207,6 +211,29 @@ func TestPipelineNonConsumingSinkFails(t *testing.T) {
 	}
 	if !bytes.Equal(good.store[h], data) {
 		t.Fatal("healthy target should still store the object")
+	}
+}
+
+// TestPipelineAllTargetsFailRecorded: when the ONLY target fails (the single-target
+// launch config), the object is not-done but the failure is a per-target failure —
+// it must be recorded as a 'failed' target_status, NOT masquerade as a source error.
+func TestPipelineAllTargetsFailRecorded(t *testing.T) {
+	data := []byte("all targets down")
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	led := newFakeLedger()
+	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{name: "down"}, Codec: CodecNone}})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
+	if err != nil {
+		t.Fatalf("an all-targets-down failure must NOT be reported as a source error: %v", err)
+	}
+	if ok {
+		t.Fatal("object must not be done when its only target failed")
+	}
+	if led.states[h+"/down"] != "failed" {
+		t.Fatalf("expected a 'failed' target_status breadcrumb, got %q", led.states[h+"/down"])
 	}
 }
 
