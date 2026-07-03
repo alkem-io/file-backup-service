@@ -73,15 +73,32 @@ func New(d Deps) *Consumer {
 func (c *Consumer) Run(ctx context.Context) error {
 	wake := make(chan struct{}, 1)
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); c.listen(ctx, wake) }()
 	go func() { defer wg.Done(); c.reap(ctx) }()
+	go func() { defer wg.Done(); c.poll(ctx, wake) }()
 	for i := 0; i < c.d.Concurrency; i++ {
 		wg.Add(1)
 		go func() { defer wg.Done(); c.worker(ctx, wake) }()
 	}
 	wg.Wait()
 	return ctx.Err()
+}
+
+// poll signals wake every PollEvery so an idle worker re-checks even if a NOTIFY was
+// missed — ONE shared ticker feeding the wake cascade, instead of one ticker per
+// worker (which fired N empty claims against the shared DB every interval at idle).
+func (c *Consumer) poll(ctx context.Context, wake chan<- struct{}) {
+	t := time.NewTicker(c.d.PollEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			signal(wake)
+		}
+	}
 }
 
 // worker claims and processes ONE object at a time until ctx is cancelled.
@@ -92,8 +109,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 // claim it wakes a sibling so a NOTIFY burst fans out across all workers instead
 // of one worker draining it solo.
 func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
-	ticker := time.NewTicker(c.d.PollEvery)
-	defer ticker.Stop()
 	for ctx.Err() == nil {
 		entries, err := c.d.Outbox.Claim(ctx, 1)
 		if err != nil {
@@ -109,11 +124,10 @@ func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
 			c.process(ctx, entries[0])
 			continue // immediately try for the next
 		}
-		select { // outbox empty — wait for a NOTIFY wakeup or the poll floor
+		select { // outbox empty — wait for a NOTIFY or the shared poll floor
 		case <-ctx.Done():
 			return
 		case <-wake:
-		case <-ticker.C:
 		}
 	}
 }

@@ -5,15 +5,17 @@ import (
 	"time"
 )
 
-// OutboxEntry is a claimed backup-outbox row (Alkemio DB).
+// OutboxEntry is a claimed backup-outbox row (Alkemio DB). Priority is not carried
+// into Go — ordering is done DB-side in the claim SQL.
 type OutboxEntry struct {
 	ID          int64
 	FileID      string
 	ExternalID  string
-	Priority    int16
 	Size        int64     // object size (from the outbox) — recorded up front
 	CreatedBy   string    // uuid text, "" if null — breadcrumb
 	CreatedDate time.Time // when the source object was created — breadcrumb
+	Attempts    int       // genuine failures so far; 0 => never processed (dedup read is skippable)
+	Deliveries  int       // reaped/crashed claims so far
 }
 
 // Outbox is the read/claim side of the backup outbox in the Alkemio DB, accessed

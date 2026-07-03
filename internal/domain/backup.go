@@ -61,20 +61,28 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // done-gate); a flaky target leaves the object not-done for retry while never
 // blocking the healthy targets.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
-	stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
-	if err != nil {
-		return false, fmt.Errorf("ledger read: %w", err)
-	}
-	pending := make([]Target, 0, len(p.Targets))
-	for _, t := range p.Targets {
-		if stored[t.Sink.Name()] {
-			p.Metrics.ObjectDedup(t.Sink.Name())
-			continue
+	var pending []Target
+	if e.Attempts == 0 && e.Deliveries == 0 {
+		// First delivery (the dominant continuous-backup case): the object has never
+		// been processed, so no target can be stored yet — skip the guaranteed-empty
+		// dedup read (one ledger round-trip per object).
+		pending = p.Targets
+	} else {
+		stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
+		if err != nil {
+			return false, fmt.Errorf("ledger read: %w", err)
 		}
-		pending = append(pending, t)
-	}
-	if len(pending) == 0 {
-		return true, nil // every target already has it
+		pending = make([]Target, 0, len(p.Targets))
+		for _, t := range p.Targets {
+			if stored[t.Sink.Name()] {
+				p.Metrics.ObjectDedup(t.Sink.Name())
+				continue
+			}
+			pending = append(pending, t)
+		}
+		if len(pending) == 0 {
+			return true, nil // every target already has it
+		}
 	}
 
 	results, verified, ferr := p.fanOut(ctx, e, pending)
@@ -251,8 +259,14 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int
 // larger buffer via io.ReadFull first amortizes the barrier over a big chunk and
 // cuts rendezvous/scheduling ~32× — for one 1 MiB buffer of extra memory per
 // in-flight object. The hash verification still happens inside vr at true EOF.
+// fanoutBufPool reuses the 1 MiB aggregation buffer across objects (one live buffer
+// per in-flight object) instead of allocating + GCing it per BackupOne.
+var fanoutBufPool = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
+
 func fanoutCopy(fw *fanoutWriter, vr io.Reader) error {
-	buf := make([]byte, 1<<20)
+	bufp := fanoutBufPool.Get().(*[]byte)
+	defer fanoutBufPool.Put(bufp)
+	buf := *bufp
 	for {
 		n, rerr := io.ReadFull(vr, buf)
 		if n > 0 {
