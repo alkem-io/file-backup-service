@@ -36,6 +36,9 @@ type Deps struct {
 	PerObjectTimeout time.Duration
 	// OnDeadLetter is called whenever an entry is moved to dead-letter (optional).
 	OnDeadLetter func()
+	// OnObjectTimeout is called when an object hits the per-object timeout (a
+	// slow/wedged target, as distinct from a graceful shutdown) (optional).
+	OnObjectTimeout func()
 	// Logger is the structured logger.
 	Logger *zap.Logger
 }
@@ -197,6 +200,11 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 			c.d.Logger.Error("skip vanished source", zap.Int64("id", e.ID), zap.Error(serr))
 		}
 	case err != nil:
+		// A per-object timeout (objCtx deadline hit while the parent is still live)
+		// is a slow/wedged target — surface it as its own metric, not just a failure.
+		if c.d.OnObjectTimeout != nil && errors.Is(objCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			c.d.OnObjectTimeout()
+		}
 		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))
 		c.fail(bctx, e.ID, err.Error())
 	default: // !ok

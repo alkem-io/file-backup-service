@@ -19,6 +19,7 @@ type Metrics struct {
 	objects    *prometheus.CounterVec
 	bytes      *prometheus.CounterVec
 	deadletter prometheus.Counter
+	timeout    prometheus.Counter
 }
 
 // New builds a Metrics with its own registry.
@@ -40,6 +41,10 @@ func New() *Metrics {
 		deadletter: f.NewCounter(prometheus.CounterOpts{
 			Name: "filebackup_deadletter_total", Help: "Outbox entries moved to dead-letter.",
 		}),
+		timeout: f.NewCounter(prometheus.CounterOpts{
+			Name: "filebackup_object_timeout_total",
+			Help: "Objects that hit the per-object timeout (a slow or wedged target).",
+		}),
 	}
 }
 
@@ -59,6 +64,11 @@ func (m *Metrics) ObjectDedup(target string) { m.objects.WithLabelValues("dedup"
 
 // DeadLetter records an entry moved to dead-letter.
 func (m *Metrics) DeadLetter() { m.deadletter.Inc() }
+
+// ObjectTimeout records an object that hit the per-object timeout — the direct,
+// alertable signal of a slow/wedged target (a wedge otherwise only shows as a
+// slowly-climbing go_goroutines from abandoned stores).
+func (m *Metrics) ObjectTimeout() { m.timeout.Inc() }
 
 // Handler returns the Prometheus HTTP handler.
 func (m *Metrics) Handler() http.Handler {

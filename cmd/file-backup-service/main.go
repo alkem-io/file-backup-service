@@ -129,6 +129,7 @@ func serve(cfgPath string) error {
 		StaleTTL:         cfg.StaleTTL(),
 		PerObjectTimeout: cfg.PerObjectTimeout(),
 		OnDeadLetter:     mx.DeadLetter,
+		OnObjectTimeout:  mx.ObjectTimeout,
 		Logger:           logger,
 	})
 
