@@ -123,6 +123,17 @@ WHERE id=$1 AND status='in_progress'`
 	return nil
 }
 
+// Skip terminally marks an entry 'skipped' (source object gone). Guarded by
+// status='in_progress' so a lost claim is a no-op.
+func (r *OutboxRepo) Skip(ctx context.Context, id int64) error {
+	const q = `UPDATE file_backup_outbox SET status='skipped', "claimedAt"=NULL
+WHERE id=$1 AND status='in_progress'`
+	if _, err := r.p.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("skip: %w", err)
+	}
+	return nil
+}
+
 // ReapStale requeues entries stuck in_progress past ttl (a crashed/wedged
 // delivery — the per-object timeout would have Failed a merely-slow one). It
 // counts them via `deliveries` and dead-letters a crash-looping object once it

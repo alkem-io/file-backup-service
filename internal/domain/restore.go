@@ -58,6 +58,9 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 // without holding the object in memory and without OOMing on a bomb. scratchDir
 // MUST be real disk (not tmpfs) — a multi-GB verify on tmpfs would exhaust RAM.
 func VerifyObject(ctx context.Context, src Sink, hash, scratchDir string) error {
+	if err := os.MkdirAll(scratchDir, 0o755); err != nil { //nolint:gosec // operator scratch dir
+		return fmt.Errorf("mkdir scratch: %w", err)
+	}
 	tmp, err := decodeToTemp(ctx, src, hash, scratchDir)
 	if err != nil {
 		return err

@@ -80,11 +80,15 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 	_, err := s.client.StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
 	if err != nil {
 		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden ||
-			resp.Code == "NoSuchKey" || resp.Code == "AccessDenied" {
+		// Only a definite 404/NoSuchKey means absent. A 403/AccessDenied is NOT
+		// "absent" — on a PutObject-only WORM credential HEAD is always denied, and
+		// on a real credential/endpoint fault everything is denied; either way we
+		// cannot conclude the object is missing, so surface it as an error rather
+		// than letting a future reconcile treat a permission fault as a gap to refill.
+		if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
 			return false, nil
 		}
-		return false, fmt.Errorf("stat: %w", err)
+		return false, fmt.Errorf("stat %s: %w", s.key(hash), err)
 	}
 	return true, nil
 }

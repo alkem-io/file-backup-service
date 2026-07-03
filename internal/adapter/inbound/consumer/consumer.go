@@ -5,6 +5,7 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -180,6 +181,13 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 		// objects toward dead-letter.
 		if rerr := c.d.Outbox.Release(bctx, e.ID); rerr != nil {
 			c.d.Logger.Error("release claim on shutdown", zap.Int64("id", e.ID), zap.Error(rerr))
+		}
+	case errors.Is(err, domain.ErrSourceGone):
+		// The source was deleted before we could back it up — benign and terminal.
+		// Skip it so it doesn't burn ~10 retries and page on a non-problem.
+		c.d.Logger.Info("source gone, skipping", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID))
+		if serr := c.d.Outbox.Skip(bctx, e.ID); serr != nil {
+			c.d.Logger.Error("skip vanished source", zap.Int64("id", e.ID), zap.Error(serr))
 		}
 	case err != nil:
 		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))

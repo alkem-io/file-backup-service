@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 // Client streams object content from file-service.
@@ -56,7 +58,13 @@ func (c *Client) FetchContent(ctx context.Context, fileID string) (io.ReadCloser
 		return nil, fmt.Errorf("fetch content: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// Drain (bounded) before Close so the keep-alive connection is reused instead
+		// of torn down under a sustained error burst.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("file-service GET %s: %w", reqURL, domain.ErrSourceGone)
+		}
 		return nil, fmt.Errorf("file-service GET %s: status %d", reqURL, resp.StatusCode)
 	}
 	return resp.Body, nil

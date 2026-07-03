@@ -3,6 +3,7 @@ package domain
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -234,6 +235,24 @@ func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 	}
 	if led.states[h+"/down"] != "failed" {
 		t.Fatalf("expected a 'failed' target_status breadcrumb, got %q", led.states[h+"/down"])
+	}
+}
+
+// goneSource models a source object deleted before backup (404 → ErrSourceGone).
+type goneSource struct{}
+
+func (goneSource) FetchContent(context.Context, string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("file-service GET: %w", ErrSourceGone)
+}
+
+// TestPipelineSourceGonePropagates: a vanished source must surface ErrSourceGone
+// so the consumer can mark the entry 'skipped' instead of retrying it.
+func TestPipelineSourceGonePropagates(t *testing.T) {
+	p := NewPipeline(goneSource{}, newFakeLedger(),
+		[]Target{{Sink: &memSink{name: "t", store: map[string][]byte{}}, Codec: CodecNone}})
+	_, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "abc"})
+	if !errors.Is(err, ErrSourceGone) {
+		t.Fatalf("expected ErrSourceGone to propagate, got %v", err)
 	}
 }
 

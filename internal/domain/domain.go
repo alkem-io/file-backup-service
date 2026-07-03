@@ -5,8 +5,15 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"io"
 )
+
+// ErrSourceGone means the source object no longer exists (e.g. it was deleted
+// before it could be backed up) — a benign TERMINAL condition, not a transient
+// failure. The consumer records the outbox entry 'skipped' rather than retrying it
+// toward dead-letter (which would burn ~10 attempts and page on a non-problem).
+var ErrSourceGone = errors.New("source object no longer exists")
 
 // Sink is a dumb, content-addressed byte store keyed by the content hash
 // (externalID). No index, no packing: a stored object is restorable with only

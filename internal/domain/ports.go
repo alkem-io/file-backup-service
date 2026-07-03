@@ -34,6 +34,9 @@ type Outbox interface {
 	// Release returns a claim to pending WITHOUT counting an attempt — used on
 	// graceful shutdown, where a cancelled in-flight object is not a failure.
 	Release(ctx context.Context, id int64) error
+	// Skip terminally records an entry as 'skipped' — the source object no longer
+	// exists (ErrSourceGone), which is benign, not a failure to retry.
+	Skip(ctx context.Context, id int64) error
 	// Probe verifies the outbox is reachable AND has the columns the consumer
 	// depends on (visibleAt/deliveries/attempts/claimedAt/size) so a scoped-role or
 	// schema/contract drift fails loudly at startup, not as a green-health silent
