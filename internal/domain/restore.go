@@ -81,13 +81,13 @@ func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, 
 	h := sha3.New256()
 	// Cap the raw download too — a hostile/corrupt stored object must not fill the
 	// primary store during a restore (the decoded cap alone left Stage 1 unbounded).
-	n, err := io.Copy(io.MultiWriter(raw, h), io.LimitReader(rc, maxRestoreBytes+1))
+	rawN, err := io.Copy(io.MultiWriter(raw, h), io.LimitReader(rc, maxRestoreBytes+1))
 	if err != nil {
 		_ = raw.Close()
 		_ = os.Remove(rawName)
 		return "", fmt.Errorf("read: %w", err)
 	}
-	if n > maxRestoreBytes {
+	if rawN > maxRestoreBytes {
 		_ = raw.Close()
 		_ = os.Remove(rawName)
 		return "", fmt.Errorf("stored object exceeds %d bytes (possible corruption)", maxRestoreBytes)
