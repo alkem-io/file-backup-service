@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 type fakeSource struct{ data []byte }
@@ -137,6 +139,74 @@ func TestPipelineSingleFetchFanOut(t *testing.T) {
 	}
 	if !bytes.Equal(a.store[h], data) || !bytes.Equal(b.store[h], data) {
 		t.Fatal("both targets must receive the full object from one fetch")
+	}
+}
+
+// TestPipelineZstdTarget exercises the zstd fan-out branch: the target receives
+// compressed bytes that decompress back to the plaintext.
+func TestPipelineZstdTarget(t *testing.T) {
+	data := bytes.Repeat([]byte("zstd fan-out payload "), 100)
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSink{name: "z", store: map[string][]byte{}}
+	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecZstd}})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
+	if err != nil || !ok {
+		t.Fatalf("backup: ok=%v err=%v", ok, err)
+	}
+	if bytes.Equal(sink.store[h], data) {
+		t.Fatal("expected compressed bytes, got plaintext")
+	}
+	dec, err := zstd.NewReader(bytes.NewReader(sink.store[h]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	out, err := io.ReadAll(dec)
+	if err != nil || !bytes.Equal(out, data) {
+		t.Fatalf("zstd target round-trip mismatch: %v", err)
+	}
+}
+
+// nonConsumingSink reports success without ever reading its stream — models a
+// misbehaving sink that must NOT be recorded as stored.
+type nonConsumingSink struct{ name string }
+
+func (n *nonConsumingSink) Name() string                                 { return n.name }
+func (n *nonConsumingSink) Exists(context.Context, string) (bool, error) { return false, nil }
+func (n *nonConsumingSink) Store(context.Context, string, io.Reader, int64) (int64, error) {
+	return 0, nil // success, but consumed nothing
+}
+func (n *nonConsumingSink) Fetch(context.Context, string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("unavailable")
+}
+func (n *nonConsumingSink) PutManifest(context.Context, string, io.Reader) error { return nil }
+
+// TestPipelineNonConsumingSinkFails: a sink that returns success without reading
+// the verified stream must be forced to failed (dead-pipe cross-check), so the
+// object is not marked done, while the healthy target still stores.
+func TestPipelineNonConsumingSinkFails(t *testing.T) {
+	data := []byte("hello dead pipe")
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := &memSink{name: "good", store: map[string][]byte{}}
+	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{
+		{Sink: &nonConsumingSink{name: "bad"}, Codec: CodecNone},
+		{Sink: good, Codec: CodecNone},
+	})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ok {
+		t.Fatal("a sink that reported success without consuming the stream must not make the object done")
+	}
+	if !bytes.Equal(good.store[h], data) {
+		t.Fatal("healthy target should still store the object")
 	}
 }
 
