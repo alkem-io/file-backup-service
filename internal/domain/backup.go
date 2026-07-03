@@ -128,6 +128,13 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		wg.Add(1)
 		go func(i int, t Target, pr *io.PipeReader) {
 			defer wg.Done()
+			// A panicking sink must fail its target, not crash the worker.
+			defer func() {
+				if r := recover(); r != nil {
+					results[i] = targetResult{err: fmt.Errorf("sink %s panicked: %v", t.Sink.Name(), r)}
+					_ = pr.CloseWithError(errAbortedBeforeEOF)
+				}
+			}()
 			var reader io.Reader = pr
 			if t.Codec == CodecZstd {
 				zr := ZstdReader(pr)
@@ -149,7 +156,9 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 	for i := range writers {
 		fw.writers[i] = writers[i]
 	}
-	_, copyErr := io.Copy(fw, vr) // copyErr set on a source integrity failure
+	// copyErr is set on a SOURCE failure: a VerifyReader hash mismatch (corrupt
+	// source) or ctx cancellation/timeout during the read.
+	_, copyErr := io.Copy(fw, vr)
 	for _, pw := range writers {
 		_ = pw.CloseWithError(copyErr)
 	}
@@ -161,6 +170,11 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		if fw.dead[i] && results[i].err == nil {
 			results[i].err = errAbortedBeforeEOF
 		}
+	}
+	if copyErr != nil {
+		// Surface the real source error (integrity / cancellation) instead of
+		// letting it masquerade as N target-store failures.
+		return results, vr.Total, fmt.Errorf("source read: %w", copyErr)
 	}
 	return results, vr.Total, nil
 }

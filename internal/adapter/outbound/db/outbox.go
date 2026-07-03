@@ -88,6 +88,17 @@ RETURNING status = 'dead_letter'`
 // maxAttempts is the dead-letter threshold (configurable later — FR-006).
 const maxAttempts = 10
 
+// Release returns a claim to pending WITHOUT incrementing attempts (a graceful
+// shutdown of an in-flight object is not a failure). No-op if the claim is lost.
+func (r *OutboxRepo) Release(ctx context.Context, id int64) error {
+	const q = `UPDATE file_backup_outbox SET status='pending', "claimedAt"=NULL
+WHERE id=$1 AND status='in_progress'`
+	if _, err := r.p.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("release: %w", err)
+	}
+	return nil
+}
+
 // ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
 func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) error {
 	const q = `UPDATE file_backup_outbox

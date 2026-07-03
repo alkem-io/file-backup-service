@@ -92,11 +92,11 @@ func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := &memSink{name: "t1", store: map[string][]byte{}}
 	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "deadbeef"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected the source integrity error to be surfaced, not hidden as a target failure")
 	}
 	if ok {
-		t.Fatal("expected required target to fail the integrity check")
+		t.Fatal("corrupt source must not report success")
 	}
 	if len(sink.store) != 0 {
 		t.Fatal("corrupt object must not be committed to the sink")

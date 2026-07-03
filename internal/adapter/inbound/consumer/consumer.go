@@ -5,6 +5,7 @@ package consumer
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -137,25 +138,44 @@ func (c *Consumer) drain(ctx context.Context) {
 }
 
 func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
+	// A panic in the pipeline/dispatcher must not crash the whole worker — count
+	// it as a failure so a poison object dead-letters instead of crash-looping.
+	defer func() {
+		if r := recover(); r != nil {
+			c.d.Logger.Error("panic backing up object", zap.Int64("id", e.ID),
+				zap.String("hash", e.ExternalID), zap.Any("panic", r), zap.Stack("stack"))
+			bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			c.fail(bctx, e.ID, fmt.Sprintf("panic: %v", r))
+		}
+	}()
+
 	objCtx, cancel := context.WithTimeout(ctx, c.d.PerObjectTimeout)
 	defer cancel()
 	ok, err := c.d.Pipeline.BackupOne(objCtx, e)
 
-	// Bookkeeping (fail / mark-done) MUST survive per-object-timeout and
-	// shutdown cancellation, or the row is stranded in_progress. Detach from the
-	// cancelled ctx with a fresh short deadline.
+	// Bookkeeping MUST survive per-object-timeout and shutdown cancellation, or the
+	// row is stranded in_progress. Detach from the cancelled ctx with a fresh deadline.
 	bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer bcancel()
+
 	switch {
-	case err != nil:
-		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))
-		c.fail(bctx, e.ID, err.Error())
-	case !ok:
-		c.fail(bctx, e.ID, "not all targets stored")
-	default:
+	case ok && err == nil:
 		if derr := c.d.Outbox.MarkDone(bctx, e.ID); derr != nil {
 			c.d.Logger.Error("mark done", zap.Int64("id", e.ID), zap.Error(derr))
 		}
+	case ctx.Err() != nil:
+		// Shutdown cancelled an incomplete backup — NOT a genuine failure. Release
+		// the claim without counting an attempt, so deploy churn doesn't march
+		// objects toward dead-letter.
+		if rerr := c.d.Outbox.Release(bctx, e.ID); rerr != nil {
+			c.d.Logger.Error("release claim on shutdown", zap.Int64("id", e.ID), zap.Error(rerr))
+		}
+	case err != nil:
+		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))
+		c.fail(bctx, e.ID, err.Error())
+	default: // !ok
+		c.fail(bctx, e.ID, "not all targets stored")
 	}
 }
 

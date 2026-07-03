@@ -28,6 +28,9 @@ type Outbox interface {
 	Fail(ctx context.Context, id int64, reason string) (bool, error)
 	// ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
 	ReapStale(ctx context.Context, ttl time.Duration) error
+	// Release returns a claim to pending WITHOUT counting an attempt — used on
+	// graceful shutdown, where a cancelled in-flight object is not a failure.
+	Release(ctx context.Context, id int64) error
 }
 
 // ObjectMeta are the ledger breadcrumbs for one backed-up object.
