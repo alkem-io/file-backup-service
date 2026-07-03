@@ -23,7 +23,7 @@ const claimSQL = `UPDATE file_backup_outbox
 SET status='in_progress', "claimedAt"=now()
 WHERE id IN (
   SELECT id FROM file_backup_outbox
-  WHERE status='pending'
+  WHERE status='pending' AND ("visibleAt" IS NULL OR "visibleAt" <= now())
   ORDER BY priority DESC, "createdDate"
   LIMIT $1
   FOR UPDATE SKIP LOCKED
@@ -72,7 +72,8 @@ func (r *OutboxRepo) Fail(ctx context.Context, id int64, reason string) (bool, e
 SET attempts = attempts + 1,
     status = CASE WHEN attempts + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
     "lastError" = $3,
-    "claimedAt" = NULL
+    "claimedAt" = NULL,
+    "visibleAt" = now() + LEAST(make_interval(secs => 5 * (2 ^ attempts)), interval '10 minutes')
 WHERE id = $1 AND status = 'in_progress'
 RETURNING status = 'dead_letter'`
 	var deadLettered bool
@@ -85,8 +86,12 @@ RETURNING status = 'dead_letter'`
 	return deadLettered, nil
 }
 
-// maxAttempts is the dead-letter threshold (configurable later — FR-006).
+// maxAttempts is the genuine-failure dead-letter threshold (configurable later — FR-006).
 const maxAttempts = 10
+
+// maxDeliveries dead-letters an object that repeatedly crashes/wedges the worker
+// (counted by the reaper). Set well above any slow object's expected reap count.
+const maxDeliveries = 50
 
 // Probe verifies the outbox is reachable via the scoped role (table + SELECT).
 // An empty table (ErrNoRows) is success — only a missing table / lost permission
@@ -103,7 +108,7 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 // Release returns a claim to pending WITHOUT incrementing attempts (a graceful
 // shutdown of an in-flight object is not a failure). No-op if the claim is lost.
 func (r *OutboxRepo) Release(ctx context.Context, id int64) error {
-	const q = `UPDATE file_backup_outbox SET status='pending', "claimedAt"=NULL
+	const q = `UPDATE file_backup_outbox SET status='pending', "claimedAt"=NULL, "visibleAt"=NULL
 WHERE id=$1 AND status='in_progress'`
 	if _, err := r.p.Exec(ctx, q, id); err != nil {
 		return fmt.Errorf("release: %w", err)
@@ -111,12 +116,19 @@ WHERE id=$1 AND status='in_progress'`
 	return nil
 }
 
-// ReapStale returns entries stuck in_progress past ttl to pending (crash safety).
+// ReapStale requeues entries stuck in_progress past ttl (a crashed/wedged
+// delivery — the per-object timeout would have Failed a merely-slow one). It
+// counts them via `deliveries` and dead-letters a crash-looping object once it
+// exceeds maxDeliveries, so a poison object that repeatedly kills the worker
+// can't loop forever while a slow object (never reaped) is never penalised.
 func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) error {
 	const q = `UPDATE file_backup_outbox
-SET status='pending', "claimedAt"=NULL
+SET deliveries = deliveries + 1,
+    status = CASE WHEN deliveries + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
+    "lastError" = CASE WHEN deliveries + 1 >= $2 THEN 'crash-loop: exceeded max deliveries' ELSE "lastError" END,
+    "claimedAt" = NULL
 WHERE status='in_progress' AND "claimedAt" < now() - make_interval(secs => $1)`
-	if _, err := r.p.Exec(ctx, q, ttl.Seconds()); err != nil {
+	if _, err := r.p.Exec(ctx, q, ttl.Seconds(), maxDeliveries); err != nil {
 		return fmt.Errorf("reap stale: %w", err)
 	}
 	return nil
