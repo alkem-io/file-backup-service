@@ -14,6 +14,8 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
+
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // Config configures an S3 sink.
@@ -59,10 +61,7 @@ func New(cfg Config) (*Sink, error) {
 func (s *Sink) Name() string { return s.name }
 
 func (s *Sink) key(hash string) string {
-	if len(hash) >= 4 {
-		return path.Join(s.prefix, hash[0:2], hash[2:4], hash)
-	}
-	return path.Join(s.prefix, hash)
+	return path.Join(s.prefix, fsutil.ShardKey(hash))
 }
 
 func (s *Sink) putOpts() minio.PutObjectOptions {

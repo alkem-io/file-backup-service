@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // Sink stores objects on a filesystem path.
@@ -23,10 +25,7 @@ func New(name, root string) *Sink { return &Sink{name: name, root: root} }
 func (s *Sink) Name() string { return s.name }
 
 func (s *Sink) pathFor(hash string) string {
-	if len(hash) >= 4 {
-		return filepath.Join(s.root, hash[0:2], hash[2:4], hash)
-	}
-	return filepath.Join(s.root, hash)
+	return filepath.Join(s.root, filepath.FromSlash(fsutil.ShardKey(hash)))
 }
 
 // Exists reports whether the object is present.
@@ -79,7 +78,7 @@ func (s *Sink) Store(_ context.Context, hash string, r io.Reader, _ int64) (int6
 		return 0, fmt.Errorf("rename: %w", err)
 	}
 	// fsync the directory so the rename survives power-loss — atomic != durable.
-	if err := syncDir(dir); err != nil {
+	if err := fsutil.SyncDir(dir); err != nil {
 		return 0, fmt.Errorf("sync dir: %w", err)
 	}
 	return n, nil
@@ -119,20 +118,7 @@ func (s *Sink) PutManifest(_ context.Context, name string, r io.Reader) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("rename manifest: %w", err)
 	}
-	return syncDir(dir)
-}
-
-// syncDir fsyncs a directory so a rename/create within it is durable.
-func syncDir(dir string) error {
-	d, err := os.Open(dir) //nolint:gosec // dir is under the configured root
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
+	return fsutil.SyncDir(dir)
 }
 
 func firstErr(errs ...error) error {

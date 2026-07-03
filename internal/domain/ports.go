@@ -22,7 +22,7 @@ type Outbox interface {
 	// Claim atomically claims up to n pending rows (priority DESC, createdDate)
 	// with FOR UPDATE SKIP LOCKED.
 	Claim(ctx context.Context, n int) ([]OutboxEntry, error)
-	// MarkDone marks an entry done once all required targets confirm.
+	// MarkDone marks an entry done once every configured target confirms (symmetric).
 	MarkDone(ctx context.Context, id int64) error
 	// Fail records a failure — re-queues, or dead-letters past the attempt limit.
 	// Returns true when the entry was moved to dead-letter.

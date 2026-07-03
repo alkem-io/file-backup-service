@@ -5,12 +5,8 @@ package domain
 
 import (
 	"context"
-	"errors"
 	"io"
 )
-
-// ErrNotImplemented marks scaffold seams pending their implementation task.
-var ErrNotImplemented = errors.New("not implemented")
 
 // Sink is a dumb, content-addressed byte store keyed by the content hash
 // (externalID). No index, no packing: a stored object is restorable with only

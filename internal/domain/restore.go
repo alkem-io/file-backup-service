@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // maxRestoreBytes caps a decoded object so a corrupt/hostile zstd frame (a
@@ -25,8 +27,12 @@ const maxRestoreBytes int64 = 16 << 30 // 16 GiB
 func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	dest := filepath.Join(destDir, hash)
 	if _, err := os.Stat(dest); err == nil {
-		if ok, _ := verifyFile(dest, hash); ok {
-			return nil // already present and intact
+		if f, oerr := os.Open(dest); oerr == nil { //nolint:gosec // primary-store path
+			ok, _ := Verify(hash, f)
+			_ = f.Close()
+			if ok {
+				return nil // already present and intact
+			}
 		}
 		// present but corrupt/mismatched — overwrite with the good backup copy.
 	}
@@ -45,7 +51,7 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	if err := os.Rename(tmp, dest); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
-	return fsyncDir(filepath.Dir(dest))
+	return fsutil.SyncDir(filepath.Dir(dest))
 }
 
 // VerifyObject streams hash from src and confirms it decodes+hashes to hash,
@@ -137,29 +143,3 @@ func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, 
 	return outName, nil
 }
 
-// verifyFile reports whether the plaintext file at path hashes to hash.
-func verifyFile(path, hash string) (bool, error) {
-	f, err := os.Open(path) //nolint:gosec // caller-provided primary-store path
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = f.Close() }()
-	h := sha3.New256()
-	if _, err := io.Copy(h, f); err != nil {
-		return false, err
-	}
-	return hex.EncodeToString(h.Sum(nil)) == hash, nil
-}
-
-// fsyncDir makes a rename/create within dir durable.
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir) //nolint:gosec // destination dir under the primary store
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
-}
