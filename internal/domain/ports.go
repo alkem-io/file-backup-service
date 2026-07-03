@@ -61,12 +61,10 @@ type TargetStatus struct {
 
 // Ledger records backup metadata in this service's own database.
 type Ledger interface {
-	// UpsertObject records an object (idempotent).
-	UpsertObject(ctx context.Context, e ObjectMeta) error
-	// RecordTargetStatuses writes every per-target status for externalID in ONE
-	// batched round-trip (idempotent; never downgrades a durable 'stored' to
-	// 'failed') — so a backfill of millions of objects isn't N+1 round-trips each.
-	RecordTargetStatuses(ctx context.Context, externalID string, statuses []TargetStatus) error
+	// RecordBackup writes the object row (FK parent) and every per-target status in
+	// ONE atomic round-trip (idempotent; never downgrades a durable 'stored' to
+	// 'failed') — so a backfill of millions of objects isn't N+ round-trips each.
+	RecordBackup(ctx context.Context, obj ObjectMeta, statuses []TargetStatus) error
 	// StoredTargets returns the set of target names already in state='stored' for
 	// externalID, in one query — the dedup source of truth (never re-reads a
 	// target, so it works with PutObject-only WORM credentials).

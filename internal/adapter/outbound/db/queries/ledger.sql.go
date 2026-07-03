@@ -7,8 +7,6 @@ package queries
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const listTargetStates = `-- name: ListTargetStates :many
@@ -38,27 +36,4 @@ func (q *Queries) ListTargetStates(ctx context.Context, externalid string) ([]Li
 		return nil, err
 	}
 	return items, nil
-}
-
-const upsertObject = `-- name: UpsertObject :exec
-INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate")
-VALUES ($1, $2, $3, $4)
-ON CONFLICT ("externalID") DO NOTHING
-`
-
-type UpsertObjectParams struct {
-	ExternalID        string             `json:"externalID"`
-	Size              int64              `json:"size"`
-	CreatedBy         pgtype.UUID        `json:"createdBy"`
-	SourceCreatedDate pgtype.Timestamptz `json:"sourceCreatedDate"`
-}
-
-func (q *Queries) UpsertObject(ctx context.Context, arg UpsertObjectParams) error {
-	_, err := q.db.Exec(ctx, upsertObject,
-		arg.ExternalID,
-		arg.Size,
-		arg.CreatedBy,
-		arg.SourceCreatedDate,
-	)
-	return err
 }

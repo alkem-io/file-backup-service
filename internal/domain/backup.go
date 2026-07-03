@@ -88,18 +88,13 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
 	defer cancel()
 
-	// Record the object row (FK parent for the statuses) with the VERIFIED plaintext
-	// size when we have it — the outbox size is the producer's unverified hearsay;
-	// the hash guarantees these bytes. On an all-targets-fail (verified<0) fall back
-	// to the outbox size so the object + its failed statuses still leave a trace.
+	// Use the VERIFIED plaintext size when we have it — the outbox size is the
+	// producer's unverified hearsay; the hash guarantees these bytes. On an
+	// all-targets-fail (verified<0) fall back to the outbox size so the object + its
+	// failed statuses still leave a trace.
 	objSize := e.Size
 	if verified >= 0 {
 		objSize = verified
-	}
-	if err := p.Ledger.UpsertObject(bctx, ObjectMeta{
-		ExternalID: e.ExternalID, Size: objSize, CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
-	}); err != nil {
-		return false, fmt.Errorf("ledger object: %w", err)
 	}
 
 	statuses := make([]TargetStatus, len(pending))
@@ -115,8 +110,11 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		p.Metrics.ObjectStored(name, results[i].stored)
 		statuses[i] = TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored}
 	}
-	if err := p.Ledger.RecordTargetStatuses(bctx, e.ExternalID, statuses); err != nil {
-		return false, fmt.Errorf("ledger target status: %w", err)
+	// Object row + all statuses in one atomic write (FK parent first, inside the CTE).
+	if err := p.Ledger.RecordBackup(bctx, ObjectMeta{
+		ExternalID: e.ExternalID, Size: objSize, CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
+	}, statuses); err != nil {
+		return false, fmt.Errorf("ledger record: %w", err)
 	}
 	return allStored, nil
 }

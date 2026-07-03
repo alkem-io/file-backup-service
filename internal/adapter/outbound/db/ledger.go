@@ -11,47 +11,49 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
-// LedgerRepo implements domain.Ledger over the sqlc-generated queries (own DB).
+// LedgerRepo implements domain.Ledger over the sqlc-generated queries (own DB),
+// plus one raw pgx CTE (RecordBackup) that sqlc's analyzer can't type.
 type LedgerRepo struct {
+	p *Pool
 	q *queries.Queries
 }
 
 // NewLedgerRepo binds a LedgerRepo to the ledger pool.
-func NewLedgerRepo(p *Pool) *LedgerRepo { return &LedgerRepo{q: queries.New(p.Pool)} }
+func NewLedgerRepo(p *Pool) *LedgerRepo { return &LedgerRepo{p: p, q: queries.New(p.Pool)} }
 
-// UpsertObject records an object (idempotent).
-func (r *LedgerRepo) UpsertObject(ctx context.Context, e domain.ObjectMeta) error {
-	return r.q.UpsertObject(ctx, queries.UpsertObjectParams{
-		ExternalID:        e.ExternalID,
-		Size:              e.Size,
-		CreatedBy:         uuidOrNull(e.CreatedBy),
-		SourceCreatedDate: timestamptzOrNull(e.SourceCreatedDate),
-	})
-}
+// recordBackupSQL writes the object row (FK parent) and every per-target status in
+// ONE atomic statement. The data-modifying CTE inserts the object first; the FK
+// check on the status rows sees it (same transaction), so ordering holds. Verified
+// against Postgres 16 (FK, idempotency, and the no-downgrade CASE). Mirrors the
+// ledger schema; there is no second copy (this replaces UpsertObject + the status
+// batch).
+const recordBackupSQL = `WITH obj AS (
+  INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate")
+  VALUES ($1, $2, $3, $4) ON CONFLICT ("externalID") DO NOTHING
+)
+INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
+SELECT $1, t.target, t.state, t.bytes, CASE WHEN t.state = 'stored' THEN now() ELSE NULL END
+FROM unnest($5::text[], $6::text[], $7::bigint[]) AS t(target, state, bytes)
+ON CONFLICT ("externalID", target) DO UPDATE SET
+  state = CASE WHEN file_backup_target_status.state = 'stored' AND EXCLUDED.state <> 'stored'
+               THEN file_backup_target_status.state ELSE EXCLUDED.state END,
+  "storedBytes" = CASE WHEN EXCLUDED.state = 'stored' THEN EXCLUDED."storedBytes"
+                       ELSE file_backup_target_status."storedBytes" END,
+  "verifiedAt" = CASE WHEN EXCLUDED.state = 'stored' THEN now()
+                      ELSE file_backup_target_status."verifiedAt" END`
 
-// RecordTargetStatuses writes every per-target status in one batched round-trip.
-func (r *LedgerRepo) RecordTargetStatuses(ctx context.Context, externalID string, statuses []domain.TargetStatus) error {
-	if len(statuses) == 0 {
-		return nil
-	}
-	params := make([]queries.BatchUpsertTargetStatusParams, len(statuses))
+// RecordBackup writes the object row + all per-target statuses atomically (one RTT).
+func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, statuses []domain.TargetStatus) error {
+	targets := make([]string, len(statuses))
+	states := make([]string, len(statuses))
+	storedBytes := make([]int64, len(statuses))
 	for i, s := range statuses {
-		params[i] = queries.BatchUpsertTargetStatusParams{
-			ExternalID:  externalID,
-			Target:      s.Target,
-			State:       s.State,
-			StoredBytes: pgtype.Int8{Int64: s.StoredBytes, Valid: true},
-		}
+		targets[i], states[i], storedBytes[i] = s.Target, s.State, s.StoredBytes
 	}
-	var firstErr error
-	// Exec closes the underlying batch results; capture the first per-query error.
-	r.q.BatchUpsertTargetStatus(ctx, params).Exec(func(_ int, err error) {
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	})
-	if firstErr != nil {
-		return fmt.Errorf("batch target status: %w", firstErr)
+	if _, err := r.p.Exec(ctx, recordBackupSQL,
+		obj.ExternalID, obj.Size, uuidOrNull(obj.CreatedBy), timestamptzOrNull(obj.SourceCreatedDate),
+		targets, states, storedBytes); err != nil {
+		return fmt.Errorf("record backup: %w", err)
 	}
 	return nil
 }

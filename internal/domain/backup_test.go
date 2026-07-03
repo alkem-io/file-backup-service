@@ -24,25 +24,19 @@ type fakeLedger struct {
 	sizes    map[string]int64  // externalID -> recorded object size
 	states   map[string]string // externalID+"/"+target -> last state
 	statuses int
-	fkError  bool
 }
 
 func newFakeLedger() *fakeLedger {
 	return &fakeLedger{objects: map[string]bool{}, sizes: map[string]int64{}, states: map[string]string{}}
 }
 
-func (f *fakeLedger) UpsertObject(_ context.Context, m ObjectMeta) error {
+func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []TargetStatus) error {
+	// The real CTE writes the object (FK parent) before the statuses atomically;
+	// the fake records both together.
 	f.objects[m.ExternalID] = true
 	f.sizes[m.ExternalID] = m.Size
-	return nil
-}
-func (f *fakeLedger) RecordTargetStatuses(_ context.Context, externalID string, statuses []TargetStatus) error {
-	if !f.objects[externalID] {
-		f.fkError = true
-		return fmt.Errorf("fk violation: object %s absent", externalID)
-	}
 	for _, s := range statuses {
-		f.states[externalID+"/"+s.Target] = s.State
+		f.states[m.ExternalID+"/"+s.Target] = s.State
 		f.statuses++
 	}
 	return nil
@@ -90,9 +84,6 @@ func TestPipelineBackupOne(t *testing.T) {
 	}
 	if !bytes.Equal(sink.store[h], data) {
 		t.Fatal("stored bytes mismatch")
-	}
-	if led.fkError {
-		t.Fatal("target status written before object row (FK order)")
 	}
 	if !led.objects[h] || led.statuses != 1 {
 		t.Fatalf("ledger not updated: %+v", led)
