@@ -200,7 +200,11 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		case ctx.Err() != nil:
 			return results, -1, fmt.Errorf("backup aborted: %w", ctx.Err())
 		case errors.Is(copyErr, io.ErrClosedPipe):
-			// all targets dead — results carry the per-target errors; not a source fault
+			// All targets dead — results carry the per-target errors; not a source
+			// fault. The stream was NOT read to EOF/hash-verified, so the size is
+			// unknown: return -1 so BackupOne falls back to the outbox size rather
+			// than freezing a partial vr.Total into the ledger (ON CONFLICT DO NOTHING).
+			return results, -1, nil
 		default:
 			return results, -1, fmt.Errorf("source read: %w", copyErr)
 		}

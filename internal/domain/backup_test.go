@@ -21,17 +21,19 @@ func (f fakeSource) FetchContent(context.Context, string) (io.ReadCloser, error)
 // after the object row exists (file_backup_target_status REFERENCES file_backup_object).
 type fakeLedger struct {
 	objects  map[string]bool
+	sizes    map[string]int64  // externalID -> recorded object size
 	states   map[string]string // externalID+"/"+target -> last state
 	statuses int
 	fkError  bool
 }
 
 func newFakeLedger() *fakeLedger {
-	return &fakeLedger{objects: map[string]bool{}, states: map[string]string{}}
+	return &fakeLedger{objects: map[string]bool{}, sizes: map[string]int64{}, states: map[string]string{}}
 }
 
 func (f *fakeLedger) UpsertObject(_ context.Context, m ObjectMeta) error {
 	f.objects[m.ExternalID] = true
+	f.sizes[m.ExternalID] = m.Size
 	return nil
 }
 func (f *fakeLedger) RecordTargetStatuses(_ context.Context, externalID string, statuses []TargetStatus) error {
@@ -237,6 +239,27 @@ func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 	}
 	if led.states[h+"/down"] != "failed" {
 		t.Fatalf("expected a 'failed' target_status breadcrumb, got %q", led.states[h+"/down"])
+	}
+}
+
+// TestPipelineAllTargetsFailRecordsOutboxSize guards the regression where an
+// all-targets-dead backup recorded a PARTIAL vr.Total (bytes read before the
+// pipes died) as the object size, frozen forever by ON CONFLICT DO NOTHING. The
+// object must exceed one io.Copy buffer so a partial read is distinguishable.
+func TestPipelineAllTargetsFailRecordsOutboxSize(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 200*1024) // > 32 KiB io.Copy buffer
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	led := newFakeLedger()
+	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{name: "down"}, Codec: CodecNone}})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h, Size: int64(len(data))})
+	if err != nil || ok {
+		t.Fatalf("all-targets-fail: ok=%v err=%v", ok, err)
+	}
+	if led.sizes[h] != int64(len(data)) {
+		t.Fatalf("all-fail must record the outbox size %d, not a partial %d", len(data), led.sizes[h])
 	}
 }
 

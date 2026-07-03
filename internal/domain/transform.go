@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"io"
 	"sync"
 
@@ -39,6 +40,15 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
 		enc := zstdEncoderPool.Get().(*zstd.Encoder)
+		// A panic in the encoder must fail THIS target, not crash the worker — a
+		// recover only catches its own goroutine, and every other sink-facing
+		// goroutine is guarded the same way. A panicked encoder is in an unknown
+		// state, so it is dropped (GC'd), never returned to the pool.
+		defer func() {
+			if r := recover(); r != nil {
+				pw.CloseWithError(fmt.Errorf("zstd encode panicked: %v", r))
+			}
+		}()
 		enc.Reset(pw)
 		_, err := io.Copy(enc, src)
 		if cerr := enc.Close(); err == nil {
@@ -51,5 +61,5 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 	return pr
 }
 
-// The restore-side hash-arbiter (raw-first, then bounded zstd) is implemented
-// as a streamed decode in restore.go's decodeToTemp — no whole-object buffering.
+// The restore-side hash-arbiter (magic-peek: bounded zstd if the frame magic is
+// present, else raw) is a streamed single-pass decode in restore.go's decodeStream.

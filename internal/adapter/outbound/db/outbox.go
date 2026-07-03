@@ -103,9 +103,14 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 		id   int64
 		cols any
 	)
-	const q = `SELECT id, "visibleAt", deliveries, attempts, "claimedAt", size
+	// Every column the consumer's SQL reads or writes (Claim RETURNING, Fail/
+	// ReapStale SET, the claim WHERE) — so a stale/renamed column in the server
+	// migration dies here at startup, not as a green-health silent stall.
+	const q = `SELECT id, "fileId", "externalID", priority, status, attempts,
+	  deliveries, "lastError", "createdBy", "createdDate", size, "claimedAt", "visibleAt"
 	FROM file_backup_outbox LIMIT 1`
-	err := r.p.QueryRow(ctx, q).Scan(&id, &cols, &cols, &cols, &cols, &cols)
+	err := r.p.QueryRow(ctx, q).Scan(&id, &cols, &cols, &cols, &cols, &cols,
+		&cols, &cols, &cols, &cols, &cols, &cols, &cols)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("outbox probe (scoped role / schema drift?): %w", err)
 	}

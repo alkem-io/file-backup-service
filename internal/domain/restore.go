@@ -162,20 +162,22 @@ func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
 // returns errTryRaw (the caller re-reads as raw); a decompression bomb is a hard
 // error (no fallback).
 func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
-	zr, err := zstd.NewReader(io.LimitReader(r, maxRestoreBytes+1))
+	// Serial single-stream decode — cap concurrency so NewReader doesn't eagerly
+	// allocate a block decoder per core (mirrors the encoder's WithEncoderConcurrency).
+	zr, err := zstd.NewReader(io.LimitReader(r, maxRestoreBytes+1), zstd.WithDecoderConcurrency(1))
 	if err != nil {
 		return errTryRaw
 	}
 	defer zr.Close()
 	h := sha3.New256()
 	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(zr, maxRestoreBytes+1))
-	if err != nil {
-		return errTryRaw
-	}
-	if n > maxRestoreBytes {
-		return fmt.Errorf("integrity: decoded output exceeds %d bytes (possible corruption/bomb)", maxRestoreBytes)
-	}
-	if hex.EncodeToString(h.Sum(nil)) != hash {
+	// A non-zstd stream, a decode error, a decoded-size overrun, OR a hash mismatch
+	// all mean "this may be raw bytes that merely start with the zstd magic" — return
+	// errTryRaw so the caller re-reads as raw (size-bounded). Only when BOTH the zstd
+	// and the raw interpretation fail is the object genuinely corrupt (decodeRaw
+	// returns the hard error). This is what makes a raw-stored object that is ITSELF a
+	// valid zstd bomb still restorable from its (small) raw bytes.
+	if err != nil || n > maxRestoreBytes || hex.EncodeToString(h.Sum(nil)) != hash {
 		return errTryRaw
 	}
 	return nil

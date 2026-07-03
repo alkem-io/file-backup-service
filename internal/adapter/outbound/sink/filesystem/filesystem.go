@@ -82,7 +82,10 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // syscall itself can't be interrupted from Go (a regular-file fd close waits on the
 // in-flight op) — that residual is an OS limit, not a policy choice.
 func writeAtomic(ctx context.Context, dir, base string, r io.Reader) (int64, error) {
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	// 0755 (not 0750): the blobs are chmod'd 0644 precisely so a different-uid DR
+	// restore / reconcile / file-service can read them — which requires world-execute
+	// on the shard dirs to traverse. Matches the restore path (RestoreObject 0755).
+	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // content-addressed backup store, readable by the restore uid
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
 	f, err := os.CreateTemp(dir, base+".*.partial")
