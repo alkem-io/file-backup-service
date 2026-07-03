@@ -88,11 +88,10 @@ func writeAtomic(ctx context.Context, dir, base string, r io.Reader) (int64, err
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // content-addressed backup store, readable by the restore uid
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
-	f, err := os.CreateTemp(dir, base+".*.partial")
+	f, tmp, err := fsutil.CreateTemp(dir, base)
 	if err != nil {
-		return 0, fmt.Errorf("create temp: %w", err)
+		return 0, err
 	}
-	tmp := f.Name()
 	n, copyErr := io.Copy(f, r)
 	syncErr := f.Sync()
 	closeErr := f.Close()
@@ -104,16 +103,8 @@ func writeAtomic(ctx context.Context, dir, base string, r io.Reader) (int64, err
 		_ = os.Remove(tmp) // cancelled mid-store — don't commit a late/orphaned write
 		return 0, err
 	}
-	if err := os.Chmod(tmp, 0o644); err != nil { //nolint:gosec // content-addressed backup blob
-		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("chmod: %w", err)
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, base)); err != nil {
-		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("rename: %w", err)
-	}
-	if err := fsutil.SyncDir(dir); err != nil {
-		return 0, fmt.Errorf("sync dir: %w", err)
+	if err := fsutil.CommitFile(tmp, filepath.Join(dir, base), 0o644); err != nil {
+		return 0, err
 	}
 	return n, nil
 }

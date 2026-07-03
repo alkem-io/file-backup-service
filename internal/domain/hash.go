@@ -9,14 +9,23 @@ import (
 	"io"
 )
 
+// newHash returns the content-hash function (FIPS 202 SHA3-256) — the ONE place
+// the object-identity algorithm is chosen. Sum, VerifyReader, and the restore-side
+// verify all route through it, so a digest change is a single edit and backup can
+// never diverge from restore.
+func newHash() hash.Hash { return sha3.New256() }
+
+// hexSum renders a digest as lowercase hex (the externalID encoding).
+func hexSum(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
+
 // Sum returns the lowercase-hex SHA3-256 of r — the file-service externalID
 // scheme (FIPS 202), which is the object's identity, key, and verifier.
 func Sum(r io.Reader) (string, error) {
-	h := sha3.New256()
+	h := newHash()
 	if _, err := io.Copy(h, r); err != nil {
 		return "", fmt.Errorf("hash: %w", err)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hexSum(h), nil
 }
 
 // Verify reports whether r hashes to want.
@@ -42,7 +51,7 @@ type VerifyReader struct {
 
 // NewVerifyReader wraps r, verifying against want.
 func NewVerifyReader(r io.Reader, want string) *VerifyReader {
-	return &VerifyReader{r: r, h: sha3.New256(), want: want}
+	return &VerifyReader{r: r, h: newHash(), want: want}
 }
 
 // Read implements io.Reader.
@@ -53,7 +62,7 @@ func (v *VerifyReader) Read(p []byte) (int, error) {
 		v.Total += int64(n)
 	}
 	if errors.Is(err, io.EOF) {
-		if got := hex.EncodeToString(v.h.Sum(nil)); got != v.want {
+		if got := hexSum(v.h); got != v.want {
 			return n, fmt.Errorf("integrity: stream hash %s != %s", got, v.want)
 		}
 	}

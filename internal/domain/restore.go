@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha3"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +28,9 @@ var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 // stored bytes must be the plaintext (which happens to start with the zstd magic).
 var errTryRaw = errors.New("not zstd after all")
 
+// errHashMismatch means the decoded content did not hash to the requested key.
+var errHashMismatch = errors.New("hash mismatch")
+
 // RestoreObject streams hash from src, reverses the transform via the hash-arbiter,
 // and writes the verified plaintext to destDir/<hash> (0644, durable) in a SINGLE
 // pass — magic-peek picks raw vs zstd, so a zstd object decodes straight to the
@@ -52,7 +53,7 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil { //nolint:gosec // primary store is world-readable
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	tmp, tmpName, err := createTemp(destDir, hash)
+	tmp, tmpName, err := fsutil.CreateTemp(destDir, hash)
 	if err != nil {
 		return err
 	}
@@ -84,15 +85,12 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 		return fmt.Errorf("sync: %w", err)
 	}
 	closeTmp()
+	if err := ctx.Err(); err != nil {
+		return err // cancelled mid-restore — don't commit (matches the sink write path)
+	}
 	// 0644 so file-service (uid 65532) can read restored objects.
-	if err := os.Chmod(tmpName, 0o644); err != nil { //nolint:gosec // content-addressed blob, served by file-service
-		return fmt.Errorf("chmod: %w", err)
-	}
-	if err := os.Rename(tmpName, dest); err != nil {
-		return fmt.Errorf("rename: %w", err)
-	}
 	keep = true
-	return fsutil.SyncDir(filepath.Dir(dest))
+	return fsutil.CommitFile(tmpName, dest, 0o644)
 }
 
 // VerifyObject streams hash from src and confirms it decodes+hashes to hash,
@@ -141,26 +139,44 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 	return decodeRaw(br, hash, dst)
 }
 
-// decodeRaw copies r straight to dst, hashing, and verifies it equals hash.
-func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
-	h := sha3.New256()
-	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(r, maxRestoreBytes+1))
+// copyCappedVerify streams src into dst bounded to maxRestoreBytes, hashing via the
+// shared object-hash primitive. It returns overCap=true if the content would exceed
+// the cap, and errHashMismatch if it does not hash to want — so restore verifies by
+// the exact same digest rule as backup (hash.go), with no divergence.
+func copyCappedVerify(dst io.Writer, src io.Reader, want string) (overCap bool, err error) {
+	h := newHash()
+	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(src, maxRestoreBytes+1))
 	if err != nil {
-		return fmt.Errorf("read: %w", err)
+		return false, err
 	}
 	if n > maxRestoreBytes {
-		return fmt.Errorf("stored object exceeds %d bytes (possible corruption)", maxRestoreBytes)
+		return true, nil
 	}
-	if hex.EncodeToString(h.Sum(nil)) != hash {
+	if hexSum(h) != want {
+		return false, errHashMismatch
+	}
+	return false, nil
+}
+
+// decodeRaw copies r straight to dst and verifies it equals hash.
+func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
+	overCap, err := copyCappedVerify(dst, r, hash)
+	switch {
+	case err != nil && !errors.Is(err, errHashMismatch):
+		return fmt.Errorf("read: %w", err)
+	case overCap:
+		return fmt.Errorf("stored object exceeds %d bytes (possible corruption)", maxRestoreBytes)
+	case errors.Is(err, errHashMismatch):
 		return fmt.Errorf("integrity: stored bytes for %s are neither valid zstd nor the plaintext", hash)
 	}
 	return nil
 }
 
-// decodeZstd streams r through a bounded zstd decoder into dst, hashing, and
-// verifies it equals hash. A non-zstd stream, a decode error, or a hash mismatch
-// returns errTryRaw (the caller re-reads as raw); a decompression bomb is a hard
-// error (no fallback).
+// decodeZstd streams r through a bounded zstd decoder into dst and verifies it
+// equals hash. A non-zstd stream, a decode error, a decoded-size overrun, OR a hash
+// mismatch all return errTryRaw so the caller re-reads as raw (size-bounded) — that
+// is what keeps a raw-stored object that is ITSELF a valid zstd bomb restorable from
+// its small raw bytes. Only when BOTH interpretations fail is it genuinely corrupt.
 func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	// Serial single-stream decode — cap concurrency so NewReader doesn't eagerly
 	// allocate a block decoder per core (mirrors the encoder's WithEncoderConcurrency).
@@ -169,25 +185,8 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 		return errTryRaw
 	}
 	defer zr.Close()
-	h := sha3.New256()
-	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(zr, maxRestoreBytes+1))
-	// A non-zstd stream, a decode error, a decoded-size overrun, OR a hash mismatch
-	// all mean "this may be raw bytes that merely start with the zstd magic" — return
-	// errTryRaw so the caller re-reads as raw (size-bounded). Only when BOTH the zstd
-	// and the raw interpretation fail is the object genuinely corrupt (decodeRaw
-	// returns the hard error). This is what makes a raw-stored object that is ITSELF a
-	// valid zstd bomb still restorable from its (small) raw bytes.
-	if err != nil || n > maxRestoreBytes || hex.EncodeToString(h.Sum(nil)) != hash {
+	if overCap, verr := copyCappedVerify(dst, zr, hash); verr != nil || overCap {
 		return errTryRaw
 	}
 	return nil
-}
-
-// createTemp opens a unique "<prefix>.*.partial" temp under dir.
-func createTemp(dir, prefix string) (*os.File, string, error) {
-	f, err := os.CreateTemp(dir, prefix+".*.partial")
-	if err != nil {
-		return nil, "", fmt.Errorf("create temp: %w", err)
-	}
-	return f, f.Name(), nil
 }
