@@ -171,10 +171,11 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		}(i, t, pr)
 	}
 
-	fw := &fanoutWriter{writers: writers, dead: make([]bool, n)}
+	fw := newFanoutWriter(writers)
 	// copyErr is set on a SOURCE failure: a VerifyReader hash mismatch (corrupt
 	// source) or ctx cancellation/timeout during the read.
 	_, copyErr := io.Copy(fw, vr)
+	fw.close() // stop the pump goroutines before closing the pipes
 	for _, pw := range writers {
 		_ = pw.CloseWithError(copyErr)
 	}
@@ -247,43 +248,63 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (n i
 	}
 }
 
-// fanoutWriter writes each chunk to every still-live target pipe. A pipe write
-// error marks that target dead (its Store exited) and the rest continue; it stops
-// the source copy only once every target is gone. Write is called serially by the
-// single io.Copy driver, so f.dead is single-reader; the per-chunk goroutines each
-// touch only their own (disjoint) f.dead[i], published to the next Write by
-// wg.Wait — no data race.
+// fanoutWriter writes each source chunk to every still-live target pipe using a
+// fixed set of per-target PUMP goroutines spawned ONCE (not one per chunk) — a
+// large object fanned to N targets would otherwise spawn millions of goroutines.
+// Each Write hands the chunk to every live pump and waits for all of them (a
+// per-chunk barrier, so the io.Copy buffer isn't reused before the pumps finish);
+// so a slow target only adds latency, never blocks the fast ones. A pipe write
+// error marks that target dead and the rest continue; Write fails only once every
+// target is gone. Write is called serially by the single io.Copy driver, so f.dead
+// is touched by one goroutine only.
 type fanoutWriter struct {
-	writers []*io.PipeWriter
-	dead    []bool
+	pumps  []chan []byte
+	done   chan pumpResult
+	dead   []bool
+	pumpWg sync.WaitGroup
+}
+
+type pumpResult struct {
+	idx int
+	err error
+}
+
+func newFanoutWriter(writers []*io.PipeWriter) *fanoutWriter {
+	n := len(writers)
+	f := &fanoutWriter{
+		pumps: make([]chan []byte, n),
+		done:  make(chan pumpResult, n),
+		dead:  make([]bool, n),
+	}
+	for i := range writers {
+		f.pumps[i] = make(chan []byte)
+		f.pumpWg.Add(1)
+		go func(i int, w *io.PipeWriter) {
+			defer f.pumpWg.Done()
+			for chunk := range f.pumps[i] {
+				_, err := w.Write(chunk)
+				f.done <- pumpResult{i, err}
+			}
+		}(i, writers[i])
+	}
+	return f
 }
 
 func (f *fanoutWriter) Write(p []byte) (int, error) {
-	// Single-target fast path (the launch config): write inline, no goroutine.
-	if last := f.soleLive(); last >= 0 {
-		if _, err := f.writers[last].Write(p); err != nil {
-			f.dead[last] = true
-			return 0, io.ErrClosedPipe
-		}
-		return len(p), nil
-	}
-	// ≥2 live targets: write to all concurrently so per-chunk latency is
-	// max(targets), not sum — a slow target no longer throttles the fast ones.
-	var wg sync.WaitGroup
-	for i := range f.writers {
+	sent := 0
+	for i := range f.pumps {
 		if f.dead[i] {
 			continue
 		}
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if _, err := f.writers[i].Write(p); err != nil {
-				f.dead[i] = true // own index only
-			}
-		}(i)
+		f.pumps[i] <- p
+		sent++
 	}
-	wg.Wait()
-	for i := range f.writers {
+	for k := 0; k < sent; k++ {
+		if res := <-f.done; res.err != nil {
+			f.dead[res.idx] = true
+		}
+	}
+	for i := range f.dead {
 		if !f.dead[i] {
 			return len(p), nil
 		}
@@ -291,18 +312,12 @@ func (f *fanoutWriter) Write(p []byte) (int, error) {
 	return 0, io.ErrClosedPipe
 }
 
-// soleLive returns the index of the only live writer, or -1 if zero or ≥2 are
-// live (so the caller either short-circuits closed or takes the concurrent path).
-func (f *fanoutWriter) soleLive() int {
-	last := -1
-	for i := range f.writers {
-		if f.dead[i] {
-			continue
-		}
-		if last >= 0 {
-			return -1 // ≥2 live
-		}
-		last = i
+// close stops the pumps. Safe to call once io.Copy has returned: every pump has
+// finished its last chunk (the final Write collected its result) and is parked on
+// its channel, so closing the channels lets each range-loop exit cleanly.
+func (f *fanoutWriter) close() {
+	for i := range f.pumps {
+		close(f.pumps[i])
 	}
-	return last
+	f.pumpWg.Wait()
 }
