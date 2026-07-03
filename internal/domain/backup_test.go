@@ -3,6 +3,7 @@ package domain
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 )
@@ -13,10 +14,25 @@ func (f fakeSource) FetchContent(context.Context, string) (io.ReadCloser, error)
 	return io.NopCloser(bytes.NewReader(f.data)), nil
 }
 
-type fakeLedger struct{ objects, statuses int }
+// fakeLedger enforces the real FK invariant: a target status can only be written
+// after the object row exists (file_backup_target_status REFERENCES file_backup_object).
+type fakeLedger struct {
+	objects  map[string]bool
+	statuses int
+	fkError  bool
+}
 
-func (f *fakeLedger) UpsertObject(context.Context, ObjectMeta) error { f.objects++; return nil }
-func (f *fakeLedger) UpsertTargetStatus(context.Context, string, string, string, int64) error {
+func newFakeLedger() *fakeLedger { return &fakeLedger{objects: map[string]bool{}} }
+
+func (f *fakeLedger) UpsertObject(_ context.Context, m ObjectMeta) error {
+	f.objects[m.ExternalID] = true
+	return nil
+}
+func (f *fakeLedger) UpsertTargetStatus(_ context.Context, externalID, _, _ string, _ int64) error {
+	if !f.objects[externalID] {
+		f.fkError = true
+		return fmt.Errorf("fk violation: object %s absent", externalID)
+	}
 	f.statuses++
 	return nil
 }
@@ -54,7 +70,7 @@ func TestPipelineBackupOne(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &memSink{name: "t1", store: map[string][]byte{}}
-	led := &fakeLedger{}
+	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Required: true, Codec: CodecNone}})
 
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f1", ExternalID: h})
@@ -64,14 +80,17 @@ func TestPipelineBackupOne(t *testing.T) {
 	if !bytes.Equal(sink.store[h], data) {
 		t.Fatal("stored bytes mismatch")
 	}
-	if led.objects != 1 || led.statuses != 1 {
+	if led.fkError {
+		t.Fatal("target status written before object row (FK order)")
+	}
+	if !led.objects[h] || led.statuses != 1 {
 		t.Fatalf("ledger not updated: %+v", led)
 	}
 }
 
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := &memSink{name: "t1", store: map[string][]byte{}}
-	p := NewPipeline(fakeSource{[]byte("wrong")}, &fakeLedger{}, []Target{{Sink: sink, Required: true}})
+	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink, Required: true}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "deadbeef"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

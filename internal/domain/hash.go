@@ -3,6 +3,7 @@ package domain
 import (
 	"crypto/sha3"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -51,7 +52,7 @@ func (v *VerifyReader) Read(p []byte) (int, error) {
 		_, _ = v.h.Write(p[:n])
 		v.Total += int64(n)
 	}
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		if got := hex.EncodeToString(v.h.Sum(nil)); got != v.want {
 			return n, fmt.Errorf("integrity: stream hash %s != %s", got, v.want)
 		}
