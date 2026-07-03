@@ -62,25 +62,30 @@ func New(d Deps) *Consumer {
 	return &Consumer{d: d}
 }
 
-// Run drains at startup, then on NOTIFY wakeups and a polling floor.
+// Run starts a fixed pool of Concurrency workers fed by a dispatcher, plus the
+// LISTEN and reaper goroutines. On ctx cancellation the dispatcher stops, the
+// work channel closes, and Run blocks until every worker finishes its in-flight
+// object — a clean graceful drain (no batch barrier, no stranded goroutines).
 func (c *Consumer) Run(ctx context.Context) error {
 	wake := make(chan struct{}, 1)
 	go c.listen(ctx, wake)
 	go c.reap(ctx)
 
-	c.drain(ctx) // startup backlog drain
-	ticker := time.NewTicker(c.d.PollEvery)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			c.drain(ctx)
-		case <-wake:
-			c.drain(ctx)
-		}
+	work := make(chan domain.OutboxEntry)
+	var wg sync.WaitGroup
+	for i := 0; i < c.d.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range work {
+				c.process(ctx, e)
+			}
+		}()
 	}
+	c.dispatch(ctx, wake, work)
+	close(work)
+	wg.Wait()
+	return ctx.Err()
 }
 
 // listen LISTENs for NOTIFY and signals wake. Best-effort: the polling floor and
@@ -114,26 +119,37 @@ func (c *Consumer) listen(ctx context.Context, wake chan<- struct{}) {
 	}
 }
 
-// drain claims and processes batches until the outbox is empty.
-func (c *Consumer) drain(ctx context.Context) {
+// dispatch claims pending entries and feeds the worker pool, blocking on a free
+// worker (natural backpressure) — so a slow object never idles the other workers
+// (no batch barrier). When the outbox is empty it waits on a NOTIFY wakeup or the
+// polling floor. Returns promptly on ctx cancellation so shutdown is clean.
+func (c *Consumer) dispatch(ctx context.Context, wake <-chan struct{}, work chan<- domain.OutboxEntry) {
+	ticker := time.NewTicker(c.d.PollEvery)
+	defer ticker.Stop()
 	for ctx.Err() == nil {
-		entries, err := c.d.Outbox.Claim(ctx, c.d.Concurrency)
-		if err != nil {
-			c.d.Logger.Error("claim outbox", zap.Error(err))
+		for ctx.Err() == nil {
+			entries, err := c.d.Outbox.Claim(ctx, c.d.Concurrency)
+			if err != nil {
+				c.d.Logger.Error("claim outbox", zap.Error(err))
+				break
+			}
+			if len(entries) == 0 {
+				break
+			}
+			for _, e := range entries {
+				select {
+				case work <- e:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
 			return
+		case <-wake:
+		case <-ticker.C:
 		}
-		if len(entries) == 0 {
-			return
-		}
-		var wg sync.WaitGroup
-		for _, e := range entries {
-			wg.Add(1)
-			go func(e domain.OutboxEntry) {
-				defer wg.Done()
-				c.process(ctx, e)
-			}(e)
-		}
-		wg.Wait()
 	}
 }
 
