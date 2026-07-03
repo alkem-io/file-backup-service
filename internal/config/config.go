@@ -11,20 +11,20 @@ import (
 
 // Target is one configured backup sink.
 type Target struct {
-	Name           string `json:"name"`
-	Type           string `json:"type"` // "s3" | "filesystem"
-	Endpoint       string `json:"endpoint,omitempty"`
-	Bucket         string `json:"bucket,omitempty"`
-	Prefix         string `json:"prefix,omitempty"`
-	Path           string `json:"path,omitempty"`
-	Compression    string `json:"compression,omitempty"` // "" | "none" | "zstd"
-	Immutable      bool   `json:"immutable,omitempty"`
-	CredentialsRef string `json:"credentialsRef,omitempty"`
+	Name        string `json:"name"`
+	Type        string `json:"type"` // "s3" | "filesystem"
+	Endpoint    string `json:"endpoint,omitempty"`
+	Region      string `json:"region,omitempty"` // s3 region (Scaleway can't auto-discover on PutObject-only creds)
+	Bucket      string `json:"bucket,omitempty"`
+	Prefix      string `json:"prefix,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Compression string `json:"compression,omitempty"` // "" | "none" | "zstd"
 	// S3 target credentials + options (templated from secrets in k8s).
 	AccessKey string `json:"accessKey,omitempty"`
 	SecretKey string `json:"secretKey,omitempty"`
 	UseSSL    bool   `json:"useSSL,omitempty"`
-	SSE       bool   `json:"sse,omitempty"` // server-side encryption at rest
+	SSE       bool   `json:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
+	Insecure  bool   `json:"insecure,omitempty"` // conscious opt-out of the TLS+SSE requirement (local dev only)
 }
 
 // Config is the worker configuration.
@@ -104,30 +104,41 @@ func (c *Config) validate() error {
 	}
 	seen := make(map[string]bool, len(c.Targets))
 	for i, t := range c.Targets {
-		if t.Name == "" {
-			return fmt.Errorf("target[%d]: name is required", i)
-		}
-		if seen[t.Name] {
-			return fmt.Errorf("duplicate target name %q", t.Name)
-		}
-		seen[t.Name] = true
-		switch t.Type {
-		case "filesystem":
-			if t.Path == "" {
-				return fmt.Errorf("target %q: filesystem requires path", t.Name)
-			}
-		case "s3":
-			if t.Endpoint == "" || t.Bucket == "" {
-				return fmt.Errorf("target %q: s3 requires endpoint and bucket", t.Name)
-			}
-		default:
-			return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
-		}
-		switch t.Compression {
-		case "", "none", "zstd":
-		default:
-			return fmt.Errorf("target %q: unknown compression %q (want none|zstd)", t.Name, t.Compression)
+		if err := validateTarget(i, t, seen); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func validateTarget(i int, t Target, seen map[string]bool) error {
+	if t.Name == "" {
+		return fmt.Errorf("target[%d]: name is required", i)
+	}
+	if seen[t.Name] {
+		return fmt.Errorf("duplicate target name %q", t.Name)
+	}
+	seen[t.Name] = true
+	switch t.Type {
+	case "filesystem":
+		if t.Path == "" {
+			return fmt.Errorf("target %q: filesystem requires path", t.Name)
+		}
+	case "s3":
+		if t.Endpoint == "" || t.Bucket == "" {
+			return fmt.Errorf("target %q: s3 requires endpoint and bucket", t.Name)
+		}
+		if !t.Insecure && (!t.UseSSL || !t.SSE) {
+			return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+
+				"set \"insecure\": true only for local dev", t.Name)
+		}
+	default:
+		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
+	}
+	switch t.Compression {
+	case "", "none", "zstd":
+		return nil
+	default:
+		return fmt.Errorf("target %q: unknown compression %q (want none|zstd)", t.Name, t.Compression)
+	}
 }

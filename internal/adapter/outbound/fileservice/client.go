@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -36,14 +38,16 @@ func New(baseURL string, hc *http.Client) *Client {
 			},
 		}
 	}
-	return &Client{baseURL: baseURL, http: hc}
+	// Trim trailing slashes so a base like "http://fs/" doesn't produce
+	// "http://fs//internal/..." → 404 on every fetch → the whole outbox dead-letters.
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: hc}
 }
 
 // FetchContent streams GET {base}/internal/file/{id}/content. The caller closes
 // the returned reader.
 func (c *Client) FetchContent(ctx context.Context, fileID string) (io.ReadCloser, error) {
-	url := fmt.Sprintf("%s/internal/file/%s/content", c.baseURL, fileID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	reqURL := fmt.Sprintf("%s/internal/file/%s/content", c.baseURL, url.PathEscape(fileID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -53,7 +57,7 @@ func (c *Client) FetchContent(ctx context.Context, fileID string) (io.ReadCloser
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("file-service GET %s: status %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("file-service GET %s: status %d", reqURL, resp.StatusCode)
 	}
 	return resp.Body, nil
 }

@@ -20,6 +20,7 @@ import (
 type Config struct {
 	Name      string
 	Endpoint  string
+	Region    string
 	Bucket    string
 	Prefix    string
 	AccessKey string
@@ -42,6 +43,7 @@ func New(cfg Config) (*Sink, error) {
 	client, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
 		Secure: cfg.UseSSL,
+		Region: cfg.Region, // explicit: PutObject-only creds can't auto-discover it (SigV4 signs this region)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 client %q: %w", cfg.Name, err)

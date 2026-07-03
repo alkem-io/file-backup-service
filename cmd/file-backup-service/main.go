@@ -212,7 +212,7 @@ func buildSink(t config.Target) (domain.Sink, error) {
 		return filesystem.New(t.Name, t.Path), nil
 	case "s3":
 		return s3.New(s3.Config{
-			Name: t.Name, Endpoint: t.Endpoint, Bucket: t.Bucket, Prefix: t.Prefix,
+			Name: t.Name, Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket, Prefix: t.Prefix,
 			AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,
 		})
 	default:

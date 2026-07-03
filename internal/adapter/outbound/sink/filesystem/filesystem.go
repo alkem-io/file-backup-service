@@ -68,6 +68,12 @@ func (s *Sink) Store(_ context.Context, hash string, r io.Reader, _ int64) (int6
 		_ = os.Remove(tmp)
 		return 0, fmt.Errorf("write temp: %w", err)
 	}
+	// 0644 so a verify/reconcile job or file-service (different uid) can read the
+	// backup blob, not just the worker (CreateTemp defaults to 0600).
+	if err := os.Chmod(tmp, 0o644); err != nil { //nolint:gosec // content-addressed backup blob
+		_ = os.Remove(tmp)
+		return 0, fmt.Errorf("chmod: %w", err)
+	}
 	if err := os.Rename(tmp, dest); err != nil {
 		_ = os.Remove(tmp)
 		return 0, fmt.Errorf("rename: %w", err)
