@@ -179,6 +179,33 @@ func TestPipelineZstdTarget(t *testing.T) {
 	}
 }
 
+// TestPipelineLargeObjectMultiChunk exercises fanoutCopy's multi-chunk aggregation
+// (>1 MiB → several io.ReadFull passes) fanned concurrently to two targets.
+func TestPipelineLargeObjectMultiChunk(t *testing.T) {
+	data := bytes.Repeat([]byte("large fan-out payload "), 130*1024) // ~2.7 MiB
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &memSink{name: "a", store: map[string][]byte{}}
+	b := &memSink{name: "b", store: map[string][]byte{}}
+	p := NewPipeline(fakeSource{data}, newFakeLedger(),
+		[]Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecZstd}})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h, Size: int64(len(data))})
+	if err != nil || !ok {
+		t.Fatalf("large multi-chunk fan-out: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(a.store[h], data) {
+		t.Fatal("raw target mismatch")
+	}
+	dec, _ := zstd.NewReader(bytes.NewReader(b.store[h]))
+	defer dec.Close()
+	out, _ := io.ReadAll(dec)
+	if !bytes.Equal(out, data) {
+		t.Fatal("zstd target mismatch")
+	}
+}
+
 // nonConsumingSink reports success without ever reading its stream — models a
 // misbehaving sink that must NOT be recorded as stored.
 type nonConsumingSink struct{ name string }

@@ -172,9 +172,9 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 	}
 
 	fw := newFanoutWriter(writers)
-	// copyErr is set on a SOURCE failure: a VerifyReader hash mismatch (corrupt
-	// source) or ctx cancellation/timeout during the read.
-	_, copyErr := io.Copy(fw, vr)
+	// copyErr is a SOURCE failure: a VerifyReader hash mismatch (corrupt source) or
+	// ctx cancellation/timeout during the read.
+	copyErr := fanoutCopy(fw, vr)
 	fw.close() // stop the pump goroutines before closing the pipes
 	for _, pw := range writers {
 		_ = pw.CloseWithError(copyErr)
@@ -229,65 +229,81 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 // size = -1 is load-bearing: commit is gated on the dispatcher closing the pipes
 // AFTER VerifyReader checks the hash; a known byte-count would let a sink finalize
 // (e.g. minio single-PUT) on length alone, before verification.
-func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (n int64, err error) {
-	type result struct {
-		n   int64
-		err error
-	}
-	ch := make(chan result, 1) // buffered so an abandoned goroutine never blocks
+func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int64, error) {
+	ch := make(chan targetResult, 1) // buffered so an abandoned goroutine never blocks
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				ch <- result{0, fmt.Errorf("sink %s panicked: %v", sink.Name(), rec)}
+				ch <- targetResult{err: fmt.Errorf("sink %s panicked: %v", sink.Name(), rec)}
 			}
 		}()
 		sn, serr := sink.Store(ctx, hash, r, -1)
-		ch <- result{sn, serr}
+		ch <- targetResult{stored: sn, err: serr}
 	}()
 	select {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case res := <-ch:
-		return res.n, res.err
+		return res.stored, res.err
+	}
+}
+
+// fanoutCopy streams vr into fw in ~1 MiB writes. An HTTP-body Read returns only
+// ~16–32 KiB, and every fanout Write costs one per-target barrier, so filling a
+// larger buffer via io.ReadFull first amortizes the barrier over a big chunk and
+// cuts rendezvous/scheduling ~32× — for one 1 MiB buffer of extra memory per
+// in-flight object. The hash verification still happens inside vr at true EOF.
+func fanoutCopy(fw *fanoutWriter, vr io.Reader) error {
+	buf := make([]byte, 1<<20)
+	for {
+		n, rerr := io.ReadFull(vr, buf)
+		if n > 0 {
+			if _, werr := fw.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		switch {
+		case rerr == nil:
+			continue // buffer filled — read the next chunk
+		case errors.Is(rerr, io.EOF), errors.Is(rerr, io.ErrUnexpectedEOF):
+			return nil // clean end of stream (vr verified the hash at EOF)
+		default:
+			return rerr // integrity mismatch / ctx cancel / read error
+		}
 	}
 }
 
 // fanoutWriter writes each source chunk to every still-live target pipe using a
 // fixed set of per-target PUMP goroutines spawned ONCE (not one per chunk) — a
 // large object fanned to N targets would otherwise spawn millions of goroutines.
-// Each Write hands the chunk to every live pump and waits for all of them (a
-// per-chunk barrier, so the io.Copy buffer isn't reused before the pumps finish);
-// so a slow target only adds latency, never blocks the fast ones. A pipe write
-// error marks that target dead and the rest continue; Write fails only once every
-// target is gone. Write is called serially by the single io.Copy driver, so f.dead
-// is touched by one goroutine only.
+// Each Write hands the chunk to every live pump and waits (a reused per-chunk
+// WaitGroup barrier) so the shared buffer isn't reused before every pump has
+// consumed it. Within a chunk the writes run concurrently; across chunks they are
+// paced to the slowest live target (the bounded-memory tradeoff — one shared
+// buffer). A pipe write error marks that target dead and the rest continue; Write
+// fails only once every target is gone. Write is called serially by the single
+// fanoutCopy driver, and each pump touches only its own dead[i] (published by the
+// barrier), so there is no data race.
 type fanoutWriter struct {
 	pumps  []chan []byte
-	done   chan pumpResult
 	dead   []bool
+	chunk  sync.WaitGroup // per-chunk barrier, reused across chunks (Write is serial)
 	pumpWg sync.WaitGroup
-}
-
-type pumpResult struct {
-	idx int
-	err error
 }
 
 func newFanoutWriter(writers []*io.PipeWriter) *fanoutWriter {
 	n := len(writers)
-	f := &fanoutWriter{
-		pumps: make([]chan []byte, n),
-		done:  make(chan pumpResult, n),
-		dead:  make([]bool, n),
-	}
+	f := &fanoutWriter{pumps: make([]chan []byte, n), dead: make([]bool, n)}
 	for i := range writers {
 		f.pumps[i] = make(chan []byte)
 		f.pumpWg.Add(1)
 		go func(i int, w *io.PipeWriter) {
 			defer f.pumpWg.Done()
 			for chunk := range f.pumps[i] {
-				_, err := w.Write(chunk)
-				f.done <- pumpResult{i, err}
+				if _, err := w.Write(chunk); err != nil {
+					f.dead[i] = true // own index; published to Write by chunk.Wait()
+				}
+				f.chunk.Done()
 			}
 		}(i, writers[i])
 	}
@@ -295,19 +311,13 @@ func newFanoutWriter(writers []*io.PipeWriter) *fanoutWriter {
 }
 
 func (f *fanoutWriter) Write(p []byte) (int, error) {
-	sent := 0
 	for i := range f.pumps {
-		if f.dead[i] {
-			continue
-		}
-		f.pumps[i] <- p
-		sent++
-	}
-	for k := 0; k < sent; k++ {
-		if res := <-f.done; res.err != nil {
-			f.dead[res.idx] = true
+		if !f.dead[i] {
+			f.chunk.Add(1)
+			f.pumps[i] <- p
 		}
 	}
+	f.chunk.Wait()
 	for i := range f.dead {
 		if !f.dead[i] {
 			return len(p), nil
@@ -316,9 +326,9 @@ func (f *fanoutWriter) Write(p []byte) (int, error) {
 	return 0, io.ErrClosedPipe
 }
 
-// close stops the pumps. Safe to call once io.Copy has returned: every pump has
-// finished its last chunk (the final Write collected its result) and is parked on
-// its channel, so closing the channels lets each range-loop exit cleanly.
+// close stops the pumps. Safe once fanoutCopy has returned: every pump finished its
+// last chunk (the final Write's barrier joined it) and is parked on its channel, so
+// closing the channels lets each range-loop exit cleanly.
 func (f *fanoutWriter) close() {
 	for i := range f.pumps {
 		close(f.pumps[i])
