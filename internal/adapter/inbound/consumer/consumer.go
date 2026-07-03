@@ -112,6 +112,13 @@ func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
 	}
 }
 
+// bookkeepingCtx detaches from a possibly-cancelled object ctx with a fresh short
+// deadline, so a MarkDone/Fail/Release/Skip survives a per-object timeout or a
+// graceful shutdown rather than leaving the row stranded in_progress.
+func bookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+}
+
 // signal does a non-blocking send — a coalescing wakeup.
 func signal(ch chan<- struct{}) {
 	select {
@@ -155,7 +162,7 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 		if r := recover(); r != nil {
 			c.d.Logger.Error("panic backing up object", zap.Int64("id", e.ID),
 				zap.String("hash", e.ExternalID), zap.Any("panic", r), zap.Stack("stack"))
-			bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			bctx, cancel := bookkeepingCtx(ctx)
 			defer cancel()
 			c.fail(bctx, e.ID, fmt.Sprintf("panic: %v", r))
 		}
@@ -167,7 +174,7 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 
 	// Bookkeeping MUST survive per-object-timeout and shutdown cancellation, or the
 	// row is stranded in_progress. Detach from the cancelled ctx with a fresh deadline.
-	bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	bctx, bcancel := bookkeepingCtx(ctx)
 	defer bcancel()
 
 	switch {

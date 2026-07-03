@@ -202,15 +202,12 @@ func (c *Config) applyDefaults() {
 // envToken upcases a target name and replaces non-alphanumerics with '_' so it is
 // a valid env-var segment.
 func envToken(name string) string {
-	var b strings.Builder
-	for _, r := range strings.ToUpper(name) {
+	return strings.Map(func(r rune) rune {
 		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
+			return r
 		}
-	}
-	return b.String()
+		return '_'
+	}, strings.ToUpper(name))
 }
 
 func setStr(dst *string, key string) {

@@ -82,33 +82,36 @@ func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, 
 	defer func() { _ = rc.Close() }()
 
 	// Stage 1: stream stored bytes to a temp, hashing to detect a plaintext store.
-	raw, err := os.CreateTemp(workDir, hash+".raw.*.partial")
+	// A single guarded defer removes the temp unless we hand it back — no error
+	// branch can leak a *.partial into the scratch dir / primary store.
+	raw, rawName, err := createTemp(workDir, hash+".raw")
 	if err != nil {
-		return "", fmt.Errorf("create temp: %w", err)
+		return "", err
 	}
-	rawName := raw.Name()
+	keepRaw := false
+	defer func() {
+		if !keepRaw {
+			_ = os.Remove(rawName)
+		}
+	}()
 	h := sha3.New256()
 	// Cap the raw download too — a hostile/corrupt stored object must not fill the
 	// primary store during a restore (the decoded cap alone left Stage 1 unbounded).
 	rawN, err := io.Copy(io.MultiWriter(raw, h), io.LimitReader(rc, maxRestoreBytes+1))
+	_ = raw.Sync()
+	_ = raw.Close()
 	if err != nil {
-		_ = raw.Close()
-		_ = os.Remove(rawName)
 		return "", fmt.Errorf("read: %w", err)
 	}
 	if rawN > maxRestoreBytes {
-		_ = raw.Close()
-		_ = os.Remove(rawName)
 		return "", fmt.Errorf("stored object exceeds %d bytes (possible corruption)", maxRestoreBytes)
 	}
-	_ = raw.Sync()
-	_ = raw.Close()
 	if hex.EncodeToString(h.Sum(nil)) == hash {
+		keepRaw = true
 		return rawName, nil // stored plain — the raw temp IS the plaintext
 	}
 
 	// Stage 2: stored bytes are zstd — decode (bounded) into a second temp, verify.
-	defer func() { _ = os.Remove(rawName) }()
 	in, err := os.Open(rawName) //nolint:gosec // temp under workDir
 	if err != nil {
 		return "", fmt.Errorf("reopen temp: %w", err)
@@ -120,28 +123,38 @@ func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, 
 	}
 	defer dec.Close()
 
-	out, err := os.CreateTemp(workDir, hash+".out.*.partial")
+	out, outName, err := createTemp(workDir, hash+".out")
 	if err != nil {
-		return "", fmt.Errorf("create temp: %w", err)
+		return "", err
 	}
-	outName := out.Name()
+	keepOut := false
+	defer func() {
+		if !keepOut {
+			_ = os.Remove(outName)
+		}
+	}()
 	h2 := sha3.New256()
 	n, err := io.Copy(io.MultiWriter(out, h2), io.LimitReader(dec, maxRestoreBytes+1))
+	_ = out.Sync()
+	_ = out.Close()
 	if err != nil {
-		_ = out.Close()
-		_ = os.Remove(outName)
 		return "", fmt.Errorf("zstd decode: %w", err)
 	}
 	if n > maxRestoreBytes {
-		_ = out.Close()
-		_ = os.Remove(outName)
 		return "", fmt.Errorf("integrity: decoded output exceeds %d bytes (possible corruption/bomb)", maxRestoreBytes)
 	}
-	_ = out.Sync()
-	_ = out.Close()
 	if hex.EncodeToString(h2.Sum(nil)) != hash {
-		_ = os.Remove(outName)
 		return "", fmt.Errorf("integrity: decoded bytes do not match %s", hash)
 	}
+	keepOut = true
 	return outName, nil
+}
+
+// createTemp opens a unique "<prefix>.*.partial" temp under dir.
+func createTemp(dir, prefix string) (*os.File, string, error) {
+	f, err := os.CreateTemp(dir, prefix+".*.partial")
+	if err != nil {
+		return nil, "", fmt.Errorf("create temp: %w", err)
+	}
+	return f, f.Name(), nil
 }
