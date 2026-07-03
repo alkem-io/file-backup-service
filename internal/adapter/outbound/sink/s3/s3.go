@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 
 	"github.com/minio/minio-go/v7"
@@ -70,11 +71,16 @@ func (s *Sink) putOpts() minio.PutObjectOptions {
 	return opts
 }
 
-// Exists reports whether the object is present.
+// Exists reports whether the object is present. On an immutable target the
+// worker's credentials are PutObject-only, so a HEAD returns 403 — treat that
+// (and a 404) as "not present / unknown" rather than a hard error, since the
+// ledger is the authoritative dedup source anyway.
 func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 	_, err := s.client.StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
 	if err != nil {
-		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+		resp := minio.ToErrorResponse(err)
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden ||
+			resp.Code == "NoSuchKey" || resp.Code == "AccessDenied" {
 			return false, nil
 		}
 		return false, fmt.Errorf("stat: %w", err)

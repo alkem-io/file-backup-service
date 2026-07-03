@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"time"
 )
 
 // Client streams object content from file-service.
@@ -19,7 +21,20 @@ type Client struct {
 // New constructs a Client for the given file-service base URL.
 func New(baseURL string, hc *http.Client) *Client {
 	if hc == nil {
-		hc = http.DefaultClient
+		// No Client.Timeout — it caps the whole request including body read and
+		// would abort large streamed objects. The per-object ctx bounds total
+		// time; these transport timeouts catch a stalled peer (connect / TLS /
+		// time-to-first-byte) so a half-open connection can't wedge a worker.
+		hc = &http.Client{
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				MaxIdleConnsPerHost:   16,
+			},
+		}
 	}
 	return &Client{baseURL: baseURL, http: hc}
 }

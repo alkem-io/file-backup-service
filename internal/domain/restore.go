@@ -2,51 +2,154 @@ package domain
 
 import (
 	"context"
+	"crypto/sha3"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/klauspost/compress/zstd"
 )
 
-// RestoreObject fetches hash from src, reverses the transform via the
-// hash-arbiter, verifies it, and writes it to destDir/<hash> (idempotent: skips
-// if already present). destDir is the primary store mount or a scratch dir.
+// maxRestoreBytes caps a decoded object so a corrupt/hostile zstd frame (a
+// decompression bomb) cannot OOM the restore/verify tooling. Larger than any
+// plausible object in this corpus; raise it deliberately if ever needed.
+const maxRestoreBytes int64 = 16 << 30 // 16 GiB
+
+// RestoreObject streams hash from src, reverses the transform via the
+// hash-arbiter, verifies it, and writes it to destDir/<hash> (0644, durable).
+// If the object is already present it is hash-verified first — a corrupt file in
+// the primary store (the reason to restore) does not mask the good backup copy.
+// Fully streamed via temp files: no whole-object buffering.
 func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	dest := filepath.Join(destDir, hash)
 	if _, err := os.Stat(dest); err == nil {
-		return nil // already present
-	}
-	out, err := fetchAndDecode(ctx, src, hash)
-	if err != nil {
-		return err
+		if ok, _ := verifyFile(dest, hash); ok {
+			return nil // already present and intact
+		}
+		// present but corrupt/mismatched — overwrite with the good backup copy.
 	}
 	if err := os.MkdirAll(destDir, 0o755); err != nil { //nolint:gosec // primary store is world-readable
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	tmp := dest + ".partial"
-	// 0644 so file-service (a different uid, 65532) can read restored objects from
-	// the primary store. Ownership is handled by the ops runbook / fsGroup.
-	if err := os.WriteFile(tmp, out, 0o644); err != nil { //nolint:gosec // content-addressed blob, served by file-service
-		return fmt.Errorf("write: %w", err)
+	tmp, err := decodeToTemp(ctx, src, hash, destDir)
+	if err != nil {
+		return err
 	}
-	return os.Rename(tmp, dest)
+	defer func() { _ = os.Remove(tmp) }() // no-op after a successful rename
+	// 0644 so file-service (uid 65532) can read restored objects.
+	if err := os.Chmod(tmp, 0o644); err != nil { //nolint:gosec // content-addressed blob, served by file-service
+		return fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+	return fsyncDir(filepath.Dir(dest))
 }
 
-// VerifyObject fetches hash from src and confirms it decodes to hash.
+// VerifyObject streams hash from src and confirms it decodes+hashes to hash,
+// without holding the object in memory and without OOMing on a bomb.
 func VerifyObject(ctx context.Context, src Sink, hash string) error {
-	_, err := fetchAndDecode(ctx, src, hash)
-	return err
+	tmp, err := decodeToTemp(ctx, src, hash, os.TempDir())
+	if err != nil {
+		return err
+	}
+	return os.Remove(tmp)
 }
 
-func fetchAndDecode(ctx context.Context, src Sink, hash string) ([]byte, error) {
+// decodeToTemp streams the stored bytes from src, applies the hash-arbiter (raw
+// first, else bounded zstd), verifies the result against hash, and returns the
+// path of a temp file (under workDir) holding the verified plaintext. The caller
+// renames or removes it. Streamed throughout — memory is bounded to io.Copy
+// buffers regardless of object size.
+func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, error) {
 	rc, err := src.Fetch(ctx, hash)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	raw, err := io.ReadAll(rc)
-	_ = rc.Close()
+	defer func() { _ = rc.Close() }()
+
+	// Stage 1: stream stored bytes to a temp, hashing to detect a plaintext store.
+	raw, err := os.CreateTemp(workDir, hash+".raw.*.partial")
 	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+		return "", fmt.Errorf("create temp: %w", err)
 	}
-	return DecodeArbiter(hash, raw)
+	rawName := raw.Name()
+	h := sha3.New256()
+	if _, err := io.Copy(io.MultiWriter(raw, h), rc); err != nil {
+		_ = raw.Close()
+		_ = os.Remove(rawName)
+		return "", fmt.Errorf("read: %w", err)
+	}
+	_ = raw.Sync()
+	_ = raw.Close()
+	if hex.EncodeToString(h.Sum(nil)) == hash {
+		return rawName, nil // stored plain — the raw temp IS the plaintext
+	}
+
+	// Stage 2: stored bytes are zstd — decode (bounded) into a second temp, verify.
+	defer func() { _ = os.Remove(rawName) }()
+	in, err := os.Open(rawName) //nolint:gosec // temp under workDir
+	if err != nil {
+		return "", fmt.Errorf("reopen temp: %w", err)
+	}
+	defer func() { _ = in.Close() }()
+	dec, err := zstd.NewReader(in)
+	if err != nil {
+		return "", fmt.Errorf("integrity: %s is neither plaintext nor zstd: %w", hash, err)
+	}
+	defer dec.Close()
+
+	out, err := os.CreateTemp(workDir, hash+".out.*.partial")
+	if err != nil {
+		return "", fmt.Errorf("create temp: %w", err)
+	}
+	outName := out.Name()
+	h2 := sha3.New256()
+	n, err := io.Copy(io.MultiWriter(out, h2), io.LimitReader(dec, maxRestoreBytes+1))
+	if err != nil {
+		_ = out.Close()
+		_ = os.Remove(outName)
+		return "", fmt.Errorf("zstd decode: %w", err)
+	}
+	if n > maxRestoreBytes {
+		_ = out.Close()
+		_ = os.Remove(outName)
+		return "", fmt.Errorf("integrity: decoded output exceeds %d bytes (possible corruption/bomb)", maxRestoreBytes)
+	}
+	_ = out.Sync()
+	_ = out.Close()
+	if hex.EncodeToString(h2.Sum(nil)) != hash {
+		_ = os.Remove(outName)
+		return "", fmt.Errorf("integrity: decoded bytes do not match %s", hash)
+	}
+	return outName, nil
+}
+
+// verifyFile reports whether the plaintext file at path hashes to hash.
+func verifyFile(path, hash string) (bool, error) {
+	f, err := os.Open(path) //nolint:gosec // caller-provided primary-store path
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha3.New256()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == hash, nil
+}
+
+// fsyncDir makes a rename/create within dir durable.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir) //nolint:gosec // destination dir under the primary store
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }

@@ -29,6 +29,9 @@ type Deps struct {
 	// StaleTTL is how long a claimed entry may stay in_progress before the reaper
 	// returns it to pending.
 	StaleTTL time.Duration
+	// PerObjectTimeout bounds a single object's backup so a hung fetch/sink can't
+	// pin a worker slot forever.
+	PerObjectTimeout time.Duration
 	// OnDeadLetter is called whenever an entry is moved to dead-letter (optional).
 	OnDeadLetter func()
 	// Logger is the structured logger.
@@ -47,7 +50,10 @@ func New(d Deps) *Consumer {
 		d.PollEvery = 10 * time.Second
 	}
 	if d.StaleTTL <= 0 {
-		d.StaleTTL = 15 * time.Minute
+		d.StaleTTL = time.Hour
+	}
+	if d.PerObjectTimeout <= 0 {
+		d.PerObjectTimeout = 30 * time.Minute
 	}
 	if d.Logger == nil {
 		d.Logger = zap.NewNop()
@@ -131,15 +137,23 @@ func (c *Consumer) drain(ctx context.Context) {
 }
 
 func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
-	ok, err := c.d.Pipeline.BackupOne(ctx, e)
+	objCtx, cancel := context.WithTimeout(ctx, c.d.PerObjectTimeout)
+	defer cancel()
+	ok, err := c.d.Pipeline.BackupOne(objCtx, e)
+
+	// Bookkeeping (fail / mark-done) MUST survive per-object-timeout and
+	// shutdown cancellation, or the row is stranded in_progress. Detach from the
+	// cancelled ctx with a fresh short deadline.
+	bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer bcancel()
 	switch {
 	case err != nil:
 		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))
-		c.fail(ctx, e.ID, err.Error())
+		c.fail(bctx, e.ID, err.Error())
 	case !ok:
-		c.fail(ctx, e.ID, "not all required targets stored")
+		c.fail(bctx, e.ID, "not all targets stored")
 	default:
-		if derr := c.d.Outbox.MarkDone(ctx, e.ID); derr != nil {
+		if derr := c.d.Outbox.MarkDone(bctx, e.ID); derr != nil {
 			c.d.Logger.Error("mark done", zap.Int64("id", e.ID), zap.Error(derr))
 		}
 	}

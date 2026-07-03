@@ -2,8 +2,11 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
@@ -17,7 +20,7 @@ type OutboxRepo struct {
 func NewOutboxRepo(p *Pool) *OutboxRepo { return &OutboxRepo{p: p} }
 
 const claimSQL = `UPDATE file_backup_outbox
-SET status='in_progress', "claimedAt"=now(), attempts=attempts+1
+SET status='in_progress', "claimedAt"=now()
 WHERE id IN (
   SELECT id FROM file_backup_outbox
   WHERE status='pending'
@@ -25,7 +28,7 @@ WHERE id IN (
   LIMIT $1
   FOR UPDATE SKIP LOCKED
 )
-RETURNING id, "fileId"::text, "externalID", priority`
+RETURNING id, "fileId"::text, "externalID", priority, COALESCE("createdBy"::text,''), "createdDate"`
 
 // Claim atomically claims up to n pending rows.
 func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, error) {
@@ -37,7 +40,7 @@ func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, er
 	var out []domain.OutboxEntry
 	for rows.Next() {
 		var e domain.OutboxEntry
-		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Priority); err != nil {
+		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Priority, &e.CreatedBy, &e.CreatedDate); err != nil {
 			return nil, fmt.Errorf("scan outbox row: %w", err)
 		}
 		out = append(out, e)
@@ -48,26 +51,35 @@ func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, er
 	return out, nil
 }
 
-// MarkDone marks an entry done.
+// MarkDone marks an entry done, but only if this worker still owns the claim
+// (status='in_progress'). A concurrently reaped/reclaimed row affects 0 rows and
+// is a safe no-op — we must not clobber another worker's claim or a done row.
 func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
-	if _, err := r.p.Exec(ctx, `UPDATE file_backup_outbox SET status='done' WHERE id=$1`, id); err != nil {
+	if _, err := r.p.Exec(ctx, `UPDATE file_backup_outbox SET status='done' WHERE id=$1 AND status='in_progress'`, id); err != nil {
 		return fmt.Errorf("mark done: %w", err)
 	}
 	return nil
 }
 
-// Fail re-queues the entry (attempts already incremented on claim) or
-// dead-letters it once the attempt limit is reached. Returns true when the entry
-// was moved to dead-letter.
+// Fail increments attempts and re-queues the entry, or dead-letters it once the
+// attempt limit is reached. attempts counts genuine FAILURES (incremented here),
+// never claims or reaps — so a slow object that is reaped/reclaimed is not
+// dead-lettered. Guarded by status='in_progress' so a lost claim (reaped,
+// reclaimed, or already done) is a no-op rather than a clobber. Returns true when
+// the entry was moved to dead-letter.
 func (r *OutboxRepo) Fail(ctx context.Context, id int64, reason string) (bool, error) {
 	const q = `UPDATE file_backup_outbox
-SET status = CASE WHEN attempts >= $2 THEN 'dead_letter' ELSE 'pending' END,
+SET attempts = attempts + 1,
+    status = CASE WHEN attempts + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
     "lastError" = $3,
     "claimedAt" = NULL
-WHERE id = $1
+WHERE id = $1 AND status = 'in_progress'
 RETURNING status = 'dead_letter'`
 	var deadLettered bool
 	if err := r.p.QueryRow(ctx, q, id, maxAttempts, reason).Scan(&deadLettered); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil // claim lost (reaped/reclaimed/done) — no-op
+		}
 		return false, fmt.Errorf("fail entry: %w", err)
 	}
 	return deadLettered, nil

@@ -2,10 +2,15 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 )
+
+// errAbortedBeforeEOF marks a target whose pipe went dead before consuming the
+// full verified stream — it must never be recorded as "stored".
+var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stream")
 
 // Target is one backup destination. All targets are symmetric — there is no
 // primary/required/optional; every object goes to every target and "done"
@@ -44,9 +49,11 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // blocking the healthy targets.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	pending := make([]Target, 0, len(p.Targets))
+	anyStored := false
 	for _, t := range p.Targets {
 		if state, _, err := p.Ledger.TargetState(ctx, e.ExternalID, t.Sink.Name()); err == nil && state == "stored" {
 			p.Metrics.ObjectDedup(t.Sink.Name())
+			anyStored = true // the object row already exists (FK parent present)
 			continue
 		}
 		pending = append(pending, t)
@@ -61,7 +68,10 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	}
 
 	allStored := true
-	objectRecorded := false
+	// objectRecorded gates the FK-safe "failed" write; if a prior round already
+	// stored the object on some target, its row exists, so failures this round
+	// (even before any success) can be recorded.
+	objectRecorded := anyStored
 	for i, t := range pending {
 		name := t.Sink.Name()
 		if results[i].err != nil {
@@ -73,7 +83,12 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 			continue
 		}
 		// Object row must exist before its target_status (FK); idempotent.
-		if err := p.Ledger.UpsertObject(ctx, ObjectMeta{ExternalID: e.ExternalID, Size: size}); err != nil {
+		if err := p.Ledger.UpsertObject(ctx, ObjectMeta{
+			ExternalID:        e.ExternalID,
+			Size:              size,
+			CreatedBy:         e.CreatedBy,
+			SourceCreatedDate: e.CreatedDate,
+		}); err != nil {
 			return false, fmt.Errorf("ledger object: %w", err)
 		}
 		objectRecorded = true
@@ -139,6 +154,14 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		_ = pw.CloseWithError(copyErr)
 	}
 	wg.Wait()
+	// A target whose pipe went dead (stopped reading) but reported no error did
+	// NOT receive the full verified stream — force it to failed so a non-consuming
+	// sink can never be recorded as "stored".
+	for i := range results {
+		if fw.dead[i] && results[i].err == nil {
+			results[i].err = errAbortedBeforeEOF
+		}
+	}
 	return results, vr.Total, nil
 }
 

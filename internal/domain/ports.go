@@ -7,10 +7,12 @@ import (
 
 // OutboxEntry is a claimed backup-outbox row (Alkemio DB).
 type OutboxEntry struct {
-	ID         int64
-	FileID     string
-	ExternalID string
-	Priority   int16
+	ID          int64
+	FileID      string
+	ExternalID  string
+	Priority    int16
+	CreatedBy   string    // uuid text, "" if null — breadcrumb
+	CreatedDate time.Time // when the source object was created — breadcrumb
 }
 
 // Outbox is the read/claim side of the backup outbox in the Alkemio DB, accessed
@@ -30,10 +32,10 @@ type Outbox interface {
 
 // ObjectMeta are the ledger breadcrumbs for one backed-up object.
 type ObjectMeta struct {
-	ExternalID string
-	Size       int64
-	CreatedBy  string // uuid text, or "" for null
-	MimeType   string
+	ExternalID        string
+	Size              int64
+	CreatedBy         string    // uuid text, or "" for null
+	SourceCreatedDate time.Time // outbox createdDate; zero => null
 }
 
 // Ledger records backup metadata in this service's own database.

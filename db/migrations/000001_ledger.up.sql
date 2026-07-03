@@ -5,9 +5,8 @@ CREATE TABLE file_backup_object (
     "externalID"        VARCHAR(128) PRIMARY KEY,          -- content hash
     size                BIGINT       NOT NULL,
     "firstSeenAt"       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    "createdBy"         UUID,                              -- breadcrumb
-    "sourceCreatedDate" TIMESTAMPTZ,                       -- breadcrumb
-    "mimeType"          VARCHAR(128)
+    "createdBy"         UUID,                              -- breadcrumb (outbox createdBy)
+    "sourceCreatedDate" TIMESTAMPTZ                        -- breadcrumb (outbox createdDate)
 );
 
 CREATE TABLE file_backup_target_status (

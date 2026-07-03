@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -23,10 +24,10 @@ func NewLedgerRepo(p *Pool) *LedgerRepo { return &LedgerRepo{q: queries.New(p.Po
 // UpsertObject records an object (idempotent).
 func (r *LedgerRepo) UpsertObject(ctx context.Context, e domain.ObjectMeta) error {
 	return r.q.UpsertObject(ctx, queries.UpsertObjectParams{
-		ExternalID: e.ExternalID,
-		Size:       e.Size,
-		CreatedBy:  uuidOrNull(e.CreatedBy),
-		MimeType:   textOrNull(e.MimeType),
+		ExternalID:        e.ExternalID,
+		Size:              e.Size,
+		CreatedBy:         uuidOrNull(e.CreatedBy),
+		SourceCreatedDate: timestamptzOrNull(e.SourceCreatedDate),
 	})
 }
 
@@ -56,18 +57,21 @@ func (r *LedgerRepo) TargetState(ctx context.Context, externalID, target string)
 	return row.State, stored, nil
 }
 
+// uuidOrNull parses a DB-sourced UUID text (via COALESCE("createdBy"::text,”))
+// into a pgtype.UUID; "" maps to SQL NULL. The source is a UUID column, so a real
+// value cannot fail to parse — the only "" case is a genuine NULL breadcrumb.
 func uuidOrNull(s string) pgtype.UUID {
 	var u pgtype.UUID
 	if s == "" {
 		return u
 	}
-	_ = u.Scan(s) // invalid uuid -> null
+	_ = u.Scan(s)
 	return u
 }
 
-func textOrNull(s string) pgtype.Text {
-	if s == "" {
-		return pgtype.Text{}
+func timestamptzOrNull(t time.Time) pgtype.Timestamptz {
+	if t.IsZero() {
+		return pgtype.Timestamptz{}
 	}
-	return pgtype.Text{String: s, Valid: true}
+	return pgtype.Timestamptz{Time: t, Valid: true}
 }

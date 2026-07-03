@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 
@@ -58,25 +57,5 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 	return pr
 }
 
-// DecodeArbiter reverses the transform using the content hash as the sole
-// arbiter: if the raw bytes already hash to want they are plaintext (handles the
-// edge case of a plaintext that is itself a zstd stream); otherwise they are
-// zstd-decompressed and re-verified. Returns the original bytes.
-func DecodeArbiter(want string, raw []byte) ([]byte, error) {
-	if ok, _ := Verify(want, bytes.NewReader(raw)); ok {
-		return raw, nil // stored plain
-	}
-	dec, err := zstd.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return nil, fmt.Errorf("integrity: raw does not match %s and is not zstd: %w", want, err)
-	}
-	defer dec.Close()
-	out, err := io.ReadAll(dec)
-	if err != nil {
-		return nil, fmt.Errorf("zstd decode: %w", err)
-	}
-	if ok, _ := Verify(want, bytes.NewReader(out)); !ok {
-		return nil, fmt.Errorf("integrity: decoded bytes do not match %s", want)
-	}
-	return out, nil
-}
+// The restore-side hash-arbiter (raw-first, then bounded zstd) is implemented
+// as a streamed decode in restore.go's decodeToTemp — no whole-object buffering.

@@ -90,14 +90,7 @@ func serve(cfgPath string) error {
 
 	mx := metrics.New()
 
-	if cfg.AlkemioDB == "" || cfg.LedgerDB == "" {
-		logger.Warn("databases not configured — running health-only (no backup)")
-		srv := startHTTP(cfg.MetricsPort, httpapi.Deps{Health: &httpapi.HealthHandler{}, Metrics: mx.Handler(), Logger: logger}, logger)
-		defer shutdown(srv)
-		<-ctx.Done()
-		return ctx.Err()
-	}
-
+	// config.Load guarantees both DSNs and >=1 target — no silent no-op mode.
 	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB)
 	if err != nil {
 		return fmt.Errorf("alkemio pool: %w", err)
@@ -120,12 +113,15 @@ func serve(cfgPath string) error {
 	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), db.NewLedgerRepo(ledgerPool), targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
-		Outbox:       db.NewOutboxRepo(alkemioPool),
-		Pipeline:     pipeline,
-		ListenPool:   alkemioPool.Pool,
-		Concurrency:  cfg.Concurrency,
-		OnDeadLetter: mx.DeadLetter,
-		Logger:       logger,
+		Outbox:           db.NewOutboxRepo(alkemioPool),
+		Pipeline:         pipeline,
+		ListenPool:       alkemioPool.Pool,
+		Concurrency:      cfg.Concurrency,
+		PollEvery:        cfg.PollEvery(),
+		StaleTTL:         cfg.StaleTTL(),
+		PerObjectTimeout: cfg.PerObjectTimeout(),
+		OnDeadLetter:     mx.DeadLetter,
+		Logger:           logger,
 	})
 
 	srv := startHTTP(cfg.MetricsPort, httpapi.Deps{
@@ -229,6 +225,9 @@ func startHTTP(port int, deps httpapi.Deps, logger *zap.Logger) *http.Server {
 		Addr:              fmt.Sprintf(":%d", port),
 		Handler:           httpapi.NewRouter(deps),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

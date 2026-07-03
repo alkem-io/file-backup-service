@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -21,6 +22,10 @@ type Metrics struct {
 // New builds a Metrics with its own registry.
 func New() *Metrics {
 	reg := prometheus.NewRegistry()
+	// Runtime/process collectors so /metrics exposes go_goroutines, heap, fds —
+	// without these a goroutine wedge is invisible on the private registry.
+	reg.MustRegister(collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	f := promauto.With(reg)
 	return &Metrics{
 		reg: reg,

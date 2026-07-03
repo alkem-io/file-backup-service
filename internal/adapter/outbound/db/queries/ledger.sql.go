@@ -12,7 +12,7 @@ import (
 )
 
 const getObject = `-- name: GetObject :one
-SELECT "externalID", size, "firstSeenAt", "createdBy", "sourceCreatedDate", "mimeType" FROM file_backup_object WHERE "externalID" = $1
+SELECT "externalID", size, "firstSeenAt", "createdBy", "sourceCreatedDate" FROM file_backup_object WHERE "externalID" = $1
 `
 
 func (q *Queries) GetObject(ctx context.Context, externalid string) (FileBackupObject, error) {
@@ -24,7 +24,6 @@ func (q *Queries) GetObject(ctx context.Context, externalid string) (FileBackupO
 		&i.FirstSeenAt,
 		&i.CreatedBy,
 		&i.SourceCreatedDate,
-		&i.MimeType,
 	)
 	return i, err
 }
@@ -52,8 +51,8 @@ func (q *Queries) GetTargetStatus(ctx context.Context, arg GetTargetStatusParams
 }
 
 const upsertObject = `-- name: UpsertObject :exec
-INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate", "mimeType")
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate")
+VALUES ($1, $2, $3, $4)
 ON CONFLICT ("externalID") DO NOTHING
 `
 
@@ -62,7 +61,6 @@ type UpsertObjectParams struct {
 	Size              int64              `json:"size"`
 	CreatedBy         pgtype.UUID        `json:"createdBy"`
 	SourceCreatedDate pgtype.Timestamptz `json:"sourceCreatedDate"`
-	MimeType          pgtype.Text        `json:"mimeType"`
 }
 
 func (q *Queries) UpsertObject(ctx context.Context, arg UpsertObjectParams) error {
@@ -71,16 +69,18 @@ func (q *Queries) UpsertObject(ctx context.Context, arg UpsertObjectParams) erro
 		arg.Size,
 		arg.CreatedBy,
 		arg.SourceCreatedDate,
-		arg.MimeType,
 	)
 	return err
 }
 
 const upsertTargetStatus = `-- name: UpsertTargetStatus :exec
 INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
-VALUES ($1, $2, $3, $4, now())
+VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'stored' THEN now() ELSE NULL END)
 ON CONFLICT ("externalID", target)
-DO UPDATE SET state = EXCLUDED.state, "storedBytes" = EXCLUDED."storedBytes", "verifiedAt" = now()
+DO UPDATE SET state = EXCLUDED.state,
+              "storedBytes" = EXCLUDED."storedBytes",
+              "verifiedAt" = CASE WHEN EXCLUDED.state = 'stored' THEN now()
+                                  ELSE file_backup_target_status."verifiedAt" END
 `
 
 type UpsertTargetStatusParams struct {

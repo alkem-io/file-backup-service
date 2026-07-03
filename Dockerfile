@@ -15,7 +15,10 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /bin/file-backup-servic
 FROM alpine:${ALPINE_VERSION}
 RUN apk add --no-cache ca-certificates
 RUN addgroup -g 65532 -S nonroot && adduser -u 65532 -S -G nonroot nonroot
+# Provision the primary-store mount so `restore --to /storage` works as nonroot.
+RUN mkdir -p /storage && chown -R 65532:65532 /storage
 COPY --from=builder /bin/file-backup-service /bin/file-backup-service
 USER nonroot:nonroot
+VOLUME ["/storage"]
 EXPOSE 4004
 ENTRYPOINT ["/bin/file-backup-service"]

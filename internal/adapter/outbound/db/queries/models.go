@@ -14,7 +14,6 @@ type FileBackupObject struct {
 	FirstSeenAt       pgtype.Timestamptz `json:"firstSeenAt"`
 	CreatedBy         pgtype.UUID        `json:"createdBy"`
 	SourceCreatedDate pgtype.Timestamptz `json:"sourceCreatedDate"`
-	MimeType          pgtype.Text        `json:"mimeType"`
 }
 
 type FileBackupTargetStatus struct {

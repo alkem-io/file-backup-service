@@ -50,14 +50,17 @@ func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 // TODO(T012): chmod to the configured mode (664) after rename.
 func (s *Sink) Store(_ context.Context, hash string, r io.Reader, _ int64) (int64, error) {
 	dest := s.pathFor(hash)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
-	tmp := dest + ".partial"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // path derived from a validated content hash under the configured root
+	// Unique temp per writer (not <hash>.partial): two concurrent Stores of the
+	// same hash must not truncate/interleave a shared temp file.
+	f, err := os.CreateTemp(dir, hash+".*.partial")
 	if err != nil {
 		return 0, fmt.Errorf("create temp: %w", err)
 	}
+	tmp := f.Name()
 	n, copyErr := io.Copy(f, r)
 	syncErr := f.Sync()
 	closeErr := f.Close()
@@ -68,6 +71,10 @@ func (s *Sink) Store(_ context.Context, hash string, r io.Reader, _ int64) (int6
 	if err := os.Rename(tmp, dest); err != nil {
 		_ = os.Remove(tmp)
 		return 0, fmt.Errorf("rename: %w", err)
+	}
+	// fsync the directory so the rename survives power-loss — atomic != durable.
+	if err := syncDir(dir); err != nil {
+		return 0, fmt.Errorf("sync dir: %w", err)
 	}
 	return n, nil
 }
@@ -81,22 +88,45 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-// PutManifest writes a ledger snapshot object under _manifest/.
+// PutManifest writes a ledger snapshot object under _manifest/ atomically
+// (temp + fsync + rename + dir fsync) so a crash mid-write can't leave a
+// truncated manifest a DR restore would trust.
 func (s *Sink) PutManifest(_ context.Context, name string, r io.Reader) error {
-	dest := filepath.Join(s.root, "_manifest", filepath.Base(name))
-	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+	dir := filepath.Join(s.root, "_manifest")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("mkdir manifest: %w", err)
 	}
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // dest is <root>/_manifest/<base>, not user-controlled
+	dest := filepath.Join(dir, filepath.Base(name))
+	f, err := os.CreateTemp(dir, "manifest.*.partial")
 	if err != nil {
 		return fmt.Errorf("create manifest: %w", err)
 	}
+	tmp := f.Name()
 	_, copyErr := io.Copy(f, r)
+	syncErr := f.Sync()
 	closeErr := f.Close()
-	if err := firstErr(copyErr, closeErr); err != nil {
+	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write manifest: %w", err)
 	}
-	return nil
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename manifest: %w", err)
+	}
+	return syncDir(dir)
+}
+
+// syncDir fsyncs a directory so a rename/create within it is durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir) //nolint:gosec // dir is under the configured root
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func firstErr(errs ...error) error {
