@@ -49,7 +49,7 @@ func TestRestoreRoundTripZstd(t *testing.T) {
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("restored zstd bytes mismatch: %v", err)
 	}
-	if err := VerifyObject(context.Background(), sink, h); err != nil {
+	if err := VerifyObject(context.Background(), sink, h, t.TempDir()); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 }

@@ -49,13 +49,15 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 }
 
 // VerifyObject streams hash from src and confirms it decodes+hashes to hash,
-// without holding the object in memory and without OOMing on a bomb.
-func VerifyObject(ctx context.Context, src Sink, hash string) error {
-	tmp, err := decodeToTemp(ctx, src, hash, os.TempDir())
+// without holding the object in memory and without OOMing on a bomb. scratchDir
+// MUST be real disk (not tmpfs) — a multi-GB verify on tmpfs would exhaust RAM.
+func VerifyObject(ctx context.Context, src Sink, hash, scratchDir string) error {
+	tmp, err := decodeToTemp(ctx, src, hash, scratchDir)
 	if err != nil {
 		return err
 	}
-	return os.Remove(tmp)
+	_ = os.Remove(tmp) // best-effort cleanup — not a verification result
+	return nil
 }
 
 // decodeToTemp streams the stored bytes from src, applies the hash-arbiter (raw
@@ -77,10 +79,18 @@ func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, 
 	}
 	rawName := raw.Name()
 	h := sha3.New256()
-	if _, err := io.Copy(io.MultiWriter(raw, h), rc); err != nil {
+	// Cap the raw download too — a hostile/corrupt stored object must not fill the
+	// primary store during a restore (the decoded cap alone left Stage 1 unbounded).
+	n, err := io.Copy(io.MultiWriter(raw, h), io.LimitReader(rc, maxRestoreBytes+1))
+	if err != nil {
 		_ = raw.Close()
 		_ = os.Remove(rawName)
 		return "", fmt.Errorf("read: %w", err)
+	}
+	if n > maxRestoreBytes {
+		_ = raw.Close()
+		_ = os.Remove(rawName)
+		return "", fmt.Errorf("stored object exceeds %d bytes (possible corruption)", maxRestoreBytes)
 	}
 	_ = raw.Sync()
 	_ = raw.Close()
