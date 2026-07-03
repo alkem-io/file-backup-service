@@ -39,27 +39,34 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // when all REQUIRED targets are stored.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	allRequiredOK := true
+	// A target_status row requires an existing object row (FK). objectRecorded
+	// tracks that so we never issue a write we know would violate the FK — a
+	// "stored" dedup or a fresh UpsertObject both imply the object row exists.
+	objectRecorded := false
 	for _, t := range p.Targets {
 		name := t.Sink.Name()
 		if state, _, err := p.Ledger.TargetState(ctx, e.ExternalID, name); err == nil && state == "stored" {
 			p.Metrics.ObjectDedup(name)
+			objectRecorded = true
 			continue
 		}
 		plaintext, stored, err := p.streamToTarget(ctx, t, e)
 		if err != nil {
 			p.Metrics.ObjectFailed(name)
-			// Best-effort; no-ops if no object row exists yet (target_status FK).
-			_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
+			if objectRecorded {
+				_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
+			}
 			if t.Required {
 				allRequiredOK = false
 			}
 			continue
 		}
-		// The object row must exist before its target_status (FK). UpsertObject is
-		// idempotent (ON CONFLICT DO NOTHING), so repeating it per target is cheap.
+		// UpsertObject is idempotent (ON CONFLICT DO NOTHING); repeating it per
+		// target is cheap and keeps the object row present before its status.
 		if err := p.Ledger.UpsertObject(ctx, ObjectMeta{ExternalID: e.ExternalID, Size: plaintext}); err != nil {
 			return false, fmt.Errorf("ledger object: %w", err)
 		}
+		objectRecorded = true
 		p.Metrics.ObjectStored(name, stored)
 		if err := p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "stored", stored); err != nil {
 			return false, fmt.Errorf("ledger target status: %w", err)
