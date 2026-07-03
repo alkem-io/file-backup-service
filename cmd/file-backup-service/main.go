@@ -83,6 +83,9 @@ func serve(cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
 	logger, _ := zap.NewProduction()
 	defer func() { _ = logger.Sync() }()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -104,18 +107,21 @@ func serve(cfgPath string) error {
 	}
 	defer ledgerPool.Close()
 
+	// Fail loudly if the scoped role can't reach the outbox, rather than a silent
+	// no-op with /health green.
+	outbox := db.NewOutboxRepo(alkemioPool)
+	if err := outbox.Probe(ctx); err != nil {
+		return fmt.Errorf("outbox not accessible (scoped role / schema?): %w", err)
+	}
+
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err
 	}
-	if len(targets) == 0 {
-		return errors.New("no backup target configured: at least one target is required, " +
-			"else objects would be marked backed-up with no copy anywhere")
-	}
 	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), db.NewLedgerRepo(ledgerPool), targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
-		Outbox:           db.NewOutboxRepo(alkemioPool),
+		Outbox:           outbox,
 		Pipeline:         pipeline,
 		ListenPool:       alkemioPool.Pool,
 		Concurrency:      cfg.Concurrency,

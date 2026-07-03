@@ -79,13 +79,14 @@ func Load(path string) (*Config, error) {
 	if c.PollEverySec == 0 {
 		c.PollEverySec = 10
 	}
-	if err := c.validate(); err != nil {
-		return nil, fmt.Errorf("invalid config %q: %w", path, err)
-	}
+	// Validation is NOT run here — it is a serve-time concern. migrate / restore /
+	// verify need only a subset (the ledger DSN, or one named target), and must
+	// not be rejected for missing serve-only fields.
 	return &c, nil
 }
 
-func (c *Config) validate() error {
+// Validate checks the full serve configuration. Call it from serve, not Load.
+func (c *Config) Validate() error {
 	if c.FileServiceBase == "" {
 		return errors.New("fileServiceBase is required")
 	}

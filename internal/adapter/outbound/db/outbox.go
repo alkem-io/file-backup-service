@@ -88,6 +88,18 @@ RETURNING status = 'dead_letter'`
 // maxAttempts is the dead-letter threshold (configurable later — FR-006).
 const maxAttempts = 10
 
+// Probe verifies the outbox is reachable via the scoped role (table + SELECT).
+// An empty table (ErrNoRows) is success — only a missing table / lost permission
+// is an error.
+func (r *OutboxRepo) Probe(ctx context.Context) error {
+	var one int
+	err := r.p.QueryRow(ctx, `SELECT 1 FROM file_backup_outbox LIMIT 1`).Scan(&one)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("outbox probe: %w", err)
+	}
+	return nil
+}
+
 // Release returns a claim to pending WITHOUT incrementing attempts (a graceful
 // shutdown of an in-flight object is not a failure). No-op if the claim is lost.
 func (r *OutboxRepo) Release(ctx context.Context, id int64) error {

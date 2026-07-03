@@ -32,6 +32,9 @@ type Outbox interface {
 	// Release returns a claim to pending WITHOUT counting an attempt — used on
 	// graceful shutdown, where a cancelled in-flight object is not a failure.
 	Release(ctx context.Context, id int64) error
+	// Probe verifies the outbox is reachable (table exists + SELECT permission) so
+	// a scoped-role/schema misconfig fails loudly at startup, not as a silent no-op.
+	Probe(ctx context.Context) error
 }
 
 // ObjectMeta are the ledger breadcrumbs for one backed-up object.
