@@ -48,7 +48,7 @@ func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[
 	}
 	out := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		if row.State == "stored" {
+		if row.State == domain.StateStored {
 			out[row.Target] = true
 		}
 	}

@@ -9,6 +9,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 // Metrics holds the Prometheus collectors.
@@ -43,12 +45,14 @@ func New() *Metrics {
 
 // ObjectStored implements domain.Metrics.
 func (m *Metrics) ObjectStored(target string, storedBytes int64) {
-	m.objects.WithLabelValues("stored", target).Inc()
+	m.objects.WithLabelValues(domain.StateStored, target).Inc()
 	m.bytes.WithLabelValues(target).Add(float64(storedBytes))
 }
 
 // ObjectFailed implements domain.Metrics.
-func (m *Metrics) ObjectFailed(target string) { m.objects.WithLabelValues("failed", target).Inc() }
+func (m *Metrics) ObjectFailed(target string) {
+	m.objects.WithLabelValues(domain.StateFailed, target).Inc()
+}
 
 // ObjectDedup implements domain.Metrics.
 func (m *Metrics) ObjectDedup(target string) { m.objects.WithLabelValues("dedup", target).Inc() }

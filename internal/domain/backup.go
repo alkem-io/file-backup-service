@@ -6,11 +6,24 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // errAbortedBeforeEOF marks a target whose pipe went dead before consuming the
 // full verified stream — it must never be recorded as "stored".
 var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stream")
+
+// Per-target ledger states. The dedup reader, the writers, and the metrics labels
+// must all agree on these exact strings (StoredTargets treats only StateStored as
+// "already has it"), so they live in one place.
+const (
+	StateStored = "stored"
+	StateFailed = "failed"
+)
+
+// ledgerWriteTimeout bounds the bookkeeping writes that must outlive a per-object
+// timeout — long enough for a slow ledger, short enough not to hang shutdown.
+const ledgerWriteTimeout = 15 * time.Second
 
 // Target is one backup destination. All targets are symmetric — there is no
 // primary/required/optional; every object goes to every target and "done"
@@ -77,9 +90,25 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		return false, fmt.Errorf("ledger object: %w", err)
 	}
 
-	results, ferr := p.fanOut(ctx, e, pending)
+	results, verified, ferr := p.fanOut(ctx, e, pending)
 	if ferr != nil {
 		return false, ferr // source integrity / cancellation — outbox retries
+	}
+
+	// Ledger bookkeeping MUST survive a per-object timeout that can fire just as the
+	// last store finishes — otherwise a target that IS stored goes unrecorded and is
+	// needlessly re-stored (or the done-gate never trips). Detach from the object ctx.
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
+	defer cancel()
+
+	// Correct the object size to the VERIFIED plaintext byte count — the outbox size
+	// is the producer's unverified hearsay; the hash guarantees these exact bytes.
+	if verified >= 0 {
+		if err := p.Ledger.UpsertObject(bctx, ObjectMeta{
+			ExternalID: e.ExternalID, Size: verified, CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
+		}); err != nil {
+			return false, fmt.Errorf("ledger object size: %w", err)
+		}
 	}
 
 	allStored := true
@@ -87,12 +116,12 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		name := t.Sink.Name()
 		if results[i].err != nil {
 			p.Metrics.ObjectFailed(name)
-			_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
+			_ = p.Ledger.UpsertTargetStatus(bctx, e.ExternalID, name, StateFailed, 0)
 			allStored = false
 			continue
 		}
 		p.Metrics.ObjectStored(name, results[i].stored)
-		if err := p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "stored", results[i].stored); err != nil {
+		if err := p.Ledger.UpsertTargetStatus(bctx, e.ExternalID, name, StateStored, results[i].stored); err != nil {
 			return false, fmt.Errorf("ledger target status: %w", err)
 		}
 	}
@@ -108,12 +137,13 @@ type targetResult struct {
 // target concurrently (each applying its own codec). A per-target failure is
 // isolated — its pipe is dropped and the remaining targets keep receiving bytes.
 // A corrupt source (VerifyReader fails at EOF) aborts every target's write, so
-// nothing is committed anywhere. Returns per-target results; a non-nil error is a
-// SOURCE failure (integrity mismatch or ctx cancellation).
-func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) ([]targetResult, error) {
+// nothing is committed anywhere. Returns per-target results and the VERIFIED byte
+// count (>=0 only when the full stream was read and hash-verified, else -1); a
+// non-nil error is a SOURCE failure (integrity mismatch or ctx cancellation).
+func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) ([]targetResult, int64, error) {
 	rc, err := p.Source.FetchContent(ctx, e.FileID)
 	if err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 	defer func() { _ = rc.Close() }()
 	vr := NewVerifyReader(rc, e.ExternalID)
@@ -174,14 +204,16 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		// mismatch, fetch read error) short-circuits as "source read".
 		switch {
 		case ctx.Err() != nil:
-			return results, fmt.Errorf("backup aborted: %w", ctx.Err())
+			return results, -1, fmt.Errorf("backup aborted: %w", ctx.Err())
 		case errors.Is(copyErr, io.ErrClosedPipe):
 			// all targets dead — results carry the per-target errors; not a source fault
 		default:
-			return results, fmt.Errorf("source read: %w", copyErr)
+			return results, -1, fmt.Errorf("source read: %w", copyErr)
 		}
 	}
-	return results, nil
+	// copyErr == nil here means the full stream was read and VerifyReader confirmed
+	// the hash, so vr.Total is the true verified plaintext size.
+	return results, vr.Total, nil
 }
 
 // storeWithCtx runs Sink.Store but honors ctx even when the sink cannot (a
