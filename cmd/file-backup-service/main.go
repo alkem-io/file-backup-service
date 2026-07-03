@@ -110,7 +110,7 @@ func serve(cfgPath string) error {
 	// Fail loudly at startup if any external dependency is unusable, rather than a
 	// silent no-op with /health green: the outbox (scoped role + schema), the ledger
 	// (schema/migrate), and every target sink (creds/bucket/path).
-	outbox := db.NewOutboxRepo(alkemioPool)
+	outbox := db.NewOutboxRepo(alkemioPool, cfg.MaxAttempts, cfg.MaxDeliveries)
 	if err := outbox.Probe(ctx); err != nil {
 		return fmt.Errorf("outbox not accessible (scoped role / schema?): %w", err)
 	}

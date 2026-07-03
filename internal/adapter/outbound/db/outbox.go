@@ -13,11 +13,15 @@ import (
 
 // OutboxRepo reads/claims the backup outbox in the Alkemio DB (scoped role).
 type OutboxRepo struct {
-	p *Pool
+	p             *Pool
+	maxAttempts   int // genuine-failure dead-letter threshold
+	maxDeliveries int // crash-loop dead-letter threshold (counted by the reaper)
 }
 
-// NewOutboxRepo binds an OutboxRepo to the alkemio pool.
-func NewOutboxRepo(p *Pool) *OutboxRepo { return &OutboxRepo{p: p} }
+// NewOutboxRepo binds an OutboxRepo to the alkemio pool with the dead-letter limits.
+func NewOutboxRepo(p *Pool, maxAttempts, maxDeliveries int) *OutboxRepo {
+	return &OutboxRepo{p: p, maxAttempts: maxAttempts, maxDeliveries: maxDeliveries}
+}
 
 const claimSQL = `UPDATE file_backup_outbox
 SET status='in_progress', "claimedAt"=now()
@@ -28,7 +32,8 @@ WHERE id IN (
   LIMIT $1
   FOR UPDATE SKIP LOCKED
 )
-RETURNING id, "fileId"::text, "externalID", priority, size, COALESCE("createdBy"::text,''), "createdDate"`
+RETURNING id, "fileId"::text, "externalID", priority, COALESCE(size,0),
+  COALESCE("createdBy"::text,''), COALESCE("createdDate", now())`
 
 // Claim atomically claims up to n pending rows.
 func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, error) {
@@ -68,16 +73,18 @@ func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
 // reclaimed, or already done) is a no-op rather than a clobber. Returns true when
 // the entry was moved to dead-letter.
 func (r *OutboxRepo) Fail(ctx context.Context, id int64, reason string) (bool, error) {
+	// COALESCE(attempts,0): defend against a server-owned column that is NULL (drift),
+	// where NULL arithmetic would make the dead-letter CASE never fire (infinite retry).
 	const q = `UPDATE file_backup_outbox
-SET attempts = attempts + 1,
-    status = CASE WHEN attempts + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
+SET attempts = COALESCE(attempts,0) + 1,
+    status = CASE WHEN COALESCE(attempts,0) + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
     "lastError" = $3,
     "claimedAt" = NULL,
-    "visibleAt" = now() + LEAST(make_interval(secs => 5 * (2 ^ attempts)), interval '10 minutes')
+    "visibleAt" = now() + LEAST(make_interval(secs => 5 * (2 ^ COALESCE(attempts,0))), interval '10 minutes')
 WHERE id = $1 AND status = 'in_progress'
 RETURNING status = 'dead_letter'`
 	var deadLettered bool
-	if err := r.p.QueryRow(ctx, q, id, maxAttempts, reason).Scan(&deadLettered); err != nil {
+	if err := r.p.QueryRow(ctx, q, id, r.maxAttempts, reason).Scan(&deadLettered); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil // claim lost (reaped/reclaimed/done) — no-op
 		}
@@ -85,13 +92,6 @@ RETURNING status = 'dead_letter'`
 	}
 	return deadLettered, nil
 }
-
-// maxAttempts is the genuine-failure dead-letter threshold (configurable later — FR-006).
-const maxAttempts = 10
-
-// maxDeliveries dead-letters an object that repeatedly crashes/wedges the worker
-// (counted by the reaper). Set well above any slow object's expected reap count.
-const maxDeliveries = 50
 
 // Probe verifies the outbox is reachable via the scoped role AND carries every
 // column the consumer depends on. Selecting the actual columns (not SELECT 1)
@@ -149,16 +149,16 @@ func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) (int, err
 	// dead-letter observer — a crash-loop dead-letter happens here, not via Fail.
 	const q = `WITH reaped AS (
     UPDATE file_backup_outbox
-    SET deliveries = deliveries + 1,
-        status = CASE WHEN deliveries + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
-        "lastError" = CASE WHEN deliveries + 1 >= $2 THEN 'crash-loop: exceeded max deliveries' ELSE "lastError" END,
+    SET deliveries = COALESCE(deliveries,0) + 1,
+        status = CASE WHEN COALESCE(deliveries,0) + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
+        "lastError" = CASE WHEN COALESCE(deliveries,0) + 1 >= $2 THEN 'crash-loop: exceeded max deliveries' ELSE "lastError" END,
         "claimedAt" = NULL
     WHERE status='in_progress' AND "claimedAt" < now() - make_interval(secs => $1)
     RETURNING status
 )
 SELECT count(*) FILTER (WHERE status = 'dead_letter') FROM reaped`
 	var deadLettered int
-	if err := r.p.QueryRow(ctx, q, ttl.Seconds(), maxDeliveries).Scan(&deadLettered); err != nil {
+	if err := r.p.QueryRow(ctx, q, ttl.Seconds(), r.maxDeliveries).Scan(&deadLettered); err != nil {
 		return 0, fmt.Errorf("reap stale: %w", err)
 	}
 	return deadLettered, nil

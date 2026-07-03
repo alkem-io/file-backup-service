@@ -29,7 +29,10 @@ func NewLedgerRepo(p *Pool) *LedgerRepo { return &LedgerRepo{p: p, q: queries.Ne
 // batch).
 const recordBackupSQL = `WITH obj AS (
   INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate")
-  VALUES ($1, $2, $3, $4) ON CONFLICT ("externalID") DO NOTHING
+  VALUES ($1, $2, $3, $4)
+  -- DO UPDATE (not DO NOTHING): a first all-targets-fail attempt writes the
+  -- unverified outbox size; a later success must correct it to the verified size.
+  ON CONFLICT ("externalID") DO UPDATE SET size = EXCLUDED.size
 )
 INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
 SELECT $1, t.target, t.state, t.bytes, CASE WHEN t.state = 'stored' THEN now() ELSE NULL END

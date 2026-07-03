@@ -81,6 +81,15 @@ func TestDSNEscapesSpecialChars(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsMalformedEnv: a malformed numeric env override must fail Load
+// loudly, not silently revert to the default (which would degrade the SLO).
+func TestLoadRejectsMalformedEnv(t *testing.T) {
+	t.Setenv("FBS_STALETTLSEC", "1h") // has units — not a valid integer
+	if _, err := Load(filepath.Join(t.TempDir(), "none.yaml")); err == nil {
+		t.Fatal("expected Load to reject a malformed numeric env override")
+	}
+}
+
 // TestConcurrencyFloor: a negative concurrency must not survive into pool sizing.
 func TestConcurrencyFloor(t *testing.T) {
 	t.Setenv("FBS_CONCURRENCY", "-4")
@@ -111,6 +120,7 @@ func TestValidateRejectsInsecureS3(t *testing.T) {
 		LedgerDB:            DBConfig{Host: "h", User: "u", DBName: "l"},
 		PerObjectTimeoutSec: 1800,
 		StaleTTLSec:         3600,
+		MetricsPort:         4004,
 		Targets:             []Target{{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r"}}, // no useSSL/sse
 	}
 	if err := c.Validate(); err == nil {

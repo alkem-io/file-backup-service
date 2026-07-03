@@ -139,17 +139,22 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 	return decodeRaw(br, hash, dst)
 }
 
-// copyCappedVerify streams src into dst bounded to maxRestoreBytes, hashing via the
-// shared object-hash primitive. It returns overCap=true if the content would exceed
-// the cap, and errHashMismatch if it does not hash to want — so restore verifies by
-// the exact same digest rule as backup (hash.go), with no divergence.
-func copyCappedVerify(dst io.Writer, src io.Reader, want string) (overCap bool, err error) {
+// copyVerify streams src into dst, hashing via the shared object-hash primitive so
+// restore verifies by the exact same digest rule as backup (hash.go). If limit > 0
+// it caps the copy and returns overCap=true past it (decompression-bomb protection
+// on the zstd path); limit <= 0 is uncapped (the RAW path — the stored bytes ARE the
+// object, no amplification, so a legitimately-large object must not be rejected).
+func copyVerify(dst io.Writer, src io.Reader, want string, limit int64) (overCap bool, err error) {
 	h := newHash()
-	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(src, maxRestoreBytes+1))
+	rdr := src
+	if limit > 0 {
+		rdr = io.LimitReader(src, limit+1)
+	}
+	n, err := io.Copy(io.MultiWriter(dst, h), rdr)
 	if err != nil {
 		return false, err
 	}
-	if n > maxRestoreBytes {
+	if limit > 0 && n > limit {
 		return true, nil
 	}
 	if hexSum(h) != want {
@@ -158,14 +163,14 @@ func copyCappedVerify(dst io.Writer, src io.Reader, want string) (overCap bool, 
 	return false, nil
 }
 
-// decodeRaw copies r straight to dst and verifies it equals hash.
+// decodeRaw copies r straight to dst and verifies it equals hash. Uncapped: the raw
+// stored bytes are the object itself, so backup (which streams any size) and restore
+// agree — a 17 GiB object backs up and restores, not rejected as "corrupt".
 func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
-	overCap, err := copyCappedVerify(dst, r, hash)
+	_, err := copyVerify(dst, r, hash, 0)
 	switch {
 	case err != nil && !errors.Is(err, errHashMismatch):
 		return fmt.Errorf("read: %w", err)
-	case overCap:
-		return fmt.Errorf("stored object exceeds %d bytes (possible corruption)", maxRestoreBytes)
 	case errors.Is(err, errHashMismatch):
 		return fmt.Errorf("integrity: stored bytes for %s are neither valid zstd nor the plaintext", hash)
 	}
@@ -185,7 +190,8 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 		return errTryRaw
 	}
 	defer zr.Close()
-	if overCap, verr := copyCappedVerify(dst, zr, hash); verr != nil || overCap {
+	// Cap the DECODED output (bomb protection); a tiny zstd frame can expand to PB.
+	if overCap, verr := copyVerify(dst, zr, hash, maxRestoreBytes); verr != nil || overCap {
 		return errTryRaw
 	}
 	return nil

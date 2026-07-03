@@ -95,6 +95,8 @@ type Config struct {
 	PerObjectTimeoutSec int      `yaml:"perObjectTimeoutSec"`
 	StaleTTLSec         int      `yaml:"staleTTLSec"`
 	PollEverySec        int      `yaml:"pollEverySec"`
+	MaxAttempts         int      `yaml:"maxAttempts"`   // genuine-failure dead-letter threshold (FR-029)
+	MaxDeliveries       int      `yaml:"maxDeliveries"` // crash-loop dead-letter threshold (FR-029)
 }
 
 // PerObjectTimeout is the per-object backup deadline.
@@ -126,37 +128,51 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("read config %q: %w", path, err)
 		}
 	}
-	c.applyEnv()
+	if err := c.applyEnv(); err != nil {
+		return nil, fmt.Errorf("env config: %w", err)
+	}
 	c.applyDefaults()
 	return &c, nil
 }
 
-func (c *Config) applyEnv() {
+// applyEnv overlays FBS_* env vars, failing loudly on any malformed numeric/bool so
+// a mis-typed SLO knob (e.g. FBS_STALETTLSEC=1h) can't silently revert to the default.
+func (c *Config) applyEnv() error {
+	var errs []error
+	add := func(err error) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
 	setStr(&c.FileServiceBase, envPrefix+"FILESERVICEBASE")
-	setInt(&c.Concurrency, envPrefix+"CONCURRENCY")
-	setInt(&c.BackfillRatePerSec, envPrefix+"BACKFILLRATEPERSEC")
-	setInt(&c.MetricsPort, envPrefix+"METRICSPORT")
-	setInt(&c.PerObjectTimeoutSec, envPrefix+"PEROBJECTTIMEOUTSEC")
-	setInt(&c.StaleTTLSec, envPrefix+"STALETTLSEC")
-	setInt(&c.PollEverySec, envPrefix+"POLLEVERYSEC")
-	applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_")
-	applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_")
-	c.applyTargetEnv()
+	add(setInt(&c.Concurrency, envPrefix+"CONCURRENCY"))
+	add(setInt(&c.BackfillRatePerSec, envPrefix+"BACKFILLRATEPERSEC"))
+	add(setInt(&c.MetricsPort, envPrefix+"METRICSPORT"))
+	add(setInt(&c.PerObjectTimeoutSec, envPrefix+"PEROBJECTTIMEOUTSEC"))
+	add(setInt(&c.StaleTTLSec, envPrefix+"STALETTLSEC"))
+	add(setInt(&c.PollEverySec, envPrefix+"POLLEVERYSEC"))
+	add(setInt(&c.MaxAttempts, envPrefix+"MAXATTEMPTS"))
+	add(setInt(&c.MaxDeliveries, envPrefix+"MAXDELIVERIES"))
+	add(applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_"))
+	add(applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_"))
+	add(c.applyTargetEnv())
+	return errors.Join(errs...)
 }
 
-func applyDBEnv(d *DBConfig, p string) {
+func applyDBEnv(d *DBConfig, p string) error {
 	setStr(&d.Host, p+"HOST")
-	setInt(&d.Port, p+"PORT")
 	setStr(&d.User, p+"USER")
 	setStr(&d.Password, p+"PASSWORD")
 	setStr(&d.DBName, p+"DBNAME")
 	setStr(&d.SSLMode, p+"SSLMODE")
+	return setInt(&d.Port, p+"PORT")
 }
 
 // applyTargetEnv overlays per-target fields from FBS_TARGET_<NAME>_<FIELD> — the
 // path by which per-target secrets (ACCESSKEY/SECRETKEY) are injected from k8s
 // secrets, and any structural field can be overridden.
-func (c *Config) applyTargetEnv() {
+func (c *Config) applyTargetEnv() error {
+	errs := make([]error, 0, 3*len(c.Targets))
 	for i := range c.Targets {
 		p := envPrefix + "TARGET_" + envToken(c.Targets[i].Name) + "_"
 		setStr(&c.Targets[i].Endpoint, p+"ENDPOINT")
@@ -167,27 +183,37 @@ func (c *Config) applyTargetEnv() {
 		setStr(&c.Targets[i].Compression, p+"COMPRESSION")
 		setStr(&c.Targets[i].AccessKey, p+"ACCESSKEY")
 		setStr(&c.Targets[i].SecretKey, p+"SECRETKEY")
-		setBool(&c.Targets[i].UseSSL, p+"USESSL")
-		setBool(&c.Targets[i].SSE, p+"SSE")
-		setBool(&c.Targets[i].Insecure, p+"INSECURE")
+		errs = append(errs,
+			setBool(&c.Targets[i].UseSSL, p+"USESSL"),
+			setBool(&c.Targets[i].SSE, p+"SSE"),
+			setBool(&c.Targets[i].Insecure, p+"INSECURE"))
 	}
+	return errors.Join(errs...)
 }
 
 func (c *Config) applyDefaults() {
-	if c.Concurrency <= 0 { // floor negatives too, so pool sizing can't underflow
+	// All floors are <= 0 (not == 0): a negative env override must not survive into
+	// pool sizing, a ":-1" listen addr, or a negative-duration ticker (panics).
+	if c.Concurrency <= 0 {
 		c.Concurrency = 8
 	}
-	if c.MetricsPort == 0 {
+	if c.MetricsPort <= 0 {
 		c.MetricsPort = 4004
 	}
-	if c.PerObjectTimeoutSec == 0 {
+	if c.PerObjectTimeoutSec <= 0 {
 		c.PerObjectTimeoutSec = 1800 // 30 min — must exceed the slowest legit backup
 	}
-	if c.StaleTTLSec == 0 {
+	if c.StaleTTLSec <= 0 {
 		c.StaleTTLSec = 3600 // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
 	}
-	if c.PollEverySec == 0 {
+	if c.PollEverySec <= 0 {
 		c.PollEverySec = 10
+	}
+	if c.MaxAttempts <= 0 {
+		c.MaxAttempts = 10
+	}
+	if c.MaxDeliveries <= 0 {
+		c.MaxDeliveries = 50
 	}
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {
@@ -216,20 +242,26 @@ func setStr(dst *string, key string) {
 	}
 }
 
-func setInt(dst *int, key string) {
+func setInt(dst *int, key string) error {
 	if v, ok := os.LookupEnv(key); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			*dst = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("%s: invalid integer %q", key, v)
 		}
+		*dst = n
 	}
+	return nil
 }
 
-func setBool(dst *bool, key string) {
+func setBool(dst *bool, key string) error {
 	if v, ok := os.LookupEnv(key); ok {
-		if b, err := strconv.ParseBool(v); err == nil {
-			*dst = b
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s: invalid bool %q", key, v)
 		}
+		*dst = b
 	}
+	return nil
 }
 
 // Validate checks the full serve configuration. Call it from serve, not Load.
@@ -252,6 +284,9 @@ func (c *Config) Validate() error {
 	if c.StaleTTLSec <= c.PerObjectTimeoutSec {
 		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec (%d), else a running object is reaped",
 			c.StaleTTLSec, c.PerObjectTimeoutSec)
+	}
+	if c.MetricsPort < 1 || c.MetricsPort > 65535 {
+		return fmt.Errorf("metricsPort (%d) out of range 1-65535", c.MetricsPort)
 	}
 	seen := make(map[string]bool, len(c.Targets))
 	for i, t := range c.Targets {
