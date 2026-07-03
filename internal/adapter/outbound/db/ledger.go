@@ -2,11 +2,9 @@ package db
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db/queries"
@@ -41,20 +39,20 @@ func (r *LedgerRepo) UpsertTargetStatus(ctx context.Context, externalID, target,
 	})
 }
 
-// TargetState returns the recorded (state, storedBytes) for (externalID, target).
-func (r *LedgerRepo) TargetState(ctx context.Context, externalID, target string) (string, int64, error) {
-	row, err := r.q.GetTargetStatus(ctx, queries.GetTargetStatusParams{ExternalID: externalID, Target: target})
+// StoredTargets returns the set of target names already in state='stored' for
+// externalID (one query — the dedup source of truth).
+func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[string]bool, error) {
+	rows, err := r.q.ListTargetStates(ctx, externalID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", 0, nil
+		return nil, fmt.Errorf("list target states: %w", err)
+	}
+	out := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if row.State == "stored" {
+			out[row.Target] = true
 		}
-		return "", 0, fmt.Errorf("get target status: %w", err)
 	}
-	var stored int64
-	if row.StoredBytes.Valid {
-		stored = row.StoredBytes.Int64
-	}
-	return row.State, stored, nil
+	return out, nil
 }
 
 // uuidOrNull parses a DB-sourced UUID text (via COALESCE("createdBy"::text,”))

@@ -28,7 +28,7 @@ WHERE id IN (
   LIMIT $1
   FOR UPDATE SKIP LOCKED
 )
-RETURNING id, "fileId"::text, "externalID", priority, COALESCE("createdBy"::text,''), "createdDate"`
+RETURNING id, "fileId"::text, "externalID", priority, size, COALESCE("createdBy"::text,''), "createdDate"`
 
 // Claim atomically claims up to n pending rows.
 func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, error) {
@@ -40,7 +40,7 @@ func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, er
 	var out []domain.OutboxEntry
 	for rows.Next() {
 		var e domain.OutboxEntry
-		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Priority, &e.CreatedBy, &e.CreatedDate); err != nil {
+		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Priority, &e.Size, &e.CreatedBy, &e.CreatedDate); err != nil {
 			return nil, fmt.Errorf("scan outbox row: %w", err)
 		}
 		out = append(out, e)

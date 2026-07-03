@@ -11,6 +11,7 @@ type OutboxEntry struct {
 	FileID      string
 	ExternalID  string
 	Priority    int16
+	Size        int64     // object size (from the outbox) — recorded up front
 	CreatedBy   string    // uuid text, "" if null — breadcrumb
 	CreatedDate time.Time // when the source object was created — breadcrumb
 }
@@ -47,8 +48,8 @@ type Ledger interface {
 	UpsertObject(ctx context.Context, e ObjectMeta) error
 	// UpsertTargetStatus records per-(object,target) completion.
 	UpsertTargetStatus(ctx context.Context, externalID, target, state string, storedBytes int64) error
-	// TargetState returns the recorded (state, storedBytes) for (externalID,
-	// target), or ("", 0, nil) when unknown. Used for dedup without touching the
-	// target (works with PutObject-only WORM credentials).
-	TargetState(ctx context.Context, externalID, target string) (string, int64, error)
+	// StoredTargets returns the set of target names already in state='stored' for
+	// externalID, in one query — the dedup source of truth (never re-reads a
+	// target, so it works with PutObject-only WORM credentials).
+	StoredTargets(ctx context.Context, externalID string) (map[string]bool, error)
 }

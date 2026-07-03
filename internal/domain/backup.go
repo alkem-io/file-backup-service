@@ -48,12 +48,14 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // done-gate); a flaky target leaves the object not-done for retry while never
 // blocking the healthy targets.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
+	stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
+	if err != nil {
+		return false, fmt.Errorf("ledger read: %w", err)
+	}
 	pending := make([]Target, 0, len(p.Targets))
-	anyStored := false
 	for _, t := range p.Targets {
-		if state, _, err := p.Ledger.TargetState(ctx, e.ExternalID, t.Sink.Name()); err == nil && state == "stored" {
+		if stored[t.Sink.Name()] {
 			p.Metrics.ObjectDedup(t.Sink.Name())
-			anyStored = true // the object row already exists (FK parent present)
 			continue
 		}
 		pending = append(pending, t)
@@ -62,36 +64,33 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		return true, nil // every target already has it
 	}
 
-	results, size, err := p.fanOut(ctx, e, pending)
-	if err != nil {
-		return false, err // source fetch failed — outbox retries the whole object
+	// Record the object row up front (idempotent) from the outbox size, so a
+	// target_status write never FK-violates AND an object that fails on every
+	// target still leaves a ledger trace — failure telemetry no longer requires a
+	// prior success.
+	if err := p.Ledger.UpsertObject(ctx, ObjectMeta{
+		ExternalID:        e.ExternalID,
+		Size:              e.Size,
+		CreatedBy:         e.CreatedBy,
+		SourceCreatedDate: e.CreatedDate,
+	}); err != nil {
+		return false, fmt.Errorf("ledger object: %w", err)
+	}
+
+	results, ferr := p.fanOut(ctx, e, pending)
+	if ferr != nil {
+		return false, ferr // source integrity / cancellation — outbox retries
 	}
 
 	allStored := true
-	// objectRecorded gates the FK-safe "failed" write; if a prior round already
-	// stored the object on some target, its row exists, so failures this round
-	// (even before any success) can be recorded.
-	objectRecorded := anyStored
 	for i, t := range pending {
 		name := t.Sink.Name()
 		if results[i].err != nil {
 			p.Metrics.ObjectFailed(name)
-			if objectRecorded {
-				_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
-			}
+			_ = p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "failed", 0)
 			allStored = false
 			continue
 		}
-		// Object row must exist before its target_status (FK); idempotent.
-		if err := p.Ledger.UpsertObject(ctx, ObjectMeta{
-			ExternalID:        e.ExternalID,
-			Size:              size,
-			CreatedBy:         e.CreatedBy,
-			SourceCreatedDate: e.CreatedDate,
-		}); err != nil {
-			return false, fmt.Errorf("ledger object: %w", err)
-		}
-		objectRecorded = true
 		p.Metrics.ObjectStored(name, results[i].stored)
 		if err := p.Ledger.UpsertTargetStatus(ctx, e.ExternalID, name, "stored", results[i].stored); err != nil {
 			return false, fmt.Errorf("ledger target status: %w", err)
@@ -109,11 +108,12 @@ type targetResult struct {
 // target concurrently (each applying its own codec). A per-target failure is
 // isolated — its pipe is dropped and the remaining targets keep receiving bytes.
 // A corrupt source (VerifyReader fails at EOF) aborts every target's write, so
-// nothing is committed anywhere. Returns per-target results and the plaintext size.
-func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) ([]targetResult, int64, error) {
+// nothing is committed anywhere. Returns per-target results; a non-nil error is a
+// SOURCE failure (integrity mismatch or ctx cancellation).
+func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) ([]targetResult, error) {
 	rc, err := p.Source.FetchContent(ctx, e.FileID)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	defer func() { _ = rc.Close() }()
 	vr := NewVerifyReader(rc, e.ExternalID)
@@ -174,9 +174,9 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 	if copyErr != nil {
 		// Surface the real source error (integrity / cancellation) instead of
 		// letting it masquerade as N target-store failures.
-		return results, vr.Total, fmt.Errorf("source read: %w", copyErr)
+		return results, fmt.Errorf("source read: %w", copyErr)
 	}
-	return results, vr.Total, nil
+	return results, nil
 }
 
 // fanoutWriter writes each chunk to every still-live target pipe. A pipe write

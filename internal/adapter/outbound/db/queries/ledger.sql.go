@@ -11,43 +11,33 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getObject = `-- name: GetObject :one
-SELECT "externalID", size, "firstSeenAt", "createdBy", "sourceCreatedDate" FROM file_backup_object WHERE "externalID" = $1
+const listTargetStates = `-- name: ListTargetStates :many
+SELECT target, state FROM file_backup_target_status WHERE "externalID" = $1
 `
 
-func (q *Queries) GetObject(ctx context.Context, externalid string) (FileBackupObject, error) {
-	row := q.db.QueryRow(ctx, getObject, externalid)
-	var i FileBackupObject
-	err := row.Scan(
-		&i.ExternalID,
-		&i.Size,
-		&i.FirstSeenAt,
-		&i.CreatedBy,
-		&i.SourceCreatedDate,
-	)
-	return i, err
+type ListTargetStatesRow struct {
+	Target string `json:"target"`
+	State  string `json:"state"`
 }
 
-const getTargetStatus = `-- name: GetTargetStatus :one
-SELECT state, "storedBytes" FROM file_backup_target_status
-WHERE "externalID" = $1 AND target = $2
-`
-
-type GetTargetStatusParams struct {
-	ExternalID string `json:"externalID"`
-	Target     string `json:"target"`
-}
-
-type GetTargetStatusRow struct {
-	State       string      `json:"state"`
-	StoredBytes pgtype.Int8 `json:"storedBytes"`
-}
-
-func (q *Queries) GetTargetStatus(ctx context.Context, arg GetTargetStatusParams) (GetTargetStatusRow, error) {
-	row := q.db.QueryRow(ctx, getTargetStatus, arg.ExternalID, arg.Target)
-	var i GetTargetStatusRow
-	err := row.Scan(&i.State, &i.StoredBytes)
-	return i, err
+func (q *Queries) ListTargetStates(ctx context.Context, externalid string) ([]ListTargetStatesRow, error) {
+	rows, err := q.db.Query(ctx, listTargetStates, externalid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTargetStatesRow{}
+	for rows.Next() {
+		var i ListTargetStatesRow
+		if err := rows.Scan(&i.Target, &i.State); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertObject = `-- name: UpsertObject :exec
@@ -77,10 +67,15 @@ const upsertTargetStatus = `-- name: UpsertTargetStatus :exec
 INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
 VALUES ($1, $2, $3, $4, CASE WHEN $3 = 'stored' THEN now() ELSE NULL END)
 ON CONFLICT ("externalID", target)
-DO UPDATE SET state = EXCLUDED.state,
-              "storedBytes" = EXCLUDED."storedBytes",
-              "verifiedAt" = CASE WHEN EXCLUDED.state = 'stored' THEN now()
-                                  ELSE file_backup_target_status."verifiedAt" END
+DO UPDATE SET
+  -- never downgrade a durable 'stored' row to 'failed'
+  state = CASE WHEN file_backup_target_status.state = 'stored' AND EXCLUDED.state <> 'stored'
+               THEN file_backup_target_status.state ELSE EXCLUDED.state END,
+  -- storedBytes / verifiedAt only advance on a fresh successful store
+  "storedBytes" = CASE WHEN EXCLUDED.state = 'stored' THEN EXCLUDED."storedBytes"
+                       ELSE file_backup_target_status."storedBytes" END,
+  "verifiedAt" = CASE WHEN EXCLUDED.state = 'stored' THEN now()
+                      ELSE file_backup_target_status."verifiedAt" END
 `
 
 type UpsertTargetStatusParams struct {

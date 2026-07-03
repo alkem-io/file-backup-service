@@ -36,8 +36,8 @@ func (f *fakeLedger) UpsertTargetStatus(_ context.Context, externalID, _, _ stri
 	f.statuses++
 	return nil
 }
-func (f *fakeLedger) TargetState(context.Context, string, string) (string, int64, error) {
-	return "", 0, nil
+func (f *fakeLedger) StoredTargets(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{}, nil
 }
 
 type memSink struct {
