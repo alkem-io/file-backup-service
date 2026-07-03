@@ -148,7 +148,7 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		}(i, t, pr)
 	}
 
-	fw := &fanoutWriter{writers: make([]io.Writer, n), dead: make([]bool, n)}
+	fw := &fanoutWriter{writers: make([]io.Writer, n), dead: make([]bool, n), liveIdx: make([]int, 0, n)}
 	for i := range writers {
 		fw.writers[i] = writers[i]
 	}
@@ -205,23 +205,52 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int
 // error marks that target dead (its Store exited) and the rest continue; it
 // stops the source copy only once every target is gone.
 type fanoutWriter struct {
+	liveIdx []int // scratch reused per Write (dispatcher goroutine only)
 	writers []io.Writer
 	dead    []bool
 }
 
 func (f *fanoutWriter) Write(p []byte) (int, error) {
-	live := 0
-	for i, w := range f.writers {
-		if f.dead[i] {
-			continue
+	live := f.liveIdx[:0]
+	for i := range f.writers {
+		if !f.dead[i] {
+			live = append(live, i)
 		}
-		if _, err := w.Write(p); err != nil {
-			f.dead[i] = true
-			continue
-		}
-		live++
 	}
-	if live == 0 {
+	switch len(live) {
+	case 0:
+		return 0, io.ErrClosedPipe
+	case 1: // fast path — no goroutines for a single target (the launch config)
+		if _, err := f.writers[live[0]].Write(p); err != nil {
+			f.dead[live[0]] = true
+			return 0, io.ErrClosedPipe
+		}
+		return len(p), nil
+	}
+	// Write to all live targets concurrently so per-chunk latency is max(targets),
+	// not sum — a slow target no longer throttles the fast ones.
+	errs := make([]bool, len(f.writers))
+	var wg sync.WaitGroup
+	for _, i := range live {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := f.writers[i].Write(p); err != nil {
+				errs[i] = true // disjoint index, read after wg.Wait — no race
+			}
+		}(i)
+	}
+	wg.Wait()
+	alive := 0
+	for i := range f.writers {
+		if errs[i] {
+			f.dead[i] = true
+		}
+		if !f.dead[i] {
+			alive++
+		}
+	}
+	if alive == 0 {
 		return 0, io.ErrClosedPipe
 	}
 	return len(p), nil

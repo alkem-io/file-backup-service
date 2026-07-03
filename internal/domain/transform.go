@@ -1,8 +1,8 @@
 package domain
 
 import (
-	"fmt"
 	"io"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -19,40 +19,34 @@ const (
 	CodecZstd Codec = "zstd"
 )
 
-// Encode streams r into w applying codec.
-func Encode(w io.Writer, r io.Reader, codec Codec) error {
-	switch codec {
-	case CodecNone, "":
-		if _, err := io.Copy(w, r); err != nil {
-			return fmt.Errorf("encode none: %w", err)
-		}
-		return nil
-	case CodecZstd:
-		enc, err := zstd.NewWriter(w)
-		if err != nil {
-			return fmt.Errorf("zstd writer: %w", err)
-		}
-		if _, err := io.Copy(enc, r); err != nil {
-			_ = enc.Close()
-			return fmt.Errorf("zstd copy: %w", err)
-		}
-		if err := enc.Close(); err != nil {
-			return fmt.Errorf("zstd close: %w", err)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown codec %q", codec)
-	}
+// zstdEncoderPool reuses single-goroutine zstd encoders across objects — each
+// NewWriter eagerly allocates GOMAXPROCS block encoders (~1.25 MiB of hash tables
+// each), so a fresh one per object per zstd target churns tens of MiB and GC.
+// We already parallelize across targets/objects, so encoder concurrency is 1.
+var zstdEncoderPool = sync.Pool{
+	New: func() any {
+		enc, _ := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+		return enc
+	},
 }
 
 // ZstdReader returns a reader that zstd-compresses src on the fly (streamed via a
-// pipe, no full-object buffer). Close it after the consuming call to release the
-// worker goroutine — errors from src (e.g. a VerifyReader integrity failure)
-// propagate to the reader so a downstream Sink never commits bad data.
+// pipe, no full-object buffer), using a pooled encoder. Close it after the
+// consuming call to release the worker goroutine — errors from src (e.g. a
+// VerifyReader integrity failure) propagate to the reader so a downstream Sink
+// never commits bad data.
 func ZstdReader(src io.Reader) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
-		pw.CloseWithError(Encode(pw, src, CodecZstd))
+		enc := zstdEncoderPool.Get().(*zstd.Encoder)
+		enc.Reset(pw)
+		_, err := io.Copy(enc, src)
+		if cerr := enc.Close(); err == nil {
+			err = cerr
+		}
+		enc.Reset(nil) // drop the pipe reference before returning to the pool
+		zstdEncoderPool.Put(enc)
+		pw.CloseWithError(err)
 	}()
 	return pr
 }

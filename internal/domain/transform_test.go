@@ -31,30 +31,23 @@ func TestZstdReaderRoundTrip(t *testing.T) {
 	}
 }
 
-func TestEncodeNoneAndZstd(t *testing.T) {
-	data := []byte("hello encode")
-	var raw bytes.Buffer
-	if err := Encode(&raw, bytes.NewReader(data), CodecNone); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(raw.Bytes(), data) {
-		t.Fatal("CodecNone must pass bytes through unchanged")
-	}
-	big := bytes.Repeat(data, 50)
-	var z bytes.Buffer
-	if err := Encode(&z, bytes.NewReader(big), CodecZstd); err != nil {
-		t.Fatal(err)
-	}
-	dec, err := zstd.NewReader(bytes.NewReader(z.Bytes()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dec.Close()
-	out, err := io.ReadAll(dec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(out, big) {
-		t.Fatal("zstd encode/decode mismatch")
+// TestZstdReaderPoolReuse drives ZstdReader repeatedly to exercise pooled-encoder
+// reuse (Reset after Close), catching a broken reuse cycle.
+func TestZstdReaderPoolReuse(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		data := bytes.Repeat([]byte("reuse "), 200)
+		compressed, err := io.ReadAll(ZstdReader(bytes.NewReader(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec, err := zstd.NewReader(bytes.NewReader(compressed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := io.ReadAll(dec)
+		dec.Close()
+		if err != nil || !bytes.Equal(out, data) {
+			t.Fatalf("round %d: pooled encoder reuse broke: %v", i, err)
+		}
 	}
 }
