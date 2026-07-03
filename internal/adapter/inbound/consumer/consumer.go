@@ -195,18 +195,29 @@ func (c *Consumer) fail(ctx context.Context, id int64, reason string) {
 	}
 }
 
-// reap periodically returns stale in_progress entries to pending.
+// reap sweeps stale in_progress entries back to pending: once immediately at
+// startup (so a crashed worker's rows don't wait a full interval to recover),
+// then on an interval SHORTER than StaleTTL so a stuck row is caught within
+// ~StaleTTL rather than up to 2×.
 func (c *Consumer) reap(ctx context.Context) {
-	t := time.NewTicker(c.d.StaleTTL)
+	sweep := func() {
+		if err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL); err != nil {
+			c.d.Logger.Error("reap stale", zap.Error(err))
+		}
+	}
+	interval := c.d.StaleTTL / 4
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	sweep() // startup sweep
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL); err != nil {
-				c.d.Logger.Error("reap stale", zap.Error(err))
-			}
+			sweep()
 		}
 	}
 }

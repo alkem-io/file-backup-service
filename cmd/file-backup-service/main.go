@@ -91,12 +91,14 @@ func serve(cfgPath string) error {
 	mx := metrics.New()
 
 	// config.Load guarantees both DSNs and >=1 target — no silent no-op mode.
-	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB)
+	// Size for: 1 permanent LISTEN + up to Concurrency in-flight bookkeeping +
+	// health + margin, so a NOTIFY burst can't starve MarkDone/Fail.
+	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB, int32(cfg.Concurrency)+8) //nolint:gosec // Concurrency is a small operator-set value
 	if err != nil {
 		return fmt.Errorf("alkemio pool: %w", err)
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB)
+	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB, int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is a small operator-set value
 	if err != nil {
 		return fmt.Errorf("ledger pool: %w", err)
 	}
