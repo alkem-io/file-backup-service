@@ -142,4 +142,3 @@ func decodeToTemp(ctx context.Context, src Sink, hash, workDir string) (string, 
 	}
 	return outName, nil
 }
-
