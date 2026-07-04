@@ -69,11 +69,16 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 		enc := zstdEncoderPool.Get().(*zstd.Encoder)
 		enc.Reset(pw)
 		_, err := io.Copy(enc, src)
-		if cerr := enc.Close(); err == nil {
-			err = cerr
+		closeErr := enc.Close()
+		if err == nil {
+			err = closeErr
 		}
-		enc.Reset(nil) // drop the pipe reference before returning to the pool
-		zstdEncoderPool.Put(enc)
+		// Only a cleanly-closed encoder goes back to the pool; one that errored on
+		// Close ended in an unknown state, so drop it (GC'd) like the panic path does.
+		if closeErr == nil {
+			enc.Reset(nil) // drop the pipe reference before returning to the pool
+			zstdEncoderPool.Put(enc)
+		}
 		pw.CloseWithError(err)
 	}()
 	return pr

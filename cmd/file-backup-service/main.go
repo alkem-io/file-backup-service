@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,7 +88,10 @@ func serve(cfgPath string) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
-	logger, _ := zap.NewProduction()
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return fmt.Errorf("init logger: %w", err)
+	}
 	defer func() { _ = logger.Sync() }()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -108,27 +112,32 @@ func serve(cfgPath string) error {
 	}
 	defer ledgerPool.Close()
 
-	// Fail loudly at startup if any external dependency is unusable, rather than a
-	// silent no-op with /health green: the outbox (scoped role + schema), the ledger
-	// (schema/migrate), and every target sink (creds/bucket/path).
 	outbox := db.NewOutboxRepo(alkemioPool, cfg.MaxAttempts, cfg.MaxDeliveries)
-	if err := outbox.Probe(ctx); err != nil {
-		return fmt.Errorf("outbox not accessible (scoped role / schema?): %w", err)
-	}
 	ledger := db.NewLedgerRepo(ledgerPool)
-	if err := ledger.Probe(ctx); err != nil {
-		return fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
-	}
-
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err
 	}
-	for _, t := range targets {
-		if err := t.Sink.Preflight(ctx); err != nil {
-			return fmt.Errorf("target preflight failed: %w", err)
-		}
+
+	// Start the HTTP surface BEFORE the startup dependency checks, so /live is always
+	// answerable and /health can report "unhealthy" while a dependency is unreachable —
+	// rather than the process being invisible until every probe passes.
+	srv, err := startHTTP(cfg.MetricsPort, httpapi.Deps{
+		Health:  &httpapi.HealthHandler{Outbox: outbox, Ledger: ledger},
+		Metrics: mx.Handler(),
+		Logger:  logger,
+	}, logger)
+	if err != nil {
+		return err
 	}
+	defer shutdown(srv)
+
+	// Fail loudly if any dependency is unusable at startup (bounded so a hung dial
+	// fails fast instead of hanging), rather than a silent no-op with /health green.
+	if err := startupChecks(ctx, outbox, ledger, targets); err != nil {
+		return err
+	}
+
 	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), ledger, targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
@@ -143,16 +152,6 @@ func serve(cfgPath string) error {
 		OnObjectTimeout:  mx.ObjectTimeout,
 		Logger:           logger,
 	})
-
-	srv, err := startHTTP(cfg.MetricsPort, httpapi.Deps{
-		Health:  &httpapi.HealthHandler{Outbox: outbox, Ledger: ledger},
-		Metrics: mx.Handler(),
-		Logger:  logger,
-	}, logger)
-	if err != nil {
-		return err
-	}
-	defer shutdown(srv)
 
 	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
 	return cons.Run(ctx)
@@ -220,6 +219,37 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 		}
 	}
 	return nil, fmt.Errorf("target %q not found in config", name)
+}
+
+// startupChecks fails serve loudly if any dependency is unusable: the outbox (scoped
+// role reads the schema + holds the UPDATE grant), the ledger (schema/migrate), and
+// every target sink (creds/bucket/path). Bounded by a deadline so a hung dial fails
+// fast; the sink preflights (independent RTTs) run concurrently.
+func startupChecks(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := outbox.Probe(ctx); err != nil {
+		return fmt.Errorf("outbox not accessible (scoped role / schema?): %w", err)
+	}
+	if err := outbox.CheckWriteGrant(ctx); err != nil {
+		return fmt.Errorf("outbox not writable: %w", err)
+	}
+	if err := ledger.Probe(ctx); err != nil {
+		return fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
+	}
+	errs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t domain.Target) {
+			defer wg.Done()
+			if err := t.Sink.Preflight(ctx); err != nil {
+				errs[i] = fmt.Errorf("target %s preflight: %w", t.Sink.Name(), err)
+			}
+		}(i, t)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 func buildTargets(cfgs []config.Target) ([]domain.Target, error) {

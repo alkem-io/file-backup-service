@@ -97,8 +97,14 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	}
 
 	results, verified, ferr := p.fanOut(ctx, e, pending)
-	if ferr != nil {
-		return false, ferr // source integrity / cancellation — outbox retries
+	// A SOURCE integrity error (corrupt bytes, fetch failure) records nothing — the
+	// object is bad and no target holds a valid copy (ctx.Err()==nil distinguishes it
+	// from an abort). A ctx-ABORT (per-object timeout / shutdown), by contrast, may
+	// have left some targets DURABLY stored, so fall through and record those (a target
+	// with err==nil passed its own ctx gate and committed) so a retry doesn't re-store.
+	aborted := ferr != nil
+	if aborted && ctx.Err() == nil {
+		return false, ferr
 	}
 
 	// Ledger bookkeeping MUST survive a per-object timeout that can fire just as the
@@ -116,28 +122,37 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		objSize = verified
 	}
 
-	statuses := make([]TargetStatus, len(pending))
+	statuses := make([]TargetStatus, 0, len(pending))
 	allStored := true
 	for i, t := range pending {
 		name := t.Sink.Name()
 		if results[i].err != nil {
-			p.Metrics.ObjectFailed(name)
-			statuses[i] = TargetStatus{Target: name, State: StateFailed}
 			allStored = false
+			// On an abort, a not-yet-stored target is simply omitted (retried) rather
+			// than recorded failed / counted — the per-object-timeout metric covers it.
+			if !aborted {
+				p.Metrics.ObjectFailed(name)
+				statuses = append(statuses, TargetStatus{Target: name, State: StateFailed})
+			}
 			continue
 		}
 		p.Metrics.ObjectStored(name, results[i].stored)
-		statuses[i] = TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored}
+		statuses = append(statuses, TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored})
 	}
 	// Object row + all statuses in one atomic write (FK parent first, inside the CTE).
 	// SizeVerified gates the size UPDATE so an all-fail retry (unverified e.Size, which
 	// is 0 when the outbox breadcrumb is unpopulated) can't downgrade an earlier
 	// verified size.
-	if err := p.Ledger.RecordBackup(bctx, ObjectMeta{
-		ExternalID: e.ExternalID, Size: objSize, SizeVerified: verified >= 0,
-		CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
-	}, statuses); err != nil {
-		return false, fmt.Errorf("ledger record: %w", err)
+	if len(statuses) > 0 {
+		if err := p.Ledger.RecordBackup(bctx, ObjectMeta{
+			ExternalID: e.ExternalID, Size: objSize, SizeVerified: verified >= 0,
+			CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
+		}, statuses); err != nil {
+			return false, fmt.Errorf("ledger record: %w", err)
+		}
+	}
+	if aborted {
+		return false, ferr // partial progress recorded; surface the abort for retry/release
 	}
 	return allStored, nil
 }

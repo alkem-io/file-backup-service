@@ -103,9 +103,11 @@ RETURNING status = 'dead_letter'`
 
 // Probe verifies the outbox is reachable via the scoped role AND carries every
 // column the consumer depends on. Selecting the actual columns (not SELECT 1)
-// turns a stale/missing server migration into a loud startup failure instead of a
-// green-health silent stall where every Claim errors on a missing column. An empty
-// table (ErrNoRows) is success.
+// turns a stale/missing server migration into a loud failure instead of a
+// green-health silent stall where every Claim errors on a missing column. It is
+// READ-ONLY so it is safe to run on the readiness path every scrape (schema drift on
+// the foreign, server-owned table is the real recurring risk). An empty table
+// (ErrNoRows) is success.
 func (r *OutboxRepo) Probe(ctx context.Context) error {
 	var (
 		id   int64
@@ -113,7 +115,7 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 	)
 	// Every column the consumer's SQL reads or writes (Claim RETURNING, Fail/
 	// ReapStale SET, the claim WHERE) — so a stale/renamed column in the server
-	// migration dies here at startup, not as a green-health silent stall.
+	// migration dies here, not as a green-health silent stall.
 	const q = `SELECT id, "fileId", "externalID", priority, status, attempts,
 	  deliveries, "lastError", "createdBy", "createdDate", size, "claimedAt", "visibleAt"
 	FROM file_backup_outbox LIMIT 1`
@@ -122,12 +124,17 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("outbox probe (scoped role / schema drift?): %w", err)
 	}
-	// Verify the UPDATE half of the SELECT/UPDATE grant too: every Claim/Fail/Reap is
-	// an UPDATE, so a SELECT-only role would pass the read above then fail every claim
-	// at runtime with green health. WHERE false touches no row but still checks the
-	// table-level UPDATE privilege at execution.
+	return nil
+}
+
+// CheckWriteGrant verifies the UPDATE half of the SELECT/UPDATE grant — every
+// Claim/Fail/Reap is an UPDATE, so a SELECT-only role would pass Probe then fail
+// every claim at runtime. WHERE false touches no row but still checks the table-level
+// UPDATE privilege at execution. Called ONCE at startup (not per readiness scrape),
+// so the shared production table doesn't take a write transaction every ~10s.
+func (r *OutboxRepo) CheckWriteGrant(ctx context.Context) error {
 	if _, err := r.p.Exec(ctx, `UPDATE file_backup_outbox SET status = status WHERE false`); err != nil {
-		return fmt.Errorf("outbox probe (scoped role lacks UPDATE?): %w", err)
+		return fmt.Errorf("outbox write-grant check (scoped role lacks UPDATE?): %w", err)
 	}
 	return nil
 }
@@ -157,7 +164,11 @@ func (r *OutboxRepo) ReapStale(ctx context.Context, ttl time.Duration) (int, err
         status = CASE WHEN COALESCE(deliveries,0) + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
         "lastError" = CASE WHEN COALESCE(deliveries,0) + 1 >= $2 THEN 'crash-loop: exceeded max deliveries' ELSE "lastError" END,
         "claimedAt" = NULL
-    WHERE status='in_progress' AND "claimedAt" < now() - make_interval(secs => $1)
+    -- claimedAt IS NULL too: on the shared/foreign outbox a row left in_progress with
+    -- a NULL claimedAt (external writer / drift) would otherwise never match
+    -- (NULL < x is NULL) and stall forever with green health.
+    WHERE status='in_progress'
+      AND ("claimedAt" IS NULL OR "claimedAt" < now() - make_interval(secs => $1))
     RETURNING status
 )
 SELECT count(*) FILTER (WHERE status = 'dead_letter') FROM reaped`

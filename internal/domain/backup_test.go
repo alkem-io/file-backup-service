@@ -40,7 +40,14 @@ func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []Ta
 		f.sizes[m.ExternalID] = m.Size
 	}
 	for _, s := range statuses {
-		f.states[m.ExternalID+"/"+s.Target] = s.State
+		// Mirror the production CTE's no-downgrade: a durable 'stored' is never
+		// overwritten by a later 'failed'.
+		key := m.ExternalID + "/" + s.Target
+		if f.states[key] == StateStored && s.State != StateStored {
+			f.statuses++
+			continue
+		}
+		f.states[key] = s.State
 		f.statuses++
 	}
 	return nil
