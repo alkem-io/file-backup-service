@@ -20,6 +20,11 @@ type Metrics struct {
 	bytes      *prometheus.CounterVec
 	deadletter prometheus.Counter
 	timeout    prometheus.Counter
+	// RPO/lag gauges — the alerting spine (FR-026/SC-001). Set periodically by the
+	// serve sampler, not on the per-object path.
+	backlogPending   prometheus.Gauge
+	oldestPendingAge prometheus.Gauge
+	lastSuccessAge   prometheus.Gauge
 }
 
 // New builds a Metrics with its own registry.
@@ -45,8 +50,28 @@ func New() *Metrics {
 			Name: "filebackup_object_timeout_total",
 			Help: "Objects that hit the per-object timeout (a slow or wedged target).",
 		}),
+		backlogPending: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_outbox_pending", Help: "Outbox entries awaiting backup (backlog depth).",
+		}),
+		oldestPendingAge: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_oldest_pending_age_seconds",
+			Help: "Age of the oldest pending outbox entry — the backup lag / RPO signal.",
+		}),
+		lastSuccessAge: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_last_success_age_seconds",
+			Help: "Seconds since the most recent verified backup (0 until the first).",
+		}),
 	}
 }
+
+// SetBacklog updates the outbox backlog gauges (pending count + oldest-pending age).
+func (m *Metrics) SetBacklog(pending int, oldestAgeSec float64) {
+	m.backlogPending.Set(float64(pending))
+	m.oldestPendingAge.Set(oldestAgeSec)
+}
+
+// SetLastSuccessAge records seconds since the most recent verified backup.
+func (m *Metrics) SetLastSuccessAge(ageSec float64) { m.lastSuccessAge.Set(ageSec) }
 
 // ObjectStored implements domain.Metrics.
 func (m *Metrics) ObjectStored(target string, storedBytes int64) {

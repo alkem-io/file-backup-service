@@ -63,6 +63,20 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	return nil
 }
 
+// LastVerifiedAge returns seconds since the most recent per-target verify (FR-026's
+// last-successful-backup-age signal). ok=false when nothing has been verified yet.
+func (r *LedgerRepo) LastVerifiedAge(ctx context.Context) (ageSec float64, ok bool, err error) {
+	const q = `SELECT EXTRACT(EPOCH FROM now() - max("verifiedAt")) FROM file_backup_target_status`
+	var age *float64
+	if err := r.p.QueryRow(ctx, q).Scan(&age); err != nil {
+		return 0, false, fmt.Errorf("last verified age: %w", err)
+	}
+	if age == nil { // no verified rows yet
+		return 0, false, nil
+	}
+	return *age, true, nil
+}
+
 // Probe verifies both ledger tables exist + are readable via the pool's role. A
 // missing table (skipped migration) errors; an empty table is success.
 func (r *LedgerRepo) Probe(ctx context.Context) error {

@@ -153,6 +153,14 @@ func serve(cfgPath string) error {
 		Logger:           logger,
 	})
 
+	// RPO/lag gauges (FR-026): backlog depth + oldest-pending age from the outbox,
+	// last-successful-backup age from the ledger — the alerting spine. Stopped before
+	// the pools close (defer runs LIFO, ahead of the pool Close defers above).
+	var sampleWG sync.WaitGroup
+	sampleWG.Add(1)
+	go func() { defer sampleWG.Done(); sampleRPO(ctx, outbox, ledger, mx) }()
+	defer sampleWG.Wait()
+
 	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
 	return cons.Run(ctx)
 }
@@ -228,6 +236,30 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 		}
 	}
 	return nil, fmt.Errorf("target %q not found in config", name)
+}
+
+// sampleRPO periodically refreshes the backlog/lag/last-success gauges until ctx is
+// cancelled. Best-effort: a failed sample is skipped (the counters still flow), and a
+// slow query is bounded so it can't wedge shutdown.
+func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, mx *metrics.Metrics) {
+	const every = 15 * time.Second
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if pending, ageSec, err := outbox.BacklogStats(sctx); err == nil {
+			mx.SetBacklog(pending, ageSec)
+		}
+		if ageSec, ok, err := ledger.LastVerifiedAge(sctx); err == nil && ok {
+			mx.SetLastSuccessAge(ageSec)
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // startupChecks fails serve loudly if any dependency is unusable: the outbox (scoped

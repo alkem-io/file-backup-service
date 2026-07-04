@@ -127,6 +127,18 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 	return nil
 }
 
+// BacklogStats returns the number of pending outbox entries and the age (seconds) of
+// the oldest one — the backlog-depth + lag signal (FR-026). Age is 0 when empty.
+func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSec float64, err error) {
+	const q = `SELECT count(*),
+	  COALESCE(EXTRACT(EPOCH FROM now() - min("createdDate")), 0)
+	FROM file_backup_outbox WHERE status='pending'`
+	if err := r.p.QueryRow(ctx, q).Scan(&pending, &oldestAgeSec); err != nil {
+		return 0, 0, fmt.Errorf("backlog stats: %w", err)
+	}
+	return pending, oldestAgeSec, nil
+}
+
 // CheckWriteGrant verifies the UPDATE half of the SELECT/UPDATE grant — every
 // Claim/Fail/Reap is an UPDATE, so a SELECT-only role would pass Probe then fail
 // every claim at runtime. WHERE false touches no row but still checks the table-level
