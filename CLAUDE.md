@@ -18,7 +18,7 @@ targets**. It also provides backfill, reconciliation, and operator restore.
 - **Databases**: PostgreSQL via **pgx v5** — reads the **outbox** in the Alkemio DB via a scoped SELECT/UPDATE role; owns its **ledger** in its **own database**
 - **Ledger schema/migrations**: **sqlc** (typed queries) + **golang-migrate** (`//go:embed`, `iofs`); sqlc `schema` points at the migrations dir (single source of truth)
 - **Targets (sinks)**: S3-compatible object storage (AWS SDK Go v2 / minio-go) + POSIX filesystem, behind one `Sink` port
-- **Compression**: klauspost/compress (**zstd**), adaptive, per-target; **no per-object codec field** (hash-arbiter)
+- **Compression**: klauspost/compress (**zstd**), per-target; **no per-object codec field** (hash-arbiter). *As-built: compression is unconditional when a target enables zstd; the "keep-only-if-smaller" adaptive check (FR-016) is deferred (T008 `[~]`) — restore's hash-arbiter decodes either form regardless.*
 - **Integrity**: SHA3-256 content hash (FIPS 202, `crypto/sha3`) — the object's identity, key, and verifier
 - **Consumer**: Postgres `LISTEN/NOTIFY` + polling floor + `FOR UPDATE SKIP LOCKED`
 - **Logging**: Zap (structured) · **HTTP**: chi v5 (health/metrics only) · **Metrics**: Prometheus

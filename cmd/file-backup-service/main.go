@@ -93,7 +93,7 @@ func serve(cfgPath string) error {
 		return fmt.Errorf("init logger: %w", err)
 	}
 	defer func() { _ = logger.Sync() }()
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signalContext()
 	defer stop()
 
 	mx := metrics.New()
@@ -138,7 +138,7 @@ func serve(cfgPath string) error {
 		return err
 	}
 
-	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, nil), ledger, targets)
+	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil), ledger, targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
@@ -157,49 +157,58 @@ func serve(cfgPath string) error {
 	return cons.Run(ctx)
 }
 
-func runRestore(args []string) error {
-	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+// signalContext returns a context cancelled on SIGINT/SIGTERM, so a long-running
+// serve loop or a stalled DR op honors the operator's stop signal.
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
+
+// sourceOp is the shared scaffold for the DR subcommands: parse --config/--hash/--from
+// (plus any extra flags via register), validate the resolved target's sink, and run op
+// under a signal-cancellable context.
+func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(ctx context.Context, sink domain.Sink, hash string) error) error {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	cfgPath := fs.String("config", "config.yaml", "config file")
-	hash := fs.String("hash", "", "content hash (externalID) to restore")
+	hash := fs.String("hash", "", "content hash (externalID)")
 	from := fs.String("from", "", "source target name")
-	to := fs.String("to", "/storage", "destination directory")
+	if register != nil {
+		register(fs)
+	}
 	_ = fs.Parse(args)
 	if *hash == "" || *from == "" {
-		return errors.New("restore requires --hash and --from")
+		return fmt.Errorf("%s requires --hash and --from", name)
 	}
 	sink, err := sinkFor(*cfgPath, *from)
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signalContext()
 	defer stop()
-	if err := domain.RestoreObject(ctx, sink, *hash, *to); err != nil {
-		return err
-	}
-	fmt.Printf("restored %s -> %s/%s\n", *hash, *to, *hash)
-	return nil
+	return op(ctx, sink, *hash)
+}
+
+func runRestore(args []string) error {
+	var to string
+	return sourceOp("restore", args,
+		func(fs *flag.FlagSet) { fs.StringVar(&to, "to", "/storage", "destination directory") },
+		func(ctx context.Context, sink domain.Sink, hash string) error {
+			if err := domain.RestoreObject(ctx, sink, hash, to); err != nil {
+				return err
+			}
+			fmt.Printf("restored %s -> %s/%s\n", hash, to, hash)
+			return nil
+		})
 }
 
 func runVerify(args []string) error {
-	fs := flag.NewFlagSet("verify", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.yaml", "config file")
-	hash := fs.String("hash", "", "content hash to verify")
-	from := fs.String("from", "", "source target name")
-	_ = fs.Parse(args)
-	if *hash == "" || *from == "" {
-		return errors.New("verify requires --hash and --from")
-	}
-	sink, err := sinkFor(*cfgPath, *from)
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if err := domain.VerifyObject(ctx, sink, *hash); err != nil {
-		return err
-	}
-	fmt.Printf("verified %s on %s\n", *hash, *from)
-	return nil
+	return sourceOp("verify", args, nil,
+		func(ctx context.Context, sink domain.Sink, hash string) error {
+			if err := domain.VerifyObject(ctx, sink, hash); err != nil {
+				return err
+			}
+			fmt.Printf("verified %s\n", hash)
+			return nil
+		})
 }
 
 // sinkFor loads config, validates the named target, and builds its sink. It

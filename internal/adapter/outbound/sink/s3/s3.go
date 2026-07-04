@@ -39,7 +39,7 @@ type Sink struct {
 	client *minio.Client
 	bucket string
 	prefix string
-	sse    encrypt.ServerSide
+	opts   minio.PutObjectOptions // constant for the sink's life (PartSize + SSE)
 }
 
 // New constructs an S3 Sink.
@@ -52,32 +52,26 @@ func New(cfg Config) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 client %q: %w", cfg.Name, err)
 	}
-	s := &Sink{name: cfg.Name, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix}
+	// Bound the streaming (size=-1) multipart buffer once. For an unknown length
+	// minio-go defaults to a ~528 MiB part (5 TiB / 10000 parts) and does
+	// make([]byte, part) PER upload — which OOMs the co-located RWO node at
+	// concurrency. 5 MiB is the S3 multipart minimum: live heap = concurrency x
+	// #targets x 5 MiB, and it still supports ~48 GiB objects, far above this corpus.
+	opts := minio.PutObjectOptions{PartSize: 5 << 20}
 	if cfg.SSE {
-		s.sse = encrypt.NewSSE()
+		opts.ServerSideEncryption = encrypt.NewSSE()
 	}
-	return s, nil
+	return &Sink{name: cfg.Name, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, opts: opts}, nil
 }
 
 // Name returns the target name.
 func (s *Sink) Name() string { return s.name }
 
-func (s *Sink) key(hash string) string {
-	return path.Join(s.prefix, fsutil.ShardKey(hash))
-}
+// prefixed joins a slash-style fsutil key under the target prefix — the one place
+// prefix handling lives, so objects and manifests can't diverge on the layout.
+func (s *Sink) prefixed(key string) string { return path.Join(s.prefix, key) }
 
-func (s *Sink) putOpts() minio.PutObjectOptions {
-	// Bound the streaming (size=-1) multipart buffer. For an unknown length minio-go
-	// defaults to a ~528 MiB part (5 TiB / 10000 parts) and does make([]byte, part)
-	// PER upload — which OOMs the co-located RWO node at concurrency. 5 MiB is the S3
-	// multipart minimum: live heap = concurrency x #targets x 5 MiB, and it still
-	// supports ~48 GiB objects (5 MiB x 10000 parts), far above this file corpus.
-	opts := minio.PutObjectOptions{PartSize: 5 << 20}
-	if s.sse != nil {
-		opts.ServerSideEncryption = s.sse
-	}
-	return opts
-}
+func (s *Sink) key(hash string) string { return s.prefixed(fsutil.ShardKey(hash)) }
 
 // Preflight checks the target is reachable at startup rather than dead-lettering
 // every object. BucketExists returns (true,nil) when the bucket exists and is
@@ -134,7 +128,7 @@ func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, erro
 	var one [1]byte
 	n, err := io.ReadFull(r, one[:]) // 1-byte buf: (1,nil) if a byte, (0,io.EOF) if empty
 	if errors.Is(err, io.EOF) {      // empty object (already hash-verified upstream)
-		if _, perr := s.client.PutObject(ctx, s.bucket, s.key(hash), bytes.NewReader(nil), 0, s.putOpts()); perr != nil {
+		if _, perr := s.client.PutObject(ctx, s.bucket, s.key(hash), bytes.NewReader(nil), 0, s.opts); perr != nil {
 			return 0, fmt.Errorf("put (empty): %w", perr)
 		}
 		return 0, nil
@@ -143,7 +137,7 @@ func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, erro
 		return 0, fmt.Errorf("read: %w", err)
 	}
 	body := io.MultiReader(bytes.NewReader(one[:n]), r)
-	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), body, -1, s.putOpts())
+	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), body, -1, s.opts)
 	if err != nil {
 		return 0, fmt.Errorf("put: %w", err)
 	}
@@ -161,8 +155,8 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 
 // PutManifest writes a ledger snapshot object under _manifest/.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
-	key := path.Join(s.prefix, fsutil.ManifestKey(name))
-	if _, err := s.client.PutObject(ctx, s.bucket, key, r, -1, s.putOpts()); err != nil {
+	key := s.prefixed(fsutil.ManifestKey(name))
+	if _, err := s.client.PutObject(ctx, s.bucket, key, r, -1, s.opts); err != nil {
 		return fmt.Errorf("put manifest: %w", err)
 	}
 	return nil

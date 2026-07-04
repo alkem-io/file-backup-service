@@ -347,9 +347,10 @@ func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 }
 
 // TestPipelineAllTargetsFailRecordsOutboxSize guards the regression where an
-// all-targets-dead backup recorded a PARTIAL vr.Total (bytes read before the
-// pipes died) as the object size, frozen forever by ON CONFLICT DO NOTHING. The
-// object must exceed one io.Copy buffer so a partial read is distinguishable.
+// all-targets-dead backup recorded a PARTIAL vr.Total (bytes read before the pipes
+// died) as the object size; instead it falls back to the outbox size with
+// SizeVerified=false. The object must exceed one io.Copy buffer so a partial read is
+// distinguishable.
 func TestPipelineAllTargetsFailRecordsOutboxSize(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), 200*1024) // > 32 KiB io.Copy buffer
 	h, err := Sum(bytes.NewReader(data))

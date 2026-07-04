@@ -263,8 +263,8 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		case errors.Is(copyErr, io.ErrClosedPipe):
 			// All targets dead — results carry the per-target errors; not a source
 			// fault. The stream was NOT read to EOF/hash-verified, so the size is
-			// unknown: return -1 so BackupOne falls back to the outbox size rather
-			// than freezing a partial vr.Total into the ledger (ON CONFLICT DO NOTHING).
+			// unknown: return -1 so BackupOne falls back to the outbox size (recorded
+			// with SizeVerified=false so it can't downgrade a later verified size).
 			return results, -1, nil
 		default:
 			return results, -1, fmt.Errorf("source read: %w", copyErr)
@@ -280,8 +280,9 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 // syscall Go cannot interrupt by closing the fd): on ctx cancellation it returns
 // the ctx error and abandons the inner Store goroutine, so wg.Wait / the dispatcher
 // unblock and the worker slot is freed rather than pinned forever. The abandoned
-// goroutine is bounded (one per wedged object) and its eventual write is an
-// idempotent overwrite of identical content-addressed bytes — never corruption.
+// goroutine is bounded (one per wedged object); if it ever completes, the filesystem
+// sink's own ctx-gate refuses to commit a cancelled write (the temp is removed), and
+// an S3 sink writes identical content-addressed bytes — never corruption either way.
 //
 // The Store call is in its OWN goroutine, so a panicking sink is recovered HERE
 // (a recover() only catches its own goroutine) and converted to an error — the

@@ -24,9 +24,14 @@ func New(name, root string) *Sink { return &Sink{name: name, root: root} }
 // Name returns the target name.
 func (s *Sink) Name() string { return s.name }
 
-func (s *Sink) pathFor(hash string) string {
-	return filepath.Join(s.root, filepath.FromSlash(fsutil.ShardKey(hash)))
+// osPath maps a slash-style fsutil key (ShardKey/ManifestKey) to an OS path under the
+// root — the one place root-joining + slash conversion lives, so objects and
+// manifests can't diverge on how the root is applied.
+func (s *Sink) osPath(key string) string {
+	return filepath.Join(s.root, filepath.FromSlash(key))
 }
+
+func (s *Sink) pathFor(hash string) string { return s.osPath(fsutil.ShardKey(hash)) }
 
 // Preflight verifies the root exists and is writable, so a missing mount / wrong
 // path / read-only volume fails loudly at startup instead of dead-lettering every
@@ -80,24 +85,14 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 // uses the same 0644 durable spine as Store — a DR restore on a different uid
 // must be able to read it.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
-	dest := filepath.Join(s.root, filepath.FromSlash(fsutil.ManifestKey(name)))
+	dest := s.osPath(fsutil.ManifestKey(name))
 	_, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r)
 	return err
 }
 
-// writeAtomic streams r into dir/base durably: MkdirAll, a unique temp per writer
-// (two concurrent Stores of the same hash must not share a temp), fsync, chmod
-// 0644 (so a verify/reconcile job or file-service on a different uid can read the
-// blob — CreateTemp defaults to 0600), atomic rename, and a parent-dir fsync
-// (atomic != durable). Returns the bytes written.
-//
-// The commit is gated on ctx: if the caller cancelled while this was blocked in a
-// hung write/fsync (the storeWithCtx abandon path), we DELETE the temp and refuse
-// to rename rather than committing an orphaned write. The bytes are
-// content-addressed so a late commit would be harmless, but not committing keeps
-// the store honest and reclaims the temp instead of leaking it. The still-blocked
-// syscall itself can't be interrupted from Go (a regular-file fd close waits on the
-// in-flight op) — that residual is an OS limit, not a policy choice.
+// writeAtomic streams r into dir/base (0644) via the shared fsutil.CommitWrite durable
+// spine (mkdir → unique temp → fsync → chmod → rename → dir-fsync, ctx-gated so a
+// cancelled write is removed rather than committed). Returns the bytes written.
 func writeAtomic(ctx context.Context, dir, base string, r io.Reader) (int64, error) {
 	var n int64
 	err := fsutil.CommitWrite(ctx, dir, base, 0o644, func(f *os.File) error {

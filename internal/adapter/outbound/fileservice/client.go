@@ -22,9 +22,14 @@ type Client struct {
 	http    *http.Client
 }
 
-// New constructs a Client for the given file-service base URL.
-func New(baseURL string, hc *http.Client) *Client {
+// New constructs a Client for the given file-service base URL. maxIdleConns sizes the
+// idle connection pool to the worker concurrency so concurrent fetches reuse
+// keep-alive connections instead of churning a new TCP/TLS handshake per object.
+func New(baseURL string, maxIdleConns int, hc *http.Client) *Client {
 	if hc == nil {
+		if maxIdleConns < 1 {
+			maxIdleConns = 16
+		}
 		// No Client.Timeout — it caps the whole request including body read and
 		// would abort large streamed objects. The per-object ctx bounds total
 		// time; these transport timeouts catch a stalled peer (connect / TLS /
@@ -36,7 +41,7 @@ func New(baseURL string, hc *http.Client) *Client {
 				ResponseHeaderTimeout: 30 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
-				MaxIdleConnsPerHost:   16,
+				MaxIdleConnsPerHost:   maxIdleConns,
 			},
 		}
 	}

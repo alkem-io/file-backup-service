@@ -246,27 +246,21 @@ func setStr(dst *string, key string) {
 	}
 }
 
-func setInt(dst *int, key string) error {
+// setParsed overlays *dst from the env var key via parse, failing loudly on a
+// malformed value. setStr stays separate — its assignment can't fail.
+func setParsed[T any](dst *T, key, kind string, parse func(string) (T, error)) error {
 	if v, ok := os.LookupEnv(key); ok {
-		n, err := strconv.Atoi(v)
+		n, err := parse(v)
 		if err != nil {
-			return fmt.Errorf("%s: invalid integer %q", key, v)
+			return fmt.Errorf("%s: invalid %s %q", key, kind, v)
 		}
 		*dst = n
 	}
 	return nil
 }
 
-func setBool(dst *bool, key string) error {
-	if v, ok := os.LookupEnv(key); ok {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("%s: invalid bool %q", key, v)
-		}
-		*dst = b
-	}
-	return nil
-}
+func setInt(dst *int, key string) error   { return setParsed(dst, key, "integer", strconv.Atoi) }
+func setBool(dst *bool, key string) error { return setParsed(dst, key, "bool", strconv.ParseBool) }
 
 // Validate checks the full serve configuration. Call it from serve, not Load.
 func (c *Config) Validate() error {
