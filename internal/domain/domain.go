@@ -22,8 +22,10 @@ type Sink interface {
 	// Name returns the configured target name.
 	Name() string
 	// Store writes bytes for hash if absent (idempotent, atomic), applying the
-	// target's configured transform. Returns bytes actually stored.
-	Store(ctx context.Context, hash string, r io.Reader, size int64) (int64, error)
+	// target's configured transform. Returns bytes actually stored. It reads r to EOF
+	// (no length is passed): the commit is gated on the upstream VerifyReader hash
+	// check, so a sink must never finalize on a known length before EOF.
+	Store(ctx context.Context, hash string, r io.Reader) (int64, error)
 	// Exists reports whether the object is already present.
 	Exists(ctx context.Context, hash string) (bool, error)
 	// Fetch returns the bytes AS STORED (still transformed). The caller reverses the

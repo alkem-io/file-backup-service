@@ -5,6 +5,7 @@
 package fsutil
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -31,6 +32,44 @@ func CreateTemp(dir, prefix string) (*os.File, string, error) {
 		return nil, "", fmt.Errorf("create temp: %w", err)
 	}
 	return f, f.Name(), nil
+}
+
+// CommitWrite is the durable-write spine shared by the filesystem sink and the DR
+// restore path, so the temp/fsync/ctx-gate/commit policy can't drift between backup
+// and restore. It: MkdirAll(dir,0755) -> temp -> fill(temp) -> fsync -> close ->
+// ctx-cancel gate -> chmod(mode)+rename+dir-fsync, removing the temp on any failure
+// or cancellation. fill writes the object body into the temp (an io.Copy, a decode).
+func CommitWrite(ctx context.Context, dir, base string, mode os.FileMode, fill func(*os.File) error) error {
+	// 0755 (not 0750): blobs are chmod'd 0644 so a different-uid restore/reconcile/
+	// file-service can read them, which needs world-execute to traverse the shard dirs.
+	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // content-addressed store, readable by the restore uid
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	f, tmp, err := CreateTemp(dir, base)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = f.Close() // idempotent after an explicit Close below
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := fill(f); err != nil {
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err // cancelled mid-write — don't commit a late/orphaned object
+	}
+	committed = true // CommitFile owns the temp from here (removes it on its own error)
+	return CommitFile(tmp, filepath.Join(dir, base), mode)
 }
 
 // CommitFile durably publishes an already-written+closed temp to dest: chmod mode,

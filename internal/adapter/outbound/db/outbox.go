@@ -56,14 +56,20 @@ func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, er
 	return out, nil
 }
 
-// MarkDone marks an entry done, but only if this worker still owns the claim
-// (status='in_progress'). A concurrently reaped/reclaimed row affects 0 rows and
-// is a safe no-op — we must not clobber another worker's claim or a done row.
-func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
-	if _, err := r.p.Exec(ctx, `UPDATE file_backup_outbox SET status='done' WHERE id=$1 AND status='in_progress'`, id); err != nil {
-		return fmt.Errorf("mark done: %w", err)
+// transition applies setClause to the claimed row, guarded by status='in_progress'
+// so a concurrently reaped/reclaimed/done row is a safe no-op (never a clobber of
+// another worker's claim). This owns the guard in one place for MarkDone/Release/Skip.
+func (r *OutboxRepo) transition(ctx context.Context, id int64, verb, setClause string) error {
+	if _, err := r.p.Exec(ctx,
+		`UPDATE file_backup_outbox SET `+setClause+` WHERE id=$1 AND status='in_progress'`, id); err != nil {
+		return fmt.Errorf("%s: %w", verb, err)
 	}
 	return nil
+}
+
+// MarkDone marks an entry done, but only if this worker still owns the claim.
+func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
+	return r.transition(ctx, id, "mark done", `status='done'`)
 }
 
 // Fail increments attempts and re-queues the entry, or dead-letters it once the
@@ -129,23 +135,12 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 // Release returns a claim to pending WITHOUT incrementing attempts (a graceful
 // shutdown of an in-flight object is not a failure). No-op if the claim is lost.
 func (r *OutboxRepo) Release(ctx context.Context, id int64) error {
-	const q = `UPDATE file_backup_outbox SET status='pending', "claimedAt"=NULL, "visibleAt"=NULL
-WHERE id=$1 AND status='in_progress'`
-	if _, err := r.p.Exec(ctx, q, id); err != nil {
-		return fmt.Errorf("release: %w", err)
-	}
-	return nil
+	return r.transition(ctx, id, "release", `status='pending', "claimedAt"=NULL, "visibleAt"=NULL`)
 }
 
-// Skip terminally marks an entry 'skipped' (source object gone). Guarded by
-// status='in_progress' so a lost claim is a no-op.
+// Skip terminally marks an entry 'skipped' (source object gone). No-op if lost.
 func (r *OutboxRepo) Skip(ctx context.Context, id int64) error {
-	const q = `UPDATE file_backup_outbox SET status='skipped', "claimedAt"=NULL
-WHERE id=$1 AND status='in_progress'`
-	if _, err := r.p.Exec(ctx, q, id); err != nil {
-		return fmt.Errorf("skip: %w", err)
-	}
-	return nil
+	return r.transition(ctx, id, "skip", `status='skipped', "claimedAt"=NULL`)
 }
 
 // ReapStale requeues entries stuck in_progress past ttl (a crashed/wedged

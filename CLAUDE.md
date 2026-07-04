@@ -77,7 +77,7 @@ come from env only. `internal/config`.
 - `alkemioDB` (host/port/user/password/dbName/sslMode → a libpq DSN) — the outbox, scoped SELECT/UPDATE role. Env: `FBS_ALKEMIODB_HOST` (reuse the shared `DATABASE_HOST`), `FBS_ALKEMIODB_PASSWORD`, …
 - `ledgerDB` (same shape) — this service's own DB (`filebackup`). Env: `FBS_LEDGERDB_*`
 - `targets[]` — each `{name, type, endpoint/bucket/region/path, compression, useSSL, sse}`. Per-target secrets/overrides: `FBS_TARGET_<NAME>_ACCESSKEY` / `_SECRETKEY` / `_BUCKET` / … (`<NAME>` = name upcased, non-alphanumerics → `_`)
-- `concurrency`, `perObjectTimeoutSec`, `staleTTLSec`, `pollEverySec`, `backfillRatePerSec`, `metricsPort` (default 4004) — all `FBS_*`-overridable
+- `concurrency`, `perObjectTimeoutSec`, `staleTTLSec`, `pollEverySec`, `maxAttempts`, `maxDeliveries`, `metricsPort` (default 4004) — all `FBS_*`-overridable (`backfillRatePerSec` returns with the backfill command, T022)
 
 ## Full Constitution
 

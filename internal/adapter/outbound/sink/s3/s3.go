@@ -125,12 +125,12 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 }
 
 // Store uploads bytes for hash (SSE applied; bucket default retention provides WORM).
-// size is always -1 (streamed) so minio reads to EOF and the commit is gated on the
-// upstream VerifyReader hash check. But a 0-byte object then completes a multipart
-// with an empty part, which Scaleway (and many S3 backends) reject (EntityTooSmall);
-// detect empty with a single-byte read (no per-object bufio buffer) and use one empty
-// PutObject instead, re-prepending the read byte via MultiReader for the normal path.
-func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, _ int64) (int64, error) {
+// It hands minio size=-1 (streamed to EOF) so the commit is gated on the upstream
+// VerifyReader hash check, never a known length. But a 0-byte object then completes a
+// multipart with an empty part, which Scaleway (and many S3 backends) reject
+// (EntityTooSmall); detect empty with a single-byte read (no per-object bufio buffer)
+// and use one empty PutObject instead, re-prepending the read byte via MultiReader.
+func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, error) {
 	var one [1]byte
 	n, err := io.ReadFull(r, one[:]) // 1-byte buf: (1,nil) if a byte, (0,io.EOF) if empty
 	if errors.Is(err, io.EOF) {      // empty object (already hash-verified upstream)

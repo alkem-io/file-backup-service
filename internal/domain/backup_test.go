@@ -50,17 +50,32 @@ func (f *fakeLedger) StoredTargets(context.Context, string) (map[string]bool, er
 }
 func (f *fakeLedger) Probe(context.Context) error { return nil }
 
+// stubSink is a no-op Sink base: embed it and override only the method a fake needs,
+// so a new port method is one edit here, not one per fake.
+type stubSink struct{ name string }
+
+func (s stubSink) Name() string                                          { return s.name }
+func (stubSink) Exists(context.Context, string) (bool, error)            { return false, nil }
+func (stubSink) Store(context.Context, string, io.Reader) (int64, error) { return 0, nil }
+func (stubSink) Fetch(context.Context, string) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("stub: no fetch")
+}
+func (stubSink) PutManifest(context.Context, string, io.Reader) error { return nil }
+func (stubSink) Preflight(context.Context) error                      { return nil }
+
 type memSink struct {
-	name  string
+	stubSink
 	store map[string][]byte
 }
 
-func (m *memSink) Name() string { return m.name }
+func newMemSink(name string) *memSink {
+	return &memSink{stubSink: stubSink{name: name}, store: map[string][]byte{}}
+}
 func (m *memSink) Exists(_ context.Context, h string) (bool, error) {
 	_, ok := m.store[h]
 	return ok, nil
 }
-func (m *memSink) Store(_ context.Context, h string, r io.Reader, _ int64) (int64, error) {
+func (m *memSink) Store(_ context.Context, h string, r io.Reader) (int64, error) {
 	b, err := io.ReadAll(r)
 	if err != nil {
 		return 0, err
@@ -71,8 +86,6 @@ func (m *memSink) Store(_ context.Context, h string, r io.Reader, _ int64) (int6
 func (m *memSink) Fetch(_ context.Context, h string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(m.store[h])), nil
 }
-func (m *memSink) PutManifest(context.Context, string, io.Reader) error { return nil }
-func (m *memSink) Preflight(context.Context) error                      { return nil }
 
 func TestPipelineBackupOne(t *testing.T) {
 	data := []byte("back me up")
@@ -80,7 +93,7 @@ func TestPipelineBackupOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &memSink{name: "t1", store: map[string][]byte{}}
+	sink := newMemSink("t1")
 	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
 
@@ -128,7 +141,7 @@ func TestPipelineTruncatedSourceNotCommitted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &memSink{name: "t", store: map[string][]byte{}}
+	sink := newMemSink("t")
 	p := NewPipeline(truncatedSource{full[:3000]}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
 	if err == nil || ok {
@@ -140,7 +153,7 @@ func TestPipelineTruncatedSourceNotCommitted(t *testing.T) {
 }
 
 func TestPipelineSourceCorrupt(t *testing.T) {
-	sink := &memSink{name: "t1", store: map[string][]byte{}}
+	sink := newMemSink("t1")
 	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "deadbeef"})
 	if err == nil {
@@ -173,8 +186,8 @@ func TestPipelineSingleFetchFanOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := &countingSource{data: data}
-	a := &memSink{name: "a", store: map[string][]byte{}}
-	b := &memSink{name: "b", store: map[string][]byte{}}
+	a := newMemSink("a")
+	b := newMemSink("b")
 	p := NewPipeline(src, newFakeLedger(), []Target{
 		{Sink: a, Codec: CodecNone},
 		{Sink: b, Codec: CodecNone},
@@ -199,7 +212,7 @@ func TestPipelineZstdTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &memSink{name: "z", store: map[string][]byte{}}
+	sink := newMemSink("z")
 	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecZstd}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
 	if err != nil || !ok {
@@ -227,8 +240,8 @@ func TestPipelineLargeObjectMultiChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &memSink{name: "a", store: map[string][]byte{}}
-	b := &memSink{name: "b", store: map[string][]byte{}}
+	a := newMemSink("a")
+	b := newMemSink("b")
 	p := NewPipeline(fakeSource{data}, newFakeLedger(),
 		[]Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecZstd}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h, Size: int64(len(data))})
@@ -247,19 +260,9 @@ func TestPipelineLargeObjectMultiChunk(t *testing.T) {
 }
 
 // nonConsumingSink reports success without ever reading its stream — models a
-// misbehaving sink that must NOT be recorded as stored.
-type nonConsumingSink struct{ name string }
-
-func (n *nonConsumingSink) Name() string                                 { return n.name }
-func (n *nonConsumingSink) Exists(context.Context, string) (bool, error) { return false, nil }
-func (n *nonConsumingSink) Store(context.Context, string, io.Reader, int64) (int64, error) {
-	return 0, nil // success, but consumed nothing
-}
-func (n *nonConsumingSink) Fetch(context.Context, string) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("unavailable")
-}
-func (n *nonConsumingSink) PutManifest(context.Context, string, io.Reader) error { return nil }
-func (n *nonConsumingSink) Preflight(context.Context) error                      { return nil }
+// misbehaving sink that must NOT be recorded as stored. The stub's Store is exactly
+// that (returns 0,nil consuming nothing), so no override is needed.
+type nonConsumingSink struct{ stubSink }
 
 // TestPipelineNonConsumingSinkFails: a sink that returns success without reading
 // the verified stream must be forced to failed (dead-pipe cross-check), so the
@@ -270,9 +273,9 @@ func TestPipelineNonConsumingSinkFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	good := &memSink{name: "good", store: map[string][]byte{}}
+	good := newMemSink("good")
 	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{
-		{Sink: &nonConsumingSink{name: "bad"}, Codec: CodecNone},
+		{Sink: &nonConsumingSink{stubSink{name: "bad"}}, Codec: CodecNone},
 		{Sink: good, Codec: CodecNone},
 	})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
@@ -297,7 +300,7 @@ func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	led := newFakeLedger()
-	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{name: "down"}, Codec: CodecNone}})
+	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{stubSink{name: "down"}}, Codec: CodecNone}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
 	if err != nil {
 		t.Fatalf("an all-targets-down failure must NOT be reported as a source error: %v", err)
@@ -321,7 +324,7 @@ func TestPipelineAllTargetsFailRecordsOutboxSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	led := newFakeLedger()
-	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{name: "down"}, Codec: CodecNone}})
+	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{stubSink{name: "down"}}, Codec: CodecNone}})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h, Size: int64(len(data))})
 	if err != nil || ok {
 		t.Fatalf("all-targets-fail: ok=%v err=%v", ok, err)
@@ -342,25 +345,18 @@ func (goneSource) FetchContent(context.Context, string) (io.ReadCloser, error) {
 // so the consumer can mark the entry 'skipped' instead of retrying it.
 func TestPipelineSourceGonePropagates(t *testing.T) {
 	p := NewPipeline(goneSource{}, newFakeLedger(),
-		[]Target{{Sink: &memSink{name: "t", store: map[string][]byte{}}, Codec: CodecNone}})
+		[]Target{{Sink: newMemSink("t"), Codec: CodecNone}})
 	_, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: "abc"})
 	if !errors.Is(err, ErrSourceGone) {
 		t.Fatalf("expected ErrSourceGone to propagate, got %v", err)
 	}
 }
 
-type failSink struct{ name string }
+type failSink struct{ stubSink }
 
-func (f *failSink) Name() string                                 { return f.name }
-func (f *failSink) Exists(context.Context, string) (bool, error) { return false, nil }
-func (f *failSink) Store(context.Context, string, io.Reader, int64) (int64, error) {
+func (f *failSink) Store(context.Context, string, io.Reader) (int64, error) {
 	return 0, fmt.Errorf("sink down")
 }
-func (f *failSink) Fetch(context.Context, string) (io.ReadCloser, error) {
-	return nil, fmt.Errorf("unavailable")
-}
-func (f *failSink) PutManifest(context.Context, string, io.Reader) error { return nil }
-func (f *failSink) Preflight(context.Context) error                      { return nil }
 
 // TestPipelineTargetIsolation: targets are symmetric — a flaky target must not
 // abort the others (they still receive the object), and the object must NOT be
@@ -371,9 +367,9 @@ func TestPipelineTargetIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	good := &memSink{name: "good", store: map[string][]byte{}}
+	good := newMemSink("good")
 	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{
-		{Sink: &failSink{name: "bad"}, Codec: CodecNone},
+		{Sink: &failSink{stubSink{name: "bad"}}, Codec: CodecNone},
 		{Sink: good, Codec: CodecNone},
 	})
 	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})

@@ -48,18 +48,9 @@ type Consumer struct{ d Deps }
 
 // New constructs a Consumer, applying defaults.
 func New(d Deps) *Consumer {
-	if d.Concurrency <= 0 {
-		d.Concurrency = 8
-	}
-	if d.PollEvery <= 0 {
-		d.PollEvery = 10 * time.Second
-	}
-	if d.StaleTTL <= 0 {
-		d.StaleTTL = time.Hour
-	}
-	if d.PerObjectTimeout <= 0 {
-		d.PerObjectTimeout = 30 * time.Minute
-	}
+	// The numeric knobs are already floored by config.applyDefaults (serve is the only
+	// caller), so New does not re-default them — one source of truth. Only the Logger
+	// gets a nil-guard, a genuine convenience for direct construction in tests.
 	if d.Logger == nil {
 		d.Logger = zap.NewNop()
 	}
@@ -134,9 +125,11 @@ func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
 
 // bookkeepingCtx detaches from a possibly-cancelled object ctx with a fresh short
 // deadline, so a MarkDone/Fail/Release/Skip survives a per-object timeout or a
-// graceful shutdown rather than leaving the row stranded in_progress.
+// graceful shutdown rather than leaving the row stranded in_progress. It shares the
+// domain's detach helper + timeout, so the ledger-write and outbox-write budgets can't
+// drift apart.
 func bookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	return domain.DetachedBookkeepingCtx(ctx)
 }
 
 // signal does a non-blocking send — a coalescing wakeup.

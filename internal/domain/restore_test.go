@@ -15,7 +15,7 @@ func TestRestoreRoundTripRaw(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &memSink{name: "s", store: map[string][]byte{h: data}} // stored raw
+	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{h: data}} // stored raw
 	dir := t.TempDir()
 	if err := RestoreObject(context.Background(), sink, h, dir); err != nil {
 		t.Fatalf("restore raw: %v", err)
@@ -40,7 +40,7 @@ func TestRestoreRoundTripZstd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &memSink{name: "s", store: map[string][]byte{h: compressed}}
+	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{h: compressed}}
 	dir := t.TempDir()
 	if err := RestoreObject(context.Background(), sink, h, dir); err != nil {
 		t.Fatalf("restore zstd: %v", err)
@@ -63,7 +63,7 @@ func TestRestoreRawStartingWithZstdMagic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &memSink{name: "s", store: map[string][]byte{h: data}} // stored raw
+	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{h: data}} // stored raw
 	dir := t.TempDir()
 	if err := RestoreObject(context.Background(), sink, h, dir); err != nil {
 		t.Fatalf("restore raw-with-zstd-magic: %v", err)
@@ -75,7 +75,7 @@ func TestRestoreRawStartingWithZstdMagic(t *testing.T) {
 }
 
 func TestRestoreCorruptFails(t *testing.T) {
-	sink := &memSink{name: "s", store: map[string][]byte{"deadbeef": []byte("garbage not zstd")}}
+	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{"deadbeef": []byte("garbage not zstd")}}
 	dir := t.TempDir()
 	if err := RestoreObject(context.Background(), sink, "deadbeef", dir); err == nil {
 		t.Fatal("expected integrity error on a corrupt object")

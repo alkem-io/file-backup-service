@@ -9,7 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Pool wraps a pgx connection pool; it satisfies the health Pinger (Ping).
+// Pool is a thin pgxpool.Pool wrapper, so this package sets the pool's explicit
+// MaxConns in one place.
 type Pool struct {
 	*pgxpool.Pool
 }

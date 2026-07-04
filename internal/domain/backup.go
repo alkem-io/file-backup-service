@@ -27,9 +27,18 @@ const (
 	StateFailed = "failed"
 )
 
-// ledgerWriteTimeout bounds the bookkeeping writes that must outlive a per-object
-// timeout — long enough for a slow ledger, short enough not to hang shutdown.
-const ledgerWriteTimeout = 15 * time.Second
+// BookkeepingTimeout bounds a post-cancellation bookkeeping write (the ledger record
+// here, the outbox mark-done/fail in the consumer) — long enough for a slow DB, short
+// enough not to hang shutdown.
+const BookkeepingTimeout = 15 * time.Second
+
+// DetachedBookkeepingCtx derives a bounded context that SURVIVES ctx's cancellation,
+// so a per-object timeout or shutdown that fires just as the last store finishes can't
+// abort the write that records what already happened (leaving a stored target
+// unrecorded and needlessly re-stored, or the done-gate never tripping).
+func DetachedBookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), BookkeepingTimeout)
+}
 
 // Target is one backup destination. All targets are symmetric — there is no
 // primary/required/optional; every object goes to every target and "done"
@@ -94,8 +103,8 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 
 	// Ledger bookkeeping MUST survive a per-object timeout that can fire just as the
 	// last store finishes — otherwise a target that IS stored goes unrecorded and is
-	// needlessly re-stored (or the done-gate never trips). Detach from the object ctx.
-	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
+	// needlessly re-stored (or the done-gate never trips).
+	bctx, cancel := DetachedBookkeepingCtx(ctx)
 	defer cancel()
 
 	// Use the VERIFIED plaintext size when we have it — the outbox size is the
@@ -240,9 +249,10 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 // (a recover() only catches its own goroutine) and converted to an error — the
 // per-target recover() in fanOut cannot reach across this goroutine boundary.
 //
-// size = -1 is load-bearing: commit is gated on the dispatcher closing the pipes
-// AFTER VerifyReader checks the hash; a known byte-count would let a sink finalize
-// (e.g. minio single-PUT) on length alone, before verification.
+// Reading r to EOF is load-bearing: commit is gated on the dispatcher closing the
+// pipes AFTER VerifyReader checks the hash; a sink that finalized on a known
+// byte-count (e.g. minio single-PUT) would commit before verification, which is why
+// Store takes no length.
 func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int64, error) {
 	ch := make(chan targetResult, 1) // buffered so an abandoned goroutine never blocks
 	go func() {
@@ -251,7 +261,7 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int
 				ch <- targetResult{err: panicErr("sink "+sink.Name(), rec)}
 			}
 		}()
-		sn, serr := sink.Store(ctx, hash, r, -1)
+		sn, serr := sink.Store(ctx, hash, r)
 		ch <- targetResult{stored: sn, err: serr}
 	}()
 	select {

@@ -90,7 +90,6 @@ type Config struct {
 	LedgerDB            DBConfig `yaml:"ledgerDB"`
 	Targets             []Target `yaml:"targets"`
 	Concurrency         int      `yaml:"concurrency"`
-	BackfillRatePerSec  int      `yaml:"backfillRatePerSec"`
 	MetricsPort         int      `yaml:"metricsPort"`
 	PerObjectTimeoutSec int      `yaml:"perObjectTimeoutSec"`
 	StaleTTLSec         int      `yaml:"staleTTLSec"`
@@ -146,7 +145,6 @@ func (c *Config) applyEnv() error {
 	}
 	setStr(&c.FileServiceBase, envPrefix+"FILESERVICEBASE")
 	add(setInt(&c.Concurrency, envPrefix+"CONCURRENCY"))
-	add(setInt(&c.BackfillRatePerSec, envPrefix+"BACKFILLRATEPERSEC"))
 	add(setInt(&c.MetricsPort, envPrefix+"METRICSPORT"))
 	add(setInt(&c.PerObjectTimeoutSec, envPrefix+"PEROBJECTTIMEOUTSEC"))
 	add(setInt(&c.StaleTTLSec, envPrefix+"STALETTLSEC"))

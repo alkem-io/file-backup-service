@@ -15,10 +15,13 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
-// maxRestoreBytes caps a decoded object so a corrupt/hostile zstd frame (a
-// decompression bomb) cannot OOM the restore/verify tooling. Larger than any
-// plausible object in this corpus; raise it deliberately if ever needed.
-const maxRestoreBytes int64 = 16 << 30 // 16 GiB
+// maxRestoreBytes caps a decoded zstd object so a corrupt/tampered frame (a
+// decompression bomb from a compromised target) cannot OOM the restore/verify
+// tooling. It MUST exceed the S3 backup ceiling (5 MiB PartSize x 10000 parts ≈
+// 48 GiB) so a large-but-legit object stored zstd stays restorable — otherwise a
+// 16–48 GiB object would back up but fail restore (overCap -> raw fallback hashes
+// the compressed frame -> mismatch). 64 GiB clears that ceiling and still bounds a bomb.
+const maxRestoreBytes int64 = 64 << 30 // 64 GiB
 
 // zstdMagic is the zstd frame magic (RFC 8878). A stored object is zstd iff it
 // begins with these bytes — so a 4-byte peek picks the codec without a probe write.
@@ -50,47 +53,18 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 		}
 		// present but corrupt/mismatched — overwrite with the good backup copy.
 	}
-	if err := os.MkdirAll(destDir, 0o755); err != nil { //nolint:gosec // primary store is world-readable
-		return fmt.Errorf("mkdir: %w", err)
-	}
-	tmp, tmpName, err := fsutil.CreateTemp(destDir, hash)
-	if err != nil {
-		return err
-	}
-	closed := false
-	closeTmp := func() {
-		if !closed {
-			_ = tmp.Close()
-			closed = true
+	// 0644 so file-service (uid 65532) can read restored objects. The temp/fsync/
+	// ctx-gate/commit ceremony is the same durable spine the sink write uses.
+	return fsutil.CommitWrite(ctx, destDir, hash, 0o644, func(tmp *os.File) error {
+		// reset rewinds the temp if the rare magic-collision fallback re-decodes it.
+		reset := func() error {
+			if _, e := tmp.Seek(0, io.SeekStart); e != nil {
+				return e
+			}
+			return tmp.Truncate(0)
 		}
-	}
-	keep := false
-	defer func() {
-		closeTmp()
-		if !keep {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	// reset rewinds the temp if the rare magic-collision fallback re-decodes it.
-	reset := func() error {
-		if _, e := tmp.Seek(0, io.SeekStart); e != nil {
-			return e
-		}
-		return tmp.Truncate(0)
-	}
-	if err := decodeStream(ctx, src, hash, tmp, reset); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync: %w", err)
-	}
-	closeTmp()
-	if err := ctx.Err(); err != nil {
-		return err // cancelled mid-restore — don't commit (matches the sink write path)
-	}
-	// 0644 so file-service (uid 65532) can read restored objects.
-	keep = true
-	return fsutil.CommitFile(tmpName, dest, 0o644)
+		return decodeStream(ctx, src, hash, tmp, reset)
+	})
 }
 
 // VerifyObject streams hash from src and confirms it decodes+hashes to hash,

@@ -61,7 +61,7 @@ func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 // (via the ledger); Store always writes so the stream is consumed and the real
 // byte count is returned — an identical existing object is just overwritten
 // atomically.
-func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, _ int64) (int64, error) {
+func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, error) {
 	dest := s.pathFor(hash)
 	return writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r)
 }
@@ -99,38 +99,11 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // syscall itself can't be interrupted from Go (a regular-file fd close waits on the
 // in-flight op) — that residual is an OS limit, not a policy choice.
 func writeAtomic(ctx context.Context, dir, base string, r io.Reader) (int64, error) {
-	// 0755 (not 0750): the blobs are chmod'd 0644 precisely so a different-uid DR
-	// restore / reconcile / file-service can read them — which requires world-execute
-	// on the shard dirs to traverse. Matches the restore path (RestoreObject 0755).
-	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // content-addressed backup store, readable by the restore uid
-		return 0, fmt.Errorf("mkdir: %w", err)
-	}
-	f, tmp, err := fsutil.CreateTemp(dir, base)
-	if err != nil {
-		return 0, err
-	}
-	n, copyErr := io.Copy(f, r)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if err := firstErr(copyErr, syncErr, closeErr); err != nil {
-		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("write temp: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		_ = os.Remove(tmp) // cancelled mid-store — don't commit a late/orphaned write
-		return 0, err
-	}
-	if err := fsutil.CommitFile(tmp, filepath.Join(dir, base), 0o644); err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
-func firstErr(errs ...error) error {
-	for _, e := range errs {
-		if e != nil {
-			return e
-		}
-	}
-	return nil
+	var n int64
+	err := fsutil.CommitWrite(ctx, dir, base, 0o644, func(f *os.File) error {
+		var cerr error
+		n, cerr = io.Copy(f, r)
+		return cerr
+	})
+	return n, err
 }
