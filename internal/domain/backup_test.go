@@ -290,6 +290,32 @@ func TestPipelineNonConsumingSinkFails(t *testing.T) {
 	}
 }
 
+// TestPipelineNonConsumingZstdSinkFails: the same guard must hold through the zstd
+// codec, where the encoder drains the source pipe regardless of whether the sink
+// reads its output — so pipe-liveness alone can't catch it; the EOF-consumption
+// check must.
+func TestPipelineNonConsumingZstdSinkFails(t *testing.T) {
+	data := bytes.Repeat([]byte("compress me "), 8) // small: fits the encoder's buffer
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	led := newFakeLedger()
+	p := NewPipeline(fakeSource{data}, led, []Target{
+		{Sink: &nonConsumingSink{stubSink{name: "bad-zstd"}}, Codec: CodecZstd},
+	})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ok {
+		t.Fatal("a non-consuming zstd sink must not make the object done")
+	}
+	if led.states[h+"/bad-zstd"] == StateStored {
+		t.Fatal("a non-consuming zstd sink must never be recorded as stored")
+	}
+}
+
 // TestPipelineAllTargetsFailRecorded: when the ONLY target fails (the single-target
 // launch config), the object is not-done but the failure is a per-target failure —
 // it must be recorded as a 'failed' target_status, NOT masquerade as a source error.

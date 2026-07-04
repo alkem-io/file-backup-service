@@ -145,6 +145,26 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 type targetResult struct {
 	stored int64
 	err    error
+	sawEOF bool // the sink read its stream to EOF — proof it consumed the full object
+}
+
+// eofReader records whether the consumer read the wrapped stream to EOF. It is the
+// robust "did the sink actually consume the verified stream" signal: unlike the
+// pipe-liveness heuristic, it works through a codec wrapper (a CodecZstd sink reads
+// the encoder's output, not the source pipe, so pipe-liveness can't see a
+// non-consuming zstd sink), so a sink that returns success without reading to EOF is
+// caught for every codec.
+type eofReader struct {
+	r      io.Reader
+	sawEOF bool
+}
+
+func (e *eofReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		e.sawEOF = true
+	}
+	return n, err
 }
 
 // fanOut fetches the source once and copies the hash-verified plaintext to every
@@ -187,8 +207,9 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 				defer func() { _ = zr.Close() }()
 				reader = zr
 			}
-			stored, serr := storeWithCtx(ctx, t.Sink, e.ExternalID, reader)
-			results[i] = targetResult{stored: stored, err: serr}
+			er := &eofReader{r: reader}
+			stored, serr := storeWithCtx(ctx, t.Sink, e.ExternalID, er)
+			results[i] = targetResult{stored: stored, err: serr, sawEOF: er.sawEOF}
 			// Unblock the dispatcher if Store bailed before draining the pipe.
 			_ = pr.CloseWithError(serr)
 		}(i, t, pr)
@@ -203,11 +224,13 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 		_ = pw.CloseWithError(copyErr)
 	}
 	wg.Wait()
-	// A target whose pipe went dead (stopped reading) but reported no error did
-	// NOT receive the full verified stream — force it to failed so a non-consuming
-	// sink can never be recorded as "stored".
+	// A sink that reported success but did NOT read its stream to EOF did not receive
+	// the full verified object — force it to failed so a non-consuming sink can never
+	// be recorded as "stored". sawEOF (not the pipe-liveness fw.dead[i]) is used
+	// because a CodecZstd sink reads the encoder's output, not the source pipe, so
+	// pipe-liveness can't detect its non-consumption.
 	for i := range results {
-		if fw.dead[i] && results[i].err == nil {
+		if results[i].err == nil && !results[i].sawEOF {
 			results[i].err = errAbortedBeforeEOF
 		}
 	}
