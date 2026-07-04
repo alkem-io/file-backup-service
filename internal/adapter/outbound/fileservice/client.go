@@ -62,7 +62,9 @@ func (c *Client) FetchContent(ctx context.Context, fileID string) (io.ReadCloser
 		// of torn down under a sustained error burst.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound {
+		// 404 or 410: the object was deleted before backup ran — a benign terminal
+		// (recorded skipped-source-absent), not a retryable failure that burns attempts.
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 			return nil, fmt.Errorf("file-service GET %s: %w", reqURL, domain.ErrSourceGone)
 		}
 		return nil, fmt.Errorf("file-service GET %s: status %d", reqURL, resp.StatusCode)

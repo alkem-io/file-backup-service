@@ -33,8 +33,7 @@ WHERE id IN (
   FOR UPDATE SKIP LOCKED
 )
 RETURNING id, "fileId"::text, "externalID", COALESCE(size,0),
-  COALESCE("createdBy"::text,''), COALESCE("createdDate", now()),
-  COALESCE(attempts,0), COALESCE(deliveries,0)`
+  COALESCE("createdBy"::text,''), COALESCE("createdDate", now())`
 
 // Claim atomically claims up to n pending rows.
 func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, error) {
@@ -46,7 +45,7 @@ func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, er
 	var out []domain.OutboxEntry
 	for rows.Next() {
 		var e domain.OutboxEntry
-		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Size, &e.CreatedBy, &e.CreatedDate, &e.Attempts, &e.Deliveries); err != nil {
+		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Size, &e.CreatedBy, &e.CreatedDate); err != nil {
 			return nil, fmt.Errorf("scan outbox row: %w", err)
 		}
 		out = append(out, e)
@@ -81,7 +80,9 @@ SET attempts = COALESCE(attempts,0) + 1,
     status = CASE WHEN COALESCE(attempts,0) + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
     "lastError" = $3,
     "claimedAt" = NULL,
-    "visibleAt" = now() + LEAST(make_interval(secs => 5 * (2 ^ COALESCE(attempts,0))), interval '10 minutes')
+    -- LEAST(attempts,20) clamps the exponent so make_interval can't overflow the
+    -- interval type before the outer LEAST caps the result at 10 minutes.
+    "visibleAt" = now() + LEAST(make_interval(secs => 5 * (2 ^ LEAST(COALESCE(attempts,0), 20))), interval '10 minutes')
 WHERE id = $1 AND status = 'in_progress'
 RETURNING status = 'dead_letter'`
 	var deadLettered bool
@@ -114,6 +115,13 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 		&cols, &cols, &cols, &cols, &cols, &cols, &cols)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("outbox probe (scoped role / schema drift?): %w", err)
+	}
+	// Verify the UPDATE half of the SELECT/UPDATE grant too: every Claim/Fail/Reap is
+	// an UPDATE, so a SELECT-only role would pass the read above then fail every claim
+	// at runtime with green health. WHERE false touches no row but still checks the
+	// table-level UPDATE privilege at execution.
+	if _, err := r.p.Exec(ctx, `UPDATE file_backup_outbox SET status = status WHERE false`); err != nil {
+		return fmt.Errorf("outbox probe (scoped role lacks UPDATE?): %w", err)
 	}
 	return nil
 }

@@ -78,18 +78,25 @@ func (s *Sink) putOpts() minio.PutObjectOptions {
 	return opts
 }
 
-// Preflight verifies the bucket is reachable with the configured credentials so a
-// wrong key/secret/bucket/region fails loudly at startup rather than dead-lettering
-// every object. A PutObject-only WORM credential legitimately can't introspect the
-// bucket (403 AccessDenied) — that is treated as "reachable"; a wrong key/secret
-// (SignatureDoesNotMatch/InvalidAccessKeyId), a missing bucket (NoSuchBucket), or an
-// unreachable endpoint fail loud.
+// Preflight checks the target is reachable at startup rather than dead-lettering
+// every object. BucketExists returns (true,nil) when the bucket exists and is
+// introspectable, (false,nil) when it is MISSING, and an error when unreachable or
+// access-denied. Note the limit: BucketExists is a HEAD, which has no body for
+// minio-go to read the real S3 code from, so every 403 (a write-only WORM cred, a
+// wrong secret, or a wrong key) collapses to "AccessDenied" — those are
+// indistinguishable here and can only be caught by an actual write. So this catches
+// the common misconfigs loudly (missing/typo'd bucket, unreachable endpoint, wrong
+// region that isn't 403) and treats any 403 as "reachable, write-only".
 func (s *Sink) Preflight(ctx context.Context) error {
-	if _, err := s.client.BucketExists(ctx, s.bucket); err != nil {
+	ok, err := s.client.BucketExists(ctx, s.bucket)
+	if err != nil {
 		if minio.ToErrorResponse(err).Code == "AccessDenied" {
-			return nil // valid creds, write-only by design — can't introspect, but reachable
+			return nil // 403: write-only WORM cred (or an unverifiable wrong cred) — reachable
 		}
-		return fmt.Errorf("s3 preflight %q (creds/bucket/region/endpoint?): %w", s.name, err)
+		return fmt.Errorf("s3 preflight %q (creds/region/endpoint?): %w", s.name, err)
+	}
+	if !ok {
+		return fmt.Errorf("s3 preflight %q: bucket %q does not exist", s.name, s.bucket)
 	}
 	return nil
 }

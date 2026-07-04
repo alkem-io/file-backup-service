@@ -14,8 +14,6 @@ type OutboxEntry struct {
 	Size        int64     // object size (from the outbox) — recorded up front
 	CreatedBy   string    // uuid text, "" if null — breadcrumb
 	CreatedDate time.Time // when the source object was created — breadcrumb
-	Attempts    int       // genuine failures so far; 0 => never processed (dedup read is skippable)
-	Deliveries  int       // reaped/crashed claims so far
 }
 
 // Outbox is the read/claim side of the backup outbox in the Alkemio DB, accessed
@@ -50,6 +48,7 @@ type Outbox interface {
 type ObjectMeta struct {
 	ExternalID        string
 	Size              int64
+	SizeVerified      bool      // Size came from the hash-verified stream, not outbox hearsay
 	CreatedBy         string    // uuid text, or "" for null
 	SourceCreatedDate time.Time // outbox createdDate; zero => null
 }

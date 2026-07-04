@@ -37,11 +37,11 @@ func Verify(want string, r io.Reader) (bool, error) {
 	return got == want, nil
 }
 
-// VerifyReader streams bytes through while hashing them; at EOF it returns an
-// error if the accumulated SHA3-256 does not match want — so a downstream writer
-// (a Sink) sees the error mid-stream and never commits corrupt or wrong-hash
-// data. Total is the plaintext byte count seen so far. This makes integrity a
-// property of the stream, with no whole-object buffering.
+// VerifyReader streams bytes through while hashing them; at end-of-stream it
+// returns an error if the accumulated SHA3-256 does not match want — so a
+// downstream writer (a Sink) sees the error mid-stream and never commits corrupt
+// or wrong-hash data. Total is the plaintext byte count seen so far. This makes
+// integrity a property of the stream, with no whole-object buffering.
 type VerifyReader struct {
 	r     io.Reader
 	h     hash.Hash
@@ -61,7 +61,11 @@ func (v *VerifyReader) Read(p []byte) (int, error) {
 		_, _ = v.h.Write(p[:n])
 		v.Total += int64(n)
 	}
-	if errors.Is(err, io.EOF) {
+	// Verify at ANY end-of-stream, not just a clean io.EOF: a truncated source (a
+	// mid-stream connection drop with a known Content-Length) surfaces as
+	// io.ErrUnexpectedEOF, which must fail the hash — otherwise the short bytes are
+	// committed as a "verified" backup and only fail at DR-restore.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		if got := hexSum(v.h); got != v.want {
 			return n, fmt.Errorf("integrity: stream hash %s != %s", got, v.want)
 		}

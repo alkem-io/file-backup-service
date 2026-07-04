@@ -67,28 +67,24 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // done-gate); a flaky target leaves the object not-done for retry while never
 // blocking the healthy targets.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
-	var pending []Target
-	if e.Attempts == 0 && e.Deliveries == 0 {
-		// First delivery (the dominant continuous-backup case): the object has never
-		// been processed, so no target can be stored yet — skip the guaranteed-empty
-		// dedup read (one ledger round-trip per object).
-		pending = p.Targets
-	} else {
-		stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
-		if err != nil {
-			return false, fmt.Errorf("ledger read: %w", err)
+	// Dedup is per content-hash, NOT per outbox row: a fresh row (attempts=0) can
+	// reference an already-stored externalID (duplicate content, or a backfill/
+	// reconcile re-enqueue), so the StoredTargets read must run unconditionally —
+	// skipping it on a "fresh" row would re-PUT duplicates to every target incl. WORM.
+	stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
+	if err != nil {
+		return false, fmt.Errorf("ledger read: %w", err)
+	}
+	pending := make([]Target, 0, len(p.Targets))
+	for _, t := range p.Targets {
+		if stored[t.Sink.Name()] {
+			p.Metrics.ObjectDedup(t.Sink.Name())
+			continue
 		}
-		pending = make([]Target, 0, len(p.Targets))
-		for _, t := range p.Targets {
-			if stored[t.Sink.Name()] {
-				p.Metrics.ObjectDedup(t.Sink.Name())
-				continue
-			}
-			pending = append(pending, t)
-		}
-		if len(pending) == 0 {
-			return true, nil // every target already has it
-		}
+		pending = append(pending, t)
+	}
+	if len(pending) == 0 {
+		return true, nil // every target already has it
 	}
 
 	results, verified, ferr := p.fanOut(ctx, e, pending)
@@ -125,8 +121,12 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		statuses[i] = TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored}
 	}
 	// Object row + all statuses in one atomic write (FK parent first, inside the CTE).
+	// SizeVerified gates the size UPDATE so an all-fail retry (unverified e.Size, which
+	// is 0 when the outbox breadcrumb is unpopulated) can't downgrade an earlier
+	// verified size.
 	if err := p.Ledger.RecordBackup(bctx, ObjectMeta{
-		ExternalID: e.ExternalID, Size: objSize, CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
+		ExternalID: e.ExternalID, Size: objSize, SizeVerified: verified >= 0,
+		CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
 	}, statuses); err != nil {
 		return false, fmt.Errorf("ledger record: %w", err)
 	}
@@ -286,7 +286,7 @@ func fanoutCopy(fw *fanoutWriter, vr io.Reader) error {
 		case rerr == nil:
 			continue // buffer filled — read the next chunk
 		case errors.Is(rerr, io.EOF), errors.Is(rerr, io.ErrUnexpectedEOF):
-			return nil // clean end of stream (vr verified the hash at EOF)
+			return nil // end of stream — vr verified the hash (at EOF or a truncated ErrUnexpectedEOF)
 		default:
 			return rerr // integrity mismatch / ctx cancel / read error
 		}

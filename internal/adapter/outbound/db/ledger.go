@@ -30,9 +30,11 @@ func NewLedgerRepo(p *Pool) *LedgerRepo { return &LedgerRepo{p: p, q: queries.Ne
 const recordBackupSQL = `WITH obj AS (
   INSERT INTO file_backup_object ("externalID", size, "createdBy", "sourceCreatedDate")
   VALUES ($1, $2, $3, $4)
-  -- DO UPDATE (not DO NOTHING): a first all-targets-fail attempt writes the
-  -- unverified outbox size; a later success must correct it to the verified size.
-  ON CONFLICT ("externalID") DO UPDATE SET size = EXCLUDED.size
+  -- Correct the size to a later VERIFIED value ($8), but never downgrade a verified
+  -- size to unverified outbox hearsay (an all-fail retry): a first all-targets-fail
+  -- attempt writes the unverified outbox size, a later success overwrites it.
+  ON CONFLICT ("externalID") DO UPDATE
+    SET size = CASE WHEN $8 THEN EXCLUDED.size ELSE file_backup_object.size END
 )
 INSERT INTO file_backup_target_status ("externalID", target, state, "storedBytes", "verifiedAt")
 SELECT $1, t.target, t.state, t.bytes, CASE WHEN t.state = 'stored' THEN now() ELSE NULL END
@@ -55,7 +57,7 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	}
 	if _, err := r.p.Exec(ctx, recordBackupSQL,
 		obj.ExternalID, obj.Size, uuidOrNull(obj.CreatedBy), timestamptzOrNull(obj.SourceCreatedDate),
-		targets, states, storedBytes); err != nil {
+		targets, states, storedBytes, obj.SizeVerified); err != nil {
 		return fmt.Errorf("record backup: %w", err)
 	}
 	return nil

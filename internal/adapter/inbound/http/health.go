@@ -21,47 +21,19 @@ type HealthResponse struct {
 	Details map[string]string `json:"details"`
 }
 
-// HealthHandler reports readiness by probing the outbox and ledger. The verdict is
-// cached for a short TTL so a K8s probe scraping every few seconds does not drive a
-// DB round-trip per request, and the two probes run concurrently so a slow DB can't
-// stack their timeouts past the probe budget.
+// HealthHandler reports readiness by probing the outbox and ledger concurrently on
+// every request. There is no cache: a K8s probe scrapes every ~10s and each probe is
+// a single LIMIT-1 round-trip, so the verdict is always current and a slow/cancelled
+// scrape can't leave a stale unhealthy verdict behind.
 type HealthHandler struct {
 	Outbox Prober
 	Ledger Prober
-	TTL    time.Duration // cache window; <=0 uses defaultHealthTTL
-
-	mu   sync.Mutex
-	at   time.Time
-	body HealthResponse
-	code int
 }
 
-const (
-	probeTimeout     = 2 * time.Second
-	defaultHealthTTL = 5 * time.Second
-)
+const probeTimeout = 2 * time.Second
 
 // ServeHTTP implements the readiness probe.
 func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	ttl := h.TTL
-	if ttl <= 0 {
-		ttl = defaultHealthTTL
-	}
-	h.mu.Lock()
-	fresh := !h.at.IsZero() && time.Since(h.at) < ttl
-	body, code := h.body, h.code
-	h.mu.Unlock()
-
-	if !fresh {
-		body, code = h.probe(req.Context())
-		h.mu.Lock()
-		h.at, h.body, h.code = time.Now(), body, code
-		h.mu.Unlock()
-	}
-	writeJSON(w, code, body)
-}
-
-func (h *HealthHandler) probe(parent context.Context) (HealthResponse, int) {
 	checks := []struct {
 		name string
 		p    Prober
@@ -77,7 +49,9 @@ func (h *HealthHandler) probe(parent context.Context) (HealthResponse, int) {
 				details[i] = "not configured"
 				return
 			}
-			ctx, cancel := context.WithTimeout(parent, probeTimeout)
+			// Detached from the request context: a kubelet timeoutSeconds shorter than
+			// probeTimeout must not cancel the probe and report a healthy DB as unusable.
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), probeTimeout)
 			defer cancel()
 			if err := p.Probe(ctx); err != nil {
 				details[i] = "unusable"
@@ -96,5 +70,5 @@ func (h *HealthHandler) probe(parent context.Context) (HealthResponse, int) {
 			out.Status, code = "unhealthy", http.StatusServiceUnavailable
 		}
 	}
-	return out, code
+	writeJSON(w, code, out)
 }

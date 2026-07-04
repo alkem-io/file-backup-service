@@ -288,6 +288,12 @@ func (c *Config) Validate() error {
 	if c.MetricsPort < 1 || c.MetricsPort > 65535 {
 		return fmt.Errorf("metricsPort (%d) out of range 1-65535", c.MetricsPort)
 	}
+	if c.MaxAttempts < 1 || c.MaxAttempts > 1000 {
+		return fmt.Errorf("maxAttempts (%d) out of range 1-1000", c.MaxAttempts)
+	}
+	if c.MaxDeliveries < 1 || c.MaxDeliveries > 1000 {
+		return fmt.Errorf("maxDeliveries (%d) out of range 1-1000", c.MaxDeliveries)
+	}
 	seen := make(map[string]bool, len(c.Targets))
 	for i, t := range c.Targets {
 		if err := validateTarget(i, t, seen); err != nil {

@@ -42,8 +42,8 @@ var zstdEncoderPool = sync.Pool{
 func ZstdReader(src io.Reader) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
-		enc := zstdEncoderPool.Get().(*zstd.Encoder)
-		// A panic in the encoder must fail THIS target, not crash the worker — a
+		// Register the panic guard BEFORE acquiring the encoder, so even a panic in
+		// the pool's constructor fails THIS target rather than crashing the worker — a
 		// recover only catches its own goroutine, and every other sink-facing
 		// goroutine is guarded the same way. A panicked encoder is in an unknown
 		// state, so it is dropped (GC'd), never returned to the pool.
@@ -52,6 +52,7 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 				pw.CloseWithError(panicErr("zstd encode", r))
 			}
 		}()
+		enc := zstdEncoderPool.Get().(*zstd.Encoder)
 		enc.Reset(pw)
 		_, err := io.Copy(enc, src)
 		if cerr := enc.Close(); err == nil {

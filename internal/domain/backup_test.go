@@ -32,9 +32,13 @@ func newFakeLedger() *fakeLedger {
 
 func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []TargetStatus) error {
 	// The real CTE writes the object (FK parent) before the statuses atomically;
-	// the fake records both together.
+	// the fake records both together. Mirror the size no-downgrade rule: a first
+	// insert sets it, a later write only overwrites when the size is verified.
+	_, existed := f.objects[m.ExternalID]
 	f.objects[m.ExternalID] = true
-	f.sizes[m.ExternalID] = m.Size
+	if !existed || m.SizeVerified {
+		f.sizes[m.ExternalID] = m.Size
+	}
 	for _, s := range statuses {
 		f.states[m.ExternalID+"/"+s.Target] = s.State
 		f.statuses++
@@ -89,6 +93,49 @@ func TestPipelineBackupOne(t *testing.T) {
 	}
 	if !led.objects[h] || led.statuses != 1 {
 		t.Fatalf("ledger not updated: %+v", led)
+	}
+}
+
+// truncatedReader yields all of data, then io.ErrUnexpectedEOF instead of io.EOF —
+// exactly what net/http returns when a response body is shorter than its
+// Content-Length (a mid-stream connection drop).
+type truncatedReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *truncatedReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+func (r *truncatedReader) Close() error { return nil }
+
+type truncatedSource struct{ served []byte }
+
+func (s truncatedSource) FetchContent(context.Context, string) (io.ReadCloser, error) {
+	return &truncatedReader{data: s.served}, nil
+}
+
+// TestPipelineTruncatedSourceNotCommitted: a source that ends in io.ErrUnexpectedEOF
+// (short read) must fail the hash gate, not be silently committed as a verified backup.
+func TestPipelineTruncatedSourceNotCommitted(t *testing.T) {
+	full := bytes.Repeat([]byte("truncate me "), 500)
+	h, err := Sum(bytes.NewReader(full))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSink{name: "t", store: map[string][]byte{}}
+	p := NewPipeline(truncatedSource{full[:3000]}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
+	ok, err := p.BackupOne(context.Background(), OutboxEntry{FileID: "f", ExternalID: h})
+	if err == nil || ok {
+		t.Fatal("a truncated source (io.ErrUnexpectedEOF) must fail, not be recorded as a verified backup")
+	}
+	if len(sink.store) != 0 {
+		t.Fatal("truncated bytes must not be committed to the sink")
 	}
 }
 
