@@ -5,9 +5,9 @@
 package s3
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -69,9 +69,10 @@ func (s *Sink) key(hash string) string {
 func (s *Sink) putOpts() minio.PutObjectOptions {
 	// Bound the streaming (size=-1) multipart buffer. For an unknown length minio-go
 	// defaults to a ~528 MiB part (5 TiB / 10000 parts) and does make([]byte, part)
-	// PER upload — which OOMs the co-located RWO node at concurrency. 16 MiB caps the
-	// buffer 33x while still allowing 160 GiB objects (16 MiB x 10000 parts).
-	opts := minio.PutObjectOptions{PartSize: 16 << 20}
+	// PER upload — which OOMs the co-located RWO node at concurrency. 5 MiB is the S3
+	// multipart minimum: live heap = concurrency x #targets x 5 MiB, and it still
+	// supports ~48 GiB objects (5 MiB x 10000 parts), far above this file corpus.
+	opts := minio.PutObjectOptions{PartSize: 5 << 20}
 	if s.sse != nil {
 		opts.ServerSideEncryption = s.sse
 	}
@@ -127,19 +128,22 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 // size is always -1 (streamed) so minio reads to EOF and the commit is gated on the
 // upstream VerifyReader hash check. But a 0-byte object then completes a multipart
 // with an empty part, which Scaleway (and many S3 backends) reject (EntityTooSmall);
-// detect empty via a 1-byte peek and use a single empty PutObject instead.
+// detect empty with a single-byte read (no per-object bufio buffer) and use one empty
+// PutObject instead, re-prepending the read byte via MultiReader for the normal path.
 func (s *Sink) Store(ctx context.Context, hash string, r io.Reader, _ int64) (int64, error) {
-	br := bufio.NewReader(r)
-	if _, err := br.Peek(1); err != nil {
-		if err == io.EOF { // empty object (already hash-verified upstream)
-			if _, perr := s.client.PutObject(ctx, s.bucket, s.key(hash), bytes.NewReader(nil), 0, s.putOpts()); perr != nil {
-				return 0, fmt.Errorf("put (empty): %w", perr)
-			}
-			return 0, nil
+	var one [1]byte
+	n, err := io.ReadFull(r, one[:]) // 1-byte buf: (1,nil) if a byte, (0,io.EOF) if empty
+	if errors.Is(err, io.EOF) {      // empty object (already hash-verified upstream)
+		if _, perr := s.client.PutObject(ctx, s.bucket, s.key(hash), bytes.NewReader(nil), 0, s.putOpts()); perr != nil {
+			return 0, fmt.Errorf("put (empty): %w", perr)
 		}
+		return 0, nil
+	}
+	if err != nil {
 		return 0, fmt.Errorf("read: %w", err)
 	}
-	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), br, -1, s.putOpts())
+	body := io.MultiReader(bytes.NewReader(one[:n]), r)
+	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), body, -1, s.putOpts())
 	if err != nil {
 		return 0, fmt.Errorf("put: %w", err)
 	}
