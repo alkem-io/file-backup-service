@@ -229,9 +229,9 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 		if err != nil {
 			return nil, err
 		}
-		codec := domain.CodecNone
-		if t.Compression == string(domain.CodecZstd) {
-			codec = domain.CodecZstd
+		codec, err := domain.ParseCodec(t.Compression) // same owner as config validation
+		if err != nil {
+			return nil, fmt.Errorf("target %q: %w", t.Name, err)
 		}
 		targets = append(targets, domain.Target{Sink: sink, Codec: codec})
 	}

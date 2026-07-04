@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 const envPrefix = "FBS_"
@@ -79,6 +81,10 @@ func (d DBConfig) validate(name string) error {
 		return fmt.Errorf("%s.user is required", name)
 	case d.DBName == "":
 		return fmt.Errorf("%s.dbName is required", name)
+	case d.Port < 1 || d.Port > 65535:
+		// applyDefaults only fills Port==0; catch a negative/out-of-range here with a
+		// clear message instead of an opaque pgx parse error on the composed DSN.
+		return fmt.Errorf("%s.port (%d) out of range 1-65535", name, d.Port)
 	}
 	return nil
 }
@@ -276,8 +282,35 @@ func (c *Config) Validate() error {
 	if len(c.Targets) == 0 {
 		return errors.New("at least one target is required")
 	}
+	if err := c.validateLimits(); err != nil {
+		return err
+	}
+	seen := make(map[string]string, len(c.Targets))
+	for i, t := range c.Targets {
+		if err := validateTarget(i, t, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateLimits range-checks the numeric knobs (kept out of Validate for clarity +
+// cyclomatic budget).
+func (c *Config) validateLimits() error {
 	if c.Concurrency > 1024 { // keep pool sizing (int32(Concurrency)+8) sane and non-wrapping
 		return fmt.Errorf("concurrency (%d) is unreasonably high (max 1024)", c.Concurrency)
+	}
+	// Cap the second-valued knobs well below the int64-nanosecond overflow point, so
+	// sec*time.Second can't wrap to a negative Duration (which would panic
+	// time.NewTicker or fire an instant timeout). One week is far above any sane value.
+	const maxSec = 7 * 24 * 60 * 60
+	for _, f := range []struct {
+		name string
+		sec  int
+	}{{"perObjectTimeoutSec", c.PerObjectTimeoutSec}, {"staleTTLSec", c.StaleTTLSec}, {"pollEverySec", c.PollEverySec}} {
+		if f.sec > maxSec {
+			return fmt.Errorf("%s (%d) exceeds the max %d", f.name, f.sec, maxSec)
+		}
 	}
 	if c.StaleTTLSec <= c.PerObjectTimeoutSec {
 		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec (%d), else a running object is reaped",
@@ -292,29 +325,30 @@ func (c *Config) Validate() error {
 	if c.MaxDeliveries < 1 || c.MaxDeliveries > 1000 {
 		return fmt.Errorf("maxDeliveries (%d) out of range 1-1000", c.MaxDeliveries)
 	}
-	seen := make(map[string]bool, len(c.Targets))
-	for i, t := range c.Targets {
-		if err := validateTarget(i, t, seen); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 // ValidateTarget checks a single target in isolation — used by the restore/verify
 // CLI, which don't run full serve validation.
 func ValidateTarget(t Target) error {
-	return validateTarget(0, t, map[string]bool{})
+	return validateTarget(0, t, map[string]string{})
 }
 
-func validateTarget(i int, t Target, seen map[string]bool) error {
+func validateTarget(i int, t Target, seen map[string]string) error {
 	if t.Name == "" {
 		return fmt.Errorf("target[%d]: name is required", i)
 	}
-	if seen[t.Name] {
-		return fmt.Errorf("duplicate target name %q", t.Name)
+	// Dedup on the env-var token, not just the raw name: two distinct names that
+	// collapse to the same FBS_TARGET_<TOKEN>_* prefix (e.g. "s3-eu" / "s3_eu") would
+	// silently share injected secrets/bucket, so reject the collision.
+	tok := envToken(t.Name)
+	if prev, ok := seen[tok]; ok {
+		if prev == t.Name {
+			return fmt.Errorf("duplicate target name %q", t.Name)
+		}
+		return fmt.Errorf("targets %q and %q collide on env-var namespace FBS_TARGET_%s_*", prev, t.Name, tok)
 	}
-	seen[t.Name] = true
+	seen[tok] = t.Name
 	switch t.Type {
 	case "filesystem":
 		if t.Path == "" {
@@ -333,10 +367,8 @@ func validateTarget(i int, t Target, seen map[string]bool) error {
 	default:
 		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
 	}
-	switch t.Compression {
-	case "", "none", "zstd":
-		return nil
-	default:
-		return fmt.Errorf("target %q: unknown compression %q (want none|zstd)", t.Name, t.Compression)
+	if _, err := domain.ParseCodec(t.Compression); err != nil {
+		return fmt.Errorf("target %q: %w", t.Name, err)
 	}
+	return nil
 }

@@ -113,17 +113,46 @@ func TestLoadEnvOnlyNoFile(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsInsecureS3(t *testing.T) {
-	c := &Config{
+// validConfig is a fully-valid serve config with the given targets — so a test can
+// isolate the ONE field it wants Validate to reject.
+func validConfig(targets ...Target) *Config {
+	return &Config{
 		FileServiceBase:     "http://fs",
-		AlkemioDB:           DBConfig{Host: "h", User: "u", DBName: "a"},
-		LedgerDB:            DBConfig{Host: "h", User: "u", DBName: "l"},
+		AlkemioDB:           DBConfig{Host: "h", Port: 5432, User: "u", DBName: "a"},
+		LedgerDB:            DBConfig{Host: "h", Port: 5432, User: "u", DBName: "l"},
 		PerObjectTimeoutSec: 1800,
 		StaleTTLSec:         3600,
+		PollEverySec:        10,
 		MetricsPort:         4004,
-		Targets:             []Target{{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r"}}, // no useSSL/sse
+		MaxAttempts:         10,
+		MaxDeliveries:       50,
+		Targets:             targets,
 	}
+}
+
+func TestValidateRejectsInsecureS3(t *testing.T) {
+	c := validConfig(Target{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r"}) // no useSSL/sse
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected the s3 TLS+SSE requirement to reject this config")
+	}
+}
+
+func TestValidateRejectsEnvTokenCollision(t *testing.T) {
+	// Distinct names that collapse to the same FBS_TARGET_<TOKEN>_* prefix must be
+	// rejected, else they'd silently share injected secrets.
+	c := validConfig(
+		Target{Name: "s3-eu", Type: "filesystem", Path: "/a"},
+		Target{Name: "s3_eu", Type: "filesystem", Path: "/b"},
+	)
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected two targets colliding on the env-var token to be rejected")
+	}
+}
+
+func TestValidateRejectsBadDBPort(t *testing.T) {
+	c := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
+	c.AlkemioDB.Port = -5432
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected a negative DB port to be rejected at Validate, not deferred to DSN parse")
 	}
 }

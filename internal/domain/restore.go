@@ -15,12 +15,13 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
-// maxRestoreBytes caps a decoded zstd object so a corrupt/tampered frame (a
-// decompression bomb from a compromised target) cannot OOM the restore/verify
-// tooling. It MUST exceed the S3 backup ceiling (5 MiB PartSize x 10000 parts ≈
-// 48 GiB) so a large-but-legit object stored zstd stays restorable — otherwise a
-// 16–48 GiB object would back up but fail restore (overCap -> raw fallback hashes
-// the compressed frame -> mismatch). 64 GiB clears that ceiling and still bounds a bomb.
+// maxRestoreBytes is the maximum decoded PLAINTEXT size the restore/verify path
+// accepts, on BOTH the raw and zstd paths. It bounds a corrupt/tampered stream (a
+// decompression bomb, or an oversized raw blob from a compromised target) so it can't
+// fill the DR host disk before the hash check fails. It is the effective supported
+// object size: an object whose plaintext exceeds it is unrestorable even if it backed
+// up (a zstd target can compress a >64 GiB plaintext under the ~48 GiB S3 part
+// ceiling), so raise it deliberately if the corpus ever needs larger objects.
 const maxRestoreBytes int64 = 64 << 30 // 64 GiB
 
 // zstdMagic is the zstd frame magic (RFC 8878). A stored object is zstd iff it
@@ -45,10 +46,15 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	dest := filepath.Join(destDir, hash)
 	if _, err := os.Stat(dest); err == nil {
 		if f, oerr := os.Open(dest); oerr == nil { //nolint:gosec // primary-store path
-			ok, _ := Verify(hash, f)
+			// Bounded + ctx-cancellable: a large stale/corrupt file must not read
+			// unboundedly nor swallow the operator's SIGINT/SIGTERM.
+			overCap, verr := copyVerify(io.Discard, ctxReader{ctx, f}, hash, maxRestoreBytes)
 			_ = f.Close()
-			if ok {
+			if verr == nil && !overCap {
 				return nil // already present and intact
+			}
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 		}
 		// present but corrupt/mismatched — overwrite with the good backup copy.
@@ -118,6 +124,20 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 // it caps the copy and returns overCap=true past it (decompression-bomb protection
 // on the zstd path); limit <= 0 is uncapped (the RAW path — the stored bytes ARE the
 // object, no amplification, so a legitimately-large object must not be rejected).
+// ctxReader makes a Read loop cancellable: it returns ctx.Err() before each Read so a
+// long local-file read (the pre-existing-intact check) honors SIGINT/SIGTERM.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
 func copyVerify(dst io.Writer, src io.Reader, want string, limit int64) (overCap bool, err error) {
 	h := newHash()
 	rdr := src
@@ -137,14 +157,17 @@ func copyVerify(dst io.Writer, src io.Reader, want string, limit int64) (overCap
 	return false, nil
 }
 
-// decodeRaw copies r straight to dst and verifies it equals hash. Uncapped: the raw
-// stored bytes are the object itself, so backup (which streams any size) and restore
-// agree — a 17 GiB object backs up and restores, not rejected as "corrupt".
+// decodeRaw copies r straight to dst and verifies it equals hash, bounded by
+// maxRestoreBytes — so a corrupt/tampered target that returns an oversized stream for
+// a CodecNone object can't fill the restore disk before the hash check fails (the
+// plaintext cap applies to the raw path too, not only zstd).
 func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
-	_, err := copyVerify(dst, r, hash, 0)
+	overCap, err := copyVerify(dst, r, hash, maxRestoreBytes)
 	switch {
 	case err != nil && !errors.Is(err, errHashMismatch):
 		return fmt.Errorf("read: %w", err)
+	case overCap:
+		return fmt.Errorf("integrity: stored bytes for %s exceed the %d-byte restore cap", hash, maxRestoreBytes)
 	case errors.Is(err, errHashMismatch):
 		return fmt.Errorf("integrity: stored bytes for %s are neither valid zstd nor the plaintext", hash)
 	}

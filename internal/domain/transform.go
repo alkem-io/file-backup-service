@@ -20,6 +20,20 @@ const (
 	CodecZstd Codec = "zstd"
 )
 
+// ParseCodec is the single owner of the compression vocabulary: config validation
+// and the sink builder both route through it, so a codec name can never validate in
+// one place and silently map to CodecNone in another.
+func ParseCodec(s string) (Codec, error) {
+	switch s {
+	case "", string(CodecNone):
+		return CodecNone, nil
+	case string(CodecZstd):
+		return CodecZstd, nil
+	default:
+		return "", fmt.Errorf("unknown compression %q (want none|zstd)", s)
+	}
+}
+
 // zstdEncoderPool reuses single-goroutine zstd encoders across objects — each
 // NewWriter eagerly allocates GOMAXPROCS block encoders (~1.25 MiB of hash tables
 // each), so a fresh one per object per zstd target churns tens of MiB and GC.
