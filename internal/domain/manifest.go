@@ -58,10 +58,9 @@ func WriteManifests(ctx context.Context, led Ledger, targets []Target, name stri
 }
 
 func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) error {
-	pr, pw := io.Pipe()
-	go func() {
-		enc := json.NewEncoder(pw) // JSONL: Encode appends a newline per record
-		err := eachStoredObject(ctx, led, sink.Name(), func(m ObjectMeta) error {
+	rc := pipeThrough("manifest encode", func(w io.Writer) error {
+		enc := json.NewEncoder(w) // JSONL: Encode appends a newline per record
+		return eachStoredObject(ctx, led, sink.Name(), func(m ObjectMeta) error {
 			var created *time.Time // nil (omitted) for a null/zero source date, not a bogus year-1
 			if !m.SourceCreatedDate.IsZero() {
 				created = &m.SourceCreatedDate
@@ -72,12 +71,11 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 			}
 			return enc.Encode(manifestLine{m.ExternalID, m.Size, createdBy, created})
 		})
-		_ = pw.CloseWithError(err)
-	}()
-	err := sink.PutManifest(ctx, name, pr)
+	})
+	err := sink.PutManifest(ctx, name, rc)
 	// Unblock the encoder goroutine if PutManifest returned before draining the pipe
-	// (an upload error / timeout) — otherwise it parks forever on pw.Write.
-	_ = pr.CloseWithError(err)
+	// (an upload error / timeout) — otherwise it parks forever on the pipe write.
+	_ = rc.Close()
 	return err
 }
 

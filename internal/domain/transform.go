@@ -62,32 +62,40 @@ var zstdEncoderPool = sync.Pool{
 // VerifyReader integrity failure) propagate to the reader so a downstream Sink
 // never commits bad data.
 func ZstdReader(src io.Reader) io.ReadCloser {
-	pr, pw := io.Pipe()
-	go func() {
-		// Register the panic guard BEFORE acquiring the encoder, so even a panic in
-		// the pool's constructor fails THIS target rather than crashing the worker — a
-		// recover only catches its own goroutine, and every other sink-facing
-		// goroutine is guarded the same way. A panicked encoder is in an unknown
-		// state, so it is dropped (GC'd), never returned to the pool.
-		defer func() {
-			if r := recover(); r != nil {
-				pw.CloseWithError(PanicErr("zstd encode", r))
-			}
-		}()
+	// pipeThrough's recover wraps the whole closure — incl. the pool Get — so even a panic
+	// in the pool constructor fails THIS target, not the worker. A panicked encoder never
+	// reaches the Put below, so it's dropped (GC'd), and one that errored on Close ended in
+	// an unknown state, so it's dropped too; only a cleanly-closed encoder is returned.
+	return pipeThrough("zstd encode", func(w io.Writer) error {
 		enc := zstdEncoderPool.Get().(*zstd.Encoder)
-		enc.Reset(pw)
+		enc.Reset(w)
 		_, err := io.Copy(enc, src)
 		closeErr := enc.Close()
 		if err == nil {
 			err = closeErr
 		}
-		// Only a cleanly-closed encoder goes back to the pool; one that errored on
-		// Close ended in an unknown state, so drop it (GC'd) like the panic path does.
 		if closeErr == nil {
 			enc.Reset(nil) // drop the pipe reference before returning to the pool
 			zstdEncoderPool.Put(enc)
 		}
-		pw.CloseWithError(err)
+		return err
+	})
+}
+
+// pipeThrough runs produce on a background goroutine writing into the returned reader's
+// pipe, then closes the pipe with produce's error (or a recovered panic named by who), so
+// a reader always sees the terminal error — the one owner of the "producer goroutine →
+// io.Pipe → CloseWithError" scaffold (a missed CloseWithError leaks the goroutine forever
+// on a parked pw.Write). Shared by the zstd encoder and the manifest writer.
+func pipeThrough(who string, produce func(w io.Writer) error) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				pw.CloseWithError(PanicErr(who, r))
+			}
+		}()
+		pw.CloseWithError(produce(pw))
 	}()
 	return pr
 }
