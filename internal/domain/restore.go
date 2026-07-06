@@ -13,13 +13,15 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
-// MaxObjectBytes is the maximum plaintext object size the service supports END TO END:
-// the restore/verify decode cap AND the object size every sink must admit. It is ONE
-// policy so a sink's own ceiling can't silently fall below the restore cap — e.g. the S3
-// sink sizes its multipart parts from this so the 10,000-part limit doesn't reject an
-// object that a filesystem target accepted (which would perpetually retry + dead-letter).
-// Raise it deliberately if the corpus ever needs larger objects.
-const MaxObjectBytes int64 = 64 << 30 // 64 GiB
+// MaxObjectBytes bounds the decoded PLAINTEXT the restore/verify path accepts — a
+// decompression-bomb / oversized-blob guard. It is sized to REALITY: file-service's
+// file.size is INTEGER (int32, ~2 GiB max), so no object larger than ~2 GiB can exist;
+// 4 GiB is 2x that with headroom. Keeping the cap near the real max is what makes the
+// bomb bound tight (a bomb can't inflate 32x past any legit object) AND keeps the S3
+// sink's flat 5 MiB part size within the 10,000-part ceiling (4 GiB / 5 MiB ≈ 820 parts,
+// far under 10,000 — so no per-object part-size arithmetic is needed). If the file
+// schema ever widens past int32, raise this AND revisit the S3 part size together.
+const MaxObjectBytes int64 = 4 << 30 // 4 GiB
 
 // maxRestoreBytes bounds the decoded PLAINTEXT on BOTH the raw and zstd restore paths
 // (bomb / oversized-blob protection). It is MaxObjectBytes as a var only so tests can
@@ -184,7 +186,11 @@ func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
 // is what keeps a raw-stored object that is ITSELF a valid zstd bomb restorable from
 // its small raw bytes. Only when BOTH interpretations fail is it genuinely corrupt.
 func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
-	zr, err := newZstdDecoder(io.LimitReader(r, maxRestoreBytes+1))
+	// Bomb protection is the DECODED-output cap (copyVerify below); do NOT also cap the
+	// COMPRESSED input — an incompressible near-cap object stores as raw zstd blocks
+	// slightly LARGER than its plaintext, and an input cap would truncate its frame and
+	// make it (falsely) unrestorable.
+	zr, err := newZstdDecoder(r)
 	if err != nil {
 		return errTryRaw
 	}

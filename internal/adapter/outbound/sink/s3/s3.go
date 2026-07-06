@@ -17,12 +17,8 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 
-	"github.com/alkem-io/file-backup-service/internal/domain"
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
-
-// s3MaxParts is S3's hard limit on multipart parts per object.
-const s3MaxParts = 10000
 
 // Config configures an S3 sink.
 type Config struct {
@@ -57,29 +53,16 @@ func New(cfg Config) (*Sink, error) {
 		return nil, fmt.Errorf("s3 client %q: %w", cfg.Name, err)
 	}
 	// Bound the streaming (size=-1) multipart buffer once. For an unknown length
-	// minio-go defaults to a ~528 MiB part (5 TiB / 10000 parts) and does
-	// make([]byte, part) PER upload — which OOMs the co-located RWO node at concurrency.
-	// Size it from domain.MaxObjectBytes so 10,000 parts admit any supported object (else
-	// a 48–64 GiB object stores to a filesystem target but is rejected by S3, silently
-	// dead-lettering on the symmetric done-gate). Rounded up to a MiB, floored at the
-	// 5 MiB S3 minimum: live heap = concurrency x #targets x PartSize.
-	opts := minio.PutObjectOptions{PartSize: s3PartSize()}
+	// minio-go defaults to a ~528 MiB part (5 TiB / 10000 parts) and does make([]byte,
+	// part) PER upload — which OOMs the co-located RWO node at concurrency. 5 MiB is the
+	// S3 multipart minimum: live heap = concurrency x #targets x 5 MiB, and 5 MiB x 10,000
+	// parts = ~48 GiB, comfortably above the ~2 GiB real max object size (domain.MaxObjectBytes
+	// = 4 GiB). If MaxObjectBytes is ever raised past ~48 GiB, revisit this together.
+	opts := minio.PutObjectOptions{PartSize: 5 << 20}
 	if cfg.SSE {
 		opts.ServerSideEncryption = encrypt.NewSSE()
 	}
 	return &Sink{name: cfg.Name, client: client, bucket: cfg.Bucket, prefix: cfg.Prefix, opts: opts}, nil
-}
-
-// s3PartSize is the smallest multipart part size (rounded to a MiB, floored at the S3
-// 5 MiB minimum) whose 10,000-part ceiling still admits a domain.MaxObjectBytes object.
-func s3PartSize() uint64 {
-	const mib = 1 << 20
-	per := (uint64(domain.MaxObjectBytes) + s3MaxParts - 1) / s3MaxParts // ceil bytes/part
-	per = ((per + mib - 1) / mib) * mib                                  // round up to a MiB
-	if per < 5*mib {
-		per = 5 * mib
-	}
-	return per
 }
 
 // Name returns the target name.
