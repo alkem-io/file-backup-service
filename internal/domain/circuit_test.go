@@ -96,6 +96,32 @@ func TestCircuitBreaker(t *testing.T) {
 	}
 }
 
+// TestCircuitBreakerFlakyTarget: a flaky-but-mostly-down target (fail 4 / succeed 1)
+// never has `threshold` CONSECUTIVE failures, yet must still trip on the failure RATE —
+// the old consecutive-count breaker let it evade isolation and dead-letter the corpus.
+func TestCircuitBreakerFlakyTarget(t *testing.T) {
+	cb := NewCircuitBreaker(5, time.Minute) // window = 10
+	// Feed the flaky pattern one outcome at a time, stopping once it trips — modelling the
+	// pipeline skipping a down target (pendingTargets). The success every 5th outcome resets
+	// a CONSECUTIVE counter, so the old breaker would never trip; the windowed one does.
+	flaky := []bool{false, false, false, false, true}
+	for i := 0; i < 30 && !cb.Down("t"); i++ {
+		cb.Record("t", flaky[i%len(flaky)])
+	}
+	if !cb.Down("t") {
+		t.Fatal("a flaky-mostly-down target (80% failure) must trip on the failure rate, not evade isolation")
+	}
+	// A genuinely healthy target (occasional single blip) must NOT trip.
+	cb2 := NewCircuitBreaker(5, time.Minute)
+	for i := 0; i < 40; i++ {
+		ok := i%20 != 0 // one blip every 20
+		cb2.Record("h", ok)
+	}
+	if cb2.Down("h") {
+		t.Fatal("a healthy target with rare blips must not trip")
+	}
+}
+
 // TestBackupOneDefersOnDownTarget: when a target's circuit is open (down), an object that
 // stored on every reachable target is DEFERRED (no genuine failure), not Failed — so a
 // single-target outage doesn't march the corpus to dead-letter (T017a).

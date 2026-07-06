@@ -78,16 +78,18 @@ func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
 	return r.transition(ctx, id, "mark done", `status='done'`)
 }
 
-// Defer re-queues a claim WITHOUT counting an attempt, invisible for a short backoff —
-// used when an object stored on every REACHABLE target and its only gap is a
-// circuit-open (persistently-down) target (T017a). A single-target outage must not march
-// the object's shared attempts toward dead-letter; the object re-checks after the
-// backoff, cheaply re-deferring (a dedup read + circuit check, no fan-out) while the
-// target stays down, and completes once it recovers. Guarded by status='in_progress'
-// (a lost claim is a no-op).
+// Defer re-queues a claim WITHOUT counting an attempt when an object stored on every
+// REACHABLE target and its only gap is a circuit-open (persistently-down) target (T017a).
+// The re-check is a LAZY, JITTERED backstop (2–4 min), not the primary recovery: the
+// object is already safely backed up on every reachable target, and RECONCILE is the real
+// gap-fill when the target returns (the ledger records the stored targets, so TargetGaps
+// sees the gap). The jitter desynchronizes what would otherwise be a synchronized
+// re-claim/UPDATE herd on the SHARED production outbox every interval during a multi-hour
+// outage. Guarded by status='in_progress' (a lost claim is a no-op).
 func (r *OutboxRepo) Defer(ctx context.Context, id int64) error {
 	return r.transition(ctx, id, "defer",
-		`status='pending', "claimedAt"=NULL, "visibleAt"=now() + interval '30 seconds'`)
+		`status='pending', "claimedAt"=NULL,
+		 "visibleAt"=now() + interval '2 minutes' + random() * interval '2 minutes'`)
 }
 
 // Fail increments attempts and re-queues the entry, or dead-letters it once the
