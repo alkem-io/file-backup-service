@@ -21,10 +21,12 @@ var ErrSourceGone = errors.New("source object no longer exists")
 type Sink interface {
 	// Name returns the configured target name.
 	Name() string
-	// Store writes bytes for hash if absent (idempotent, atomic), applying the
-	// target's configured transform. Returns bytes actually stored. It reads r to EOF
-	// (no length is passed): the commit is gated on the upstream VerifyReader hash
-	// check, so a sink must never finalize on a known length before EOF.
+	// Store ALWAYS writes r to EOF (idempotent by content hash; the codec is applied
+	// upstream by fanOut, not here) and returns bytes stored. Dedup is the caller's job
+	// via the ledger — a Store MUST NOT short-circuit on Exists, because reading r to EOF
+	// is load-bearing: the commit is gated on the upstream VerifyReader hash check (no
+	// length is passed), so a sink that skipped the read would stall the fan-out barrier
+	// and break the verify-then-commit invariant.
 	Store(ctx context.Context, hash string, r io.Reader) (int64, error)
 	// Exists reports whether the object is already present.
 	Exists(ctx context.Context, hash string) (bool, error)

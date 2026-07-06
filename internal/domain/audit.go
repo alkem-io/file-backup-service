@@ -51,11 +51,16 @@ func (r AuditReport) Missing() int {
 // A target whose Exists always errors (a PutObject-only WORM credential) is reported
 // Unverifiable rather than clean — Exists is definitionally blind under that credential,
 // so audit gives no coverage there and the caller must not mistake it for a pass.
-func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int) (AuditReport, error) {
+//
+// startAfter seeds the keyset cursor. For a SAMPLED audit the caller passes a RANDOM
+// externalID so repeated runs sample a different band each time — otherwise a fixed ""
+// start would re-check the same lowest-externalID prefix every run, a permanent blind
+// spot for every object past the first N. A full audit (samplePerTarget<=0) passes "".
+func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int, startAfter string) (AuditReport, error) {
 	rep := AuditReport{Targets: make([]TargetAudit, 0, len(targets))}
 	for _, t := range targets {
 		ta := TargetAudit{Target: t.Sink.Name(), Worm: t.Worm}
-		after := ""
+		after := startAfter
 		for {
 			// A cancelled audit (SIGINT / a cron timeout) MUST surface the error, not
 			// return a partial report as a clean pass — an incomplete integrity check that

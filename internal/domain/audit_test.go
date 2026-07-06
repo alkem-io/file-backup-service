@@ -18,7 +18,7 @@ func TestAuditDetectsMissing(t *testing.T) {
 	a.store["hashA"] = []byte("x") // A really has it
 	b := newMemSink("b")           // B: ledger says stored, but the sink is empty → missing
 
-	rep, err := Audit(ctx, led, []Target{{Sink: a}, {Sink: b}}, 0)
+	rep, err := Audit(ctx, led, []Target{{Sink: a}, {Sink: b}}, 0, "")
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 
 	// A target NOT marked Worm whose Exists always errors is UNEXPECTEDLY unverifiable
 	// (a broken read path — an alert). The SAME sink marked Worm is expected (not an alert).
-	repBad, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "t"}}}}, 0)
+	repBad, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "t"}}}}, 0, "")
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 		t.Fatalf("non-worm all-errored target must be UnexpectedlyUnverifiable: %+v", repBad.Targets[0])
 	}
 
-	repWorm, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}, Worm: true}}, 0)
+	repWorm, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}, Worm: true}}, 0, "")
 	if err != nil {
 		t.Fatalf("audit worm: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestAuditCancelledPropagates(t *testing.T) {
 		[]TargetStatus{{Target: "a", State: StateStored}})
 	a := newMemSink("a")
 	a.store["hashA"] = []byte("x")
-	if _, err := Audit(ctx, led, []Target{{Sink: a}}, 0); err == nil {
+	if _, err := Audit(ctx, led, []Target{{Sink: a}}, 0, ""); err == nil {
 		t.Fatal("a cancelled audit must return an error, not a clean (partial) report")
 	}
 }

@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -359,6 +361,16 @@ func runBackfill(args []string) error {
 	return err
 }
 
+// randHex returns a random externalID-shaped hex string — a rotating keyset start so a
+// sampled audit checks a different band each run instead of the same fixed prefix.
+func randHex() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "" // fall back to the start; a failed rand never blocks the audit
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // runAudit verifies the ledger against reality (FR-014/T030): for a sample per target,
 // confirm the target actually still holds what the ledger records as stored. A nonzero
 // 'missing' count means silent loss on a target — a nonzero exit so cron/CI can alert.
@@ -374,7 +386,11 @@ func runAudit(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	rep, err := domain.Audit(ctx, ledger, targets, *sample)
+	startAfter := "" // a full audit starts at the beginning
+	if *sample > 0 {
+		startAfter = randHex() // a sampled audit rotates its band each run (no fixed blind spot)
+	}
+	rep, err := domain.Audit(ctx, ledger, targets, *sample, startAfter)
 	var unexpected []string
 	for _, t := range rep.Targets {
 		status := ""

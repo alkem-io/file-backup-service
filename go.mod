@@ -2,11 +2,6 @@ module github.com/alkem-io/file-backup-service
 
 go 1.26
 
-// Scaffold deps: chi (HTTP), zap (logging), pgx (ledger/outbox). Remaining deps
-// (aws-sdk-go-v2/minio-go, klauspost/compress zstd, golang-migrate, prometheus)
-// land with the implementation tasks in
-// specs/008-continuous-file-backup/tasks/file-backup-service.md.
-
 require (
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/golang-migrate/migrate/v4 v4.19.1
