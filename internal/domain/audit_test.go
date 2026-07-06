@@ -53,6 +53,21 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	}
 }
 
+// TestAuditCancelledPropagates: a cancelled audit must return an error, not a partial
+// report as a clean pass (an incomplete integrity check that exits 0 reads as verified).
+func TestAuditCancelledPropagates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	led := newFakeLedger()
+	_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: "hashA"},
+		[]TargetStatus{{Target: "a", State: StateStored}})
+	a := newMemSink("a")
+	a.store["hashA"] = []byte("x")
+	if _, err := Audit(ctx, led, []Target{{Sink: a}}, 0); err == nil {
+		t.Fatal("a cancelled audit must return an error, not a clean (partial) report")
+	}
+}
+
 // existsErrSink models a PutObject-only WORM credential: Exists always errors (403).
 type existsErrSink struct{ stubSink }
 

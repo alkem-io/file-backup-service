@@ -51,7 +51,13 @@ func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget in
 	for _, t := range targets {
 		ta := TargetAudit{Target: t.Sink.Name()}
 		after := ""
-		for ctx.Err() == nil {
+		for {
+			// A cancelled audit (SIGINT / a cron timeout) MUST surface the error, not
+			// return a partial report as a clean pass — an incomplete integrity check that
+			// exits 0 is read as "verified" by a monitoring cron.
+			if err := ctx.Err(); err != nil {
+				return rep, err
+			}
 			limit := storedPageSize
 			if samplePerTarget > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
 				remaining := samplePerTarget - ta.Checked
@@ -69,7 +75,14 @@ func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget in
 			if len(page) == 0 {
 				break
 			}
-			for _, e := range existsPage(ctx, t.Sink, page) {
+			results := existsPage(ctx, t.Sink, page)
+			// If cancellation landed mid-page, the in-flight Exists calls returned
+			// ctx.Canceled — don't count those tainted errors (they'd falsely trip
+			// Unverifiable); surface the cancellation instead.
+			if err := ctx.Err(); err != nil {
+				return rep, err
+			}
+			for _, e := range results {
 				ta.Checked++
 				switch {
 				case e.err != nil:

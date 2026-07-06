@@ -52,10 +52,10 @@ func main() {
 			err = nil
 		}
 	case "audit":
+		// NOT swallowing context.Canceled (unlike serve/reconcile/backfill): an
+		// interrupted audit is an INCOMPLETE integrity check and must exit nonzero, so a
+		// cron doesn't read an aborted verification as passed.
 		err = runAudit(args)
-		if errors.Is(err, context.Canceled) {
-			err = nil
-		}
 	case "backfill":
 		err = runBackfill(args)
 		if errors.Is(err, context.Canceled) {

@@ -95,6 +95,39 @@ func TestReconcileSurvivesCodecFlip(t *testing.T) {
 	}
 }
 
+// TestReconcileRawZstdLookalike: a raw-stored object whose bytes are a VALID zstd frame
+// (a .zst upload on a CodecNone target) must still reconcile — the decode falls back to
+// raw (like restore) instead of force-decoding as zstd and failing on every source
+// forever. Guards the magic-arbiter regression.
+func TestReconcileRawZstdLookalike(t *testing.T) {
+	ctx := context.Background()
+	plaintext := bytes.Repeat([]byte("z"), 200)
+	frame, err := io.ReadAll(ZstdReader(bytes.NewReader(plaintext))) // a real zstd frame
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := Sum(bytes.NewReader(frame)) // stored RAW: the FRAME bytes are the object
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newMemSink("a")
+	a.store[h] = frame
+	b := newMemSink("b")
+
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(frame))},
+		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
+
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}})
+	st, err := rec.Run(ctx, 0)
+	if err != nil || st.Repaired != 1 {
+		t.Fatalf("reconcile raw-zstd-lookalike: stats=%+v err=%v", st, err)
+	}
+	if !bytes.Equal(b.store[h], frame) {
+		t.Fatal("B should hold the raw frame bytes (the object)")
+	}
+}
+
 // TestReconcileZstdSource: repair works when the source target stored the object zstd —
 // it's decoded to plaintext, re-verified, and re-fanned out.
 func TestReconcileZstdSource(t *testing.T) {

@@ -141,6 +141,9 @@ func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn fun
 // target" predicate — TargetGaps streams the gap objects, CoverageGaps counts them; a
 // change to one's stored-on-target rule must change the other (see coverage integration test).
 func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int, error) {
+	if len(allTargets) == 0 {
+		return 0, nil // no targets configured → nothing can be under-replicated (matches TargetGaps)
+	}
 	const q = `SELECT
 	  (SELECT count(*) FROM file_backup_object)
 	  - (SELECT count(*) FROM (

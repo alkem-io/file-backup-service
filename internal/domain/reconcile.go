@@ -1,13 +1,10 @@
 package domain
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
-
-	"github.com/klauspost/compress/zstd"
+	"os"
 )
 
 // Reconciler repairs under-replicated objects (FR-025/T029): for each object not
@@ -104,60 +101,54 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 	st.Failed++ // every source failed to fetch
 }
 
-// decodingSource adapts a backup target into a pipeline Source: it Fetches the stored
-// bytes and yields the PLAINTEXT for the pipeline to re-verify against externalID and
-// re-fan-out. It arbitrates the codec from the STORED BYTES (zstd-magic peek), NOT the
-// target's configured codec — so flipping a target's compression config doesn't make
-// its already-stored objects unreconcilable (the recovery path must survive a config
-// change the same way restore does). BOTH branches bound the yielded plaintext at
-// maxRestoreBytes+1 (a compromised/oversized source can't fill the recovery host disk),
-// and a wrong decode (a rare raw-object-that-looks-like-zstd) is caught by the
-// pipeline's VerifyReader (hash mismatch → nothing committed → repair rotates source).
+// decodingSource adapts a backup target into a pipeline Source: it decodes the stored
+// object to a temp file using the SAME codec-agnostic decode as restore (decodeStream:
+// zstd-magic arbiter + RAW FALLBACK + maxRestoreBytes cap + ctx-cancellable), then serves
+// that as the plaintext for the pipeline to re-verify + re-fan-out. Reusing decodeStream
+// (rather than a streaming magic-peek) is what makes reconcile recover EXACTLY what
+// restore can: it survives a target's compression config being flipped (decode by bytes,
+// not config) AND a raw-stored object that merely begins with the zstd magic (a .zst
+// upload on a CodecNone target) — the latter needs the re-read-as-raw fallback, which a
+// one-pass stream can't do. The temp file is bounded + verified against externalID and
+// removed on Close.
 type decodingSource struct {
 	src Sink
 }
 
-// FetchContent implements Source: fetch the stored bytes and yield the (bounded) plaintext.
+// FetchContent implements Source: decode the stored object to a temp file and serve it.
 func (d decodingSource) FetchContent(ctx context.Context, externalID string) (io.ReadCloser, error) {
-	rc, err := d.src.Fetch(ctx, externalID)
+	tmp, err := os.CreateTemp("", "reconcile-*.plain")
 	if err != nil {
+		return nil, fmt.Errorf("reconcile temp: %w", err)
+	}
+	reset := func() error { // rewind the temp for decodeStream's raw fallback
+		if _, e := tmp.Seek(0, io.SeekStart); e != nil {
+			return e
+		}
+		return tmp.Truncate(0)
+	}
+	if err := decodeStream(ctx, d.src, externalID, tmp, reset); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 		return nil, err
 	}
-	br := bufio.NewReaderSize(rc, 8<<10)
-	magic, _ := br.Peek(4) // short object → short magic, simply won't match
-	if !bytes.Equal(magic, zstdMagic) {
-		return &boundedReadCloser{r: io.LimitReader(br, maxRestoreBytes+1), under: rc}, nil // stored raw == plaintext
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, fmt.Errorf("reconcile temp rewind: %w", err)
 	}
-	zr, err := newZstdDecoder(br)
-	if err != nil {
-		_ = rc.Close()
-		return nil, fmt.Errorf("zstd decode: %w", err)
-	}
-	return &zstdReadCloser{r: io.LimitReader(zr, maxRestoreBytes+1), zr: zr, under: rc}, nil
+	return &tempReadCloser{f: tmp}, nil
 }
 
-// boundedReadCloser yields a bounded reader and closes the underlying stored-object reader.
-type boundedReadCloser struct {
-	r     io.Reader
-	under io.Closer
-}
+// tempReadCloser serves the decoded plaintext temp file and removes it on Close.
+type tempReadCloser struct{ f *os.File }
 
-// Read yields the bounded stream.
-func (b *boundedReadCloser) Read(p []byte) (int, error) { return b.r.Read(p) }
+// Read yields the decoded plaintext.
+func (t *tempReadCloser) Read(p []byte) (int, error) { return t.f.Read(p) }
 
-// Close releases the underlying stored-object reader.
-func (b *boundedReadCloser) Close() error { return b.under.Close() }
-
-type zstdReadCloser struct {
-	r     io.Reader // decoded stream, bomb-capped
-	zr    *zstd.Decoder
-	under io.Closer
-}
-
-func (z *zstdReadCloser) Read(p []byte) (int, error) { return z.r.Read(p) }
-
-// Close releases the decoder and the underlying stored-object reader.
-func (z *zstdReadCloser) Close() error {
-	z.zr.Close()
-	return z.under.Close()
+// Close closes and removes the temp file.
+func (t *tempReadCloser) Close() error {
+	err := t.f.Close()
+	_ = os.Remove(t.f.Name())
+	return err
 }
