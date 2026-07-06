@@ -432,12 +432,14 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 
 // everyTick runs fn immediately and then every interval until ctx is cancelled. Each
 // fn call gets a timeout-bounded child ctx (derived from ctx, so shutdown aborts it)
-// so a slow pass can't wedge shutdown. The shared skeleton for the background samplers.
-func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(context.Context)) {
+// so a slow pass can't wedge shutdown. onPanic is invoked with the recovered value if fn
+// panics, so the pass stays OBSERVABLE (sample-error counter / log) instead of the panic
+// being swallowed silently. The shared skeleton for the background samplers.
+func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(context.Context), onPanic func(recovered any)) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		runTick(ctx, timeout, fn)
+		runTick(ctx, timeout, fn, onPanic)
 		select {
 		case <-ctx.Done():
 			return
@@ -447,13 +449,19 @@ func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(con
 }
 
 // runTick runs one bounded tick with a recover, so a pgx/driver panic in a sampler or the
-// manifest loop degrades that one pass (the caller's sample-error counter) instead of
-// crashing the serve process — these background goroutines are on the other side of a
-// boundary no request/pipeline recover reaches.
-func runTick(ctx context.Context, timeout time.Duration, fn func(context.Context)) {
+// manifest loop degrades that one pass instead of crashing the serve process — these
+// background goroutines are on the other side of a boundary no request/pipeline recover
+// reaches. A panic unwinds fn BEFORE its own error branch runs (where SampleError lives),
+// so the recover routes the panic to onPanic to still fire the sample-error / log — else a
+// sampler that panics every tick would freeze its gauge stale-green with zero signal.
+func runTick(ctx context.Context, timeout time.Duration, fn func(context.Context), onPanic func(recovered any)) {
 	fctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	defer func() { _ = recover() }() // the pass is best-effort; a panic must not take down serve
+	defer func() {
+		if r := recover(); r != nil && onPanic != nil {
+			onPanic(r)
+		}
+	}()
 	fn(fctx)
 }
 
@@ -481,7 +489,7 @@ func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo
 		if failed {
 			mx.SampleError()
 		}
-	})
+	}, func(any) { mx.SampleError() }) // a panicking pass is a failed sample, not a silent freeze
 }
 
 // sampleCoverage refreshes the under-replication gauge on a coarse cadence (the count
@@ -495,7 +503,7 @@ func sampleCoverage(ctx context.Context, ledger *db.LedgerRepo, targets []domain
 		} else {
 			mx.SampleError()
 		}
-	})
+	}, func(any) { mx.SampleError() }) // a panicking pass is a failed sample, not a silent freeze
 }
 
 // manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),
@@ -506,7 +514,7 @@ func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.T
 		if err := domain.WriteManifests(fctx, ledger, targets, domain.ManifestName(time.Now())); err != nil && ctx.Err() == nil {
 			logger.Warn("manifest snapshot", zap.Error(err))
 		}
-	})
+	}, func(r any) { logger.Warn("manifest snapshot panicked", zap.Any("panic", r)) })
 }
 
 type startCheck struct {

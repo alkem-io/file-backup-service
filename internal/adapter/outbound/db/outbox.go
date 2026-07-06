@@ -79,8 +79,13 @@ func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
 // re-claim/UPDATE herd on the SHARED production outbox every interval during a multi-hour
 // outage. Guarded by status='in_progress' (a lost claim is a no-op).
 func (r *OutboxRepo) Defer(ctx context.Context, id int64) error {
+	// attempts=0: a deferred object stored on EVERY reachable target is NOT in a failure
+	// state — its only gap is a down target — so any prior genuine-failure count is reset.
+	// This also makes a deferred row uniquely (attempts=0 AND visibleAt IS NOT NULL), which
+	// is what lets BacklogStats exclude ALL deferred rows (not just first-attempt ones) from
+	// the RPO gauge — otherwise a failed-then-deferred object would re-spike oldest-age.
 	return r.transition(ctx, id, "defer",
-		`status='pending', "claimedAt"=NULL,
+		`status='pending', "claimedAt"=NULL, attempts=0,
 		 "visibleAt"=now() + interval '2 minutes' + random() * interval '2 minutes'`)
 }
 
@@ -145,11 +150,14 @@ func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSe
 	// Count only rows that represent REAL un-backed-up work, so the RPO gauge doesn't fire a
 	// false backup-lag page during a single-target outage. Excludes:
 	//   - not-yet-visible rows (visibleAt in the future) — matches Claim's visibility.
-	//   - DEFERRED objects (T017a) — these ARE backed up on every reachable target; they're
-	//     uniquely identified by attempts=0 AND visibleAt IS NOT NULL (Fail bumps attempts;
-	//     a fresh row has visibleAt NULL). They cycle through visibility every backoff, so a
-	//     plain visibleAt filter isn't enough — their old createdDate would still dominate
-	//     min() in the brief visible window and spike oldest-age to hours.
+	//   - DEFERRED objects (T017a) — these ARE backed up on every reachable target; Defer
+	//     resets attempts=0 (a deferred object is not in a failure state), so they're
+	//     uniquely (attempts=0 AND visibleAt IS NOT NULL) — a fresh row has visibleAt NULL,
+	//     a genuinely-retrying failure has attempts>0. This holds even for a failed-THEN-
+	//     deferred object: the reset erases its earlier genuine-failure count. Deferred rows
+	//     cycle through visibility every backoff, so a plain visibleAt filter isn't enough —
+	//     their old createdDate would dominate min() in the visible window and spike oldest-
+	//     age to hours.
 	// A row counts iff: fresh (visibleAt NULL) OR a genuinely-retrying failure that is due
 	// (visibleAt <= now() AND attempts > 0).
 	const q = `SELECT count(*),
