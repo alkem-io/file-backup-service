@@ -145,7 +145,7 @@ func serve(cfgPath string) error {
 	fsClient := fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil)
 	// Fail loudly if any dependency is unusable at startup (bounded so a hung dial
 	// fails fast instead of hanging), rather than a silent no-op with /health green.
-	if err := startupChecks(ctx, fsClient, outbox, ledger, targets); err != nil {
+	if err := startupChecks(ctx, logger, fsClient, outbox, ledger, targets); err != nil {
 		return err
 	}
 
@@ -394,35 +394,20 @@ func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.T
 	})
 }
 
-// startupChecks fails serve loudly if any dependency is unusable: the outbox (scoped
-// role reads the schema + holds the UPDATE grant), the ledger (schema/migrate), and
-// every target sink (creds/bucket/path). Bounded by a deadline so a hung dial fails
-// fast. All checks run CONCURRENTLY (they hit independent pools/endpoints), each with a
-// recover so a driver panic in one is reported, not a crash.
-func startupChecks(ctx context.Context, fs *fileservice.Client, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+type startCheck struct {
+	name string
+	fn   func(context.Context) error
+}
 
-	type check struct {
-		name string
-		fn   func(context.Context) error
-	}
-	checks := make([]check, 0, 4+len(targets))
-	checks = append(checks,
-		check{"file-service unreachable", fs.Preflight},
-		check{"outbox not accessible (scoped role / schema?)", outbox.Probe},
-		check{"outbox not writable", outbox.CheckWriteGrant},
-		check{"ledger not accessible (schema / migrate?)", ledger.Probe},
-	)
-	for _, t := range targets {
-		checks = append(checks, check{"target " + t.Sink.Name() + " preflight", t.Sink.Preflight})
-	}
-
+// runChecks runs every check CONCURRENTLY (independent pools/endpoints), each with a
+// recover so a driver panic becomes an error, not a crash. Returns per-check errors
+// (nil = ok) in order.
+func runChecks(ctx context.Context, checks []startCheck) []error {
 	errs := make([]error, len(checks))
 	var wg sync.WaitGroup
 	for i, c := range checks {
 		wg.Add(1)
-		go func(i int, c check) {
+		go func(i int, c startCheck) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
@@ -435,7 +420,47 @@ func startupChecks(ctx context.Context, fs *fileservice.Client, outbox *db.Outbo
 		}(i, c)
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	return errs
+}
+
+// startupChecks validates dependencies at startup, bounded by a deadline so a hung dial
+// fails fast. REQUIRED infrastructure (file-service, outbox, ledger) is fatal on any
+// failure — the worker can do nothing without them. TARGETS follow the runtime's
+// per-target isolation: a target that fails preflight is logged LOUD and left degraded
+// (its objects stay not-done, retried, surfaced by the coverage gauge + failure
+// counter), NOT fatal; serve fails only if NO target is usable (nothing could be backed
+// up). This matches FR-012 rather than turning one target's blip into a fleet CrashLoop.
+func startupChecks(ctx context.Context, logger *zap.Logger, fs *fileservice.Client, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if err := errors.Join(runChecks(ctx, []startCheck{
+		{"file-service unreachable", fs.Preflight},
+		{"outbox not accessible (scoped role / schema?)", outbox.Probe},
+		{"outbox not writable", outbox.CheckWriteGrant},
+		{"ledger not accessible (schema / migrate?)", ledger.Probe},
+	})...); err != nil {
+		return err
+	}
+
+	tChecks := make([]startCheck, len(targets))
+	for i, t := range targets {
+		tChecks[i] = startCheck{"target " + t.Sink.Name(), t.Sink.Preflight}
+	}
+	errs := runChecks(ctx, tChecks)
+	usable := 0
+	for i, err := range errs {
+		if err == nil {
+			usable++
+			continue
+		}
+		logger.Error("target preflight failed — starting DEGRADED; backups to it will retry until it recovers",
+			zap.String("target", targets[i].Sink.Name()), zap.Error(err))
+	}
+	if usable == 0 {
+		return fmt.Errorf("no target is usable at startup: %w", errors.Join(errs...))
+	}
+	return nil
 }
 
 func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
