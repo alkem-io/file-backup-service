@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
@@ -55,18 +56,15 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	if err != nil {
 		return nil, fmt.Errorf("files page: %w", err)
 	}
-	defer rows.Close()
-	out := make([]domain.OutboxEntry, 0, limit)
-	for rows.Next() {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.OutboxEntry, error) {
 		var e domain.OutboxEntry
 		var createdDate pgtype.Timestamptz
-		if err := rows.Scan(&e.FileID, &e.ExternalID, &e.CreatedBy, &createdDate, &e.Size); err != nil {
-			return nil, fmt.Errorf("scan file: %w", err)
+		if err := row.Scan(&e.FileID, &e.ExternalID, &e.CreatedBy, &createdDate, &e.Size); err != nil {
+			return e, err
 		}
 		e.CreatedDate = nullTime(createdDate)
-		out = append(out, e)
-	}
-	return out, rows.Err()
+		return e, nil
+	})
 }
 
 // Probe verifies the `file` table is readable via the scoped role AND has every column

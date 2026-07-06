@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db/queries"
@@ -83,18 +84,17 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 	if err != nil {
 		return nil, fmt.Errorf("stored objects page: %w", err)
 	}
-	defer rows.Close()
-	out := make([]domain.ObjectMeta, 0, limit)
-	for rows.Next() {
+	// pgx.CollectRows owns Close + rows.Err() (a hand-rolled loop could drop the Err check
+	// and read a truncated result as complete).
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.ObjectMeta, error) {
 		var m domain.ObjectMeta
 		var created pgtype.Timestamptz
-		if err := rows.Scan(&m.ExternalID, &m.Size, &m.CreatedBy, &created); err != nil {
-			return nil, fmt.Errorf("scan object: %w", err)
+		if err := row.Scan(&m.ExternalID, &m.Size, &m.CreatedBy, &created); err != nil {
+			return m, err
 		}
 		m.SourceCreatedDate = nullTime(created)
-		out = append(out, m)
-	}
-	return out, rows.Err()
+		return m, nil
+	})
 }
 
 // TargetGaps invokes fn for every object NOT stored on every configured target, with the
@@ -142,21 +142,18 @@ func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, af
 	if err != nil {
 		return nil, fmt.Errorf("target gaps page: %w", err)
 	}
-	defer rows.Close()
-	out := make([]targetGap, 0, limit)
-	for rows.Next() {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (targetGap, error) {
 		var g targetGap
 		var storedList []string
-		if err := rows.Scan(&g.externalID, &storedList); err != nil {
-			return nil, fmt.Errorf("scan gap: %w", err)
+		if err := row.Scan(&g.externalID, &storedList); err != nil {
+			return g, err
 		}
 		g.stored = make(map[string]bool, len(storedList))
 		for _, t := range storedList {
 			g.stored[t] = true
 		}
-		out = append(out, g)
-	}
-	return out, rows.Err()
+		return g, nil
+	})
 }
 
 // CoverageGaps counts objects NOT stored on every configured target — the coverage

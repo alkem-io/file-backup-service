@@ -47,19 +47,11 @@ func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, er
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}
-	defer rows.Close()
-	var out []domain.OutboxEntry
-	for rows.Next() {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.OutboxEntry, error) {
 		var e domain.OutboxEntry
-		if err := rows.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Size, &e.CreatedBy, &e.CreatedDate); err != nil {
-			return nil, fmt.Errorf("scan outbox row: %w", err)
-		}
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate outbox rows: %w", err)
-	}
-	return out, nil
+		err := row.Scan(&e.ID, &e.FileID, &e.ExternalID, &e.Size, &e.CreatedBy, &e.CreatedDate)
+		return e, err
+	})
 }
 
 // transition applies setClause to the claimed row, guarded by status='in_progress'
