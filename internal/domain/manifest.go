@@ -72,9 +72,13 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 			return enc.Encode(manifestLine{m.ExternalID, m.Size, createdBy, created})
 		})
 	})
-	err := sink.PutManifest(ctx, name, rc)
-	// Unblock the encoder goroutine if PutManifest returned before draining the pipe
-	// (an upload error / timeout) — otherwise it parks forever on the pipe write.
+	// callWithCtx so a filesystem PutManifest blocked in an uninterruptible io.Copy on a
+	// WEDGED MOUNT is abandoned on ctx cancel — otherwise the manifest goroutine (and thus
+	// serve's deferred bgWG.Wait at shutdown) hangs forever and the pod is SIGKILLed. The
+	// backup path guards every sink write the same way (storeWithCtx).
+	err := callWithCtx(ctx, func() error { return sink.PutManifest(ctx, name, rc) })
+	// Unblock the encoder goroutine if PutManifest returned/was abandoned before draining
+	// the pipe — otherwise it parks forever on the pipe write.
 	_ = rc.Close()
 	return err
 }
