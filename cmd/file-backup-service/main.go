@@ -282,7 +282,7 @@ func runReconcile(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	st, err := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
+	st, err := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout(), cfg.ScratchDir).Run(ctx, *ratePerSec)
 	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d\n", st.Repaired, st.Skipped, st.Failed)
 	return err
 }
@@ -370,17 +370,29 @@ func runAudit(args []string) error {
 	}
 	defer pool.Close()
 	rep, err := domain.Audit(ctx, ledger, targets, *sample)
+	var unexpected []string
 	for _, t := range rep.Targets {
 		status := ""
-		if t.Unverifiable() {
-			status = "  [UNVERIFIABLE — every Exists denied (WORM credential?); no coverage here]"
+		switch {
+		case t.UnexpectedlyUnverifiable():
+			status = "  [UNVERIFIABLE — every Exists denied but target is NOT worm: read credential/endpoint broken?]"
+			unexpected = append(unexpected, t.Target)
+		case t.Unverifiable():
+			status = "  [unverifiable — worm target, read-denying by design; no coverage expected]"
 		}
 		fmt.Printf("audit %s: checked=%d missing=%d errors=%d%s\n", t.Target, t.Checked, t.Missing, t.Errors, status)
 	}
-	if err == nil && rep.Missing() > 0 {
-		err = fmt.Errorf("%d ledger-stored objects are missing from their target", rep.Missing())
+	// Exit nonzero on silent loss OR a normally-readable target that couldn't be verified
+	// (a broken read path) — an expected-worm Unverifiable target is fine (exit 0).
+	switch {
+	case err != nil:
+		return err
+	case rep.Missing() > 0:
+		return fmt.Errorf("%d ledger-stored objects are missing from their target", rep.Missing())
+	case len(unexpected) > 0:
+		return fmt.Errorf("targets unverifiable (read path broken, not worm): %v", unexpected)
 	}
-	return err
+	return nil
 }
 
 // sinkFor loads config, validates the target set, and builds the named target's sink.
@@ -560,7 +572,7 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 		if err != nil {
 			return nil, fmt.Errorf("target %q: %w", t.Name, err)
 		}
-		targets = append(targets, domain.Target{Sink: sink, Codec: codec})
+		targets = append(targets, domain.Target{Sink: sink, Codec: codec, Worm: t.Worm})
 	}
 	return targets, nil
 }

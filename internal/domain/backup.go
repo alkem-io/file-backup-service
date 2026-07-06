@@ -49,6 +49,9 @@ type Target struct {
 	Sink Sink
 	// Codec is the per-target transform (none | zstd).
 	Codec Codec
+	// Worm marks a write-once, read-denying target (PutObject-only creds): audit expects
+	// its Exists to always error, so an all-errored Worm target is not an alert.
+	Worm bool
 }
 
 // Pipeline backs up one object to all configured targets and updates the ledger.

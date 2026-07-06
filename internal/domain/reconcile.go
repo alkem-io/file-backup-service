@@ -20,16 +20,18 @@ type Reconciler struct {
 	targets    []Target
 	byName     map[string]Target
 	perObjectT time.Duration // bounds one object's repair (a hung source/sink), like serve
+	scratchDir string        // where decodingSource stages a decoded object ("" = OS temp dir)
 }
 
 // NewReconciler binds a Reconciler to the ledger and target set; perObjectTimeout bounds
-// one object's repair so a hung fetch/sink can't stall the whole single-threaded pass.
-func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration) *Reconciler {
+// one object's repair so a hung fetch/sink can't stall the whole single-threaded pass,
+// and scratchDir ("" = OS temp) is where a decoded object is staged before re-fan-out.
+func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration, scratchDir string) *Reconciler {
 	byName := make(map[string]Target, len(targets))
 	for _, t := range targets {
 		byName[t.Sink.Name()] = t
 	}
-	return &Reconciler{ledger: led, targets: targets, byName: byName, perObjectT: perObjectTimeout}
+	return &Reconciler{ledger: led, targets: targets, byName: byName, perObjectT: perObjectTimeout, scratchDir: scratchDir}
 }
 
 // ReconcileStats reports one reconcile pass.
@@ -76,7 +78,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 			continue // stale status for a removed target
 		}
 		tried = true
-		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink}, entry)
+		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry)
 		if err == nil {
 			// The source fetched + verified cleanly. Either fully repaired (done), or a
 			// DESTINATION target failed (!done) — and rotating to another source can't fix
@@ -114,7 +116,8 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 // one-pass stream can't do. The temp file is bounded + verified against externalID and
 // removed on Close.
 type decodingSource struct {
-	src Sink
+	src        Sink
+	scratchDir string // "" = OS temp dir
 }
 
 // FetchContent implements Source: decode the stored object to a temp file and serve it.
@@ -122,7 +125,7 @@ type decodingSource struct {
 // e.FileID, so reconcile no longer fakes a FileID.
 func (d decodingSource) FetchContent(ctx context.Context, e OutboxEntry) (io.ReadCloser, error) {
 	externalID := e.ExternalID
-	tmp, err := os.CreateTemp("", "reconcile-*.plain")
+	tmp, err := os.CreateTemp(d.scratchDir, "reconcile-*.plain") // "" = OS temp dir
 	if err != nil {
 		return nil, fmt.Errorf("reconcile temp: %w", err)
 	}

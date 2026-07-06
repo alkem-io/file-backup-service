@@ -47,6 +47,10 @@ type Target struct {
 	UseSSL      bool   `yaml:"useSSL,omitempty"`
 	SSE         bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
 	Insecure    bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
+	// Worm marks a write-once target whose credential can't read (PutObject-only, e.g. the
+	// immutable off-site copy): audit EXPECTS its Exists to always deny, so it isn't an
+	// alert — whereas a normally-readable target that suddenly can't be verified IS.
+	Worm bool `yaml:"worm,omitempty"`
 }
 
 // DBConfig is a Postgres connection built from parts (so deployments can reuse
@@ -112,6 +116,10 @@ type Config struct {
 	MaxAttempts         int      `yaml:"maxAttempts"`      // genuine-failure dead-letter threshold (FR-029)
 	MaxDeliveries       int      `yaml:"maxDeliveries"`    // crash-loop dead-letter threshold (FR-029)
 	ManifestEverySec    int      `yaml:"manifestEverySec"` // ledger-snapshot cadence to each target (FR-015)
+	// ScratchDir is where reconcile stages a decoded object before re-fanning it out.
+	// Empty = the OS temp dir; point it at a SIZED volume (not a small memory-backed
+	// emptyDir/tmpfs) so a large-object repair on the recovery host can't fill /tmp.
+	ScratchDir string `yaml:"scratchDir"`
 }
 
 // PerObjectTimeout is the per-object backup deadline.
@@ -165,6 +173,7 @@ func (c *Config) applyEnv() error {
 		}
 	}
 	setStr(&c.FileServiceBase, envPrefix+"FILESERVICEBASE")
+	setStr(&c.ScratchDir, envPrefix+"SCRATCHDIR")
 	add(setInt(&c.Concurrency, envPrefix+"CONCURRENCY"))
 	add(setInt(&c.MetricsPort, envPrefix+"METRICSPORT"))
 	add(setInt(&c.PerObjectTimeoutSec, envPrefix+"PEROBJECTTIMEOUTSEC"))

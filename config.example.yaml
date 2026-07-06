@@ -30,6 +30,7 @@ concurrency: 8            # FBS_CONCURRENCY
 perObjectTimeoutSec: 1800 # per-object backup deadline (FBS_PEROBJECTTIMEOUTSEC)
 staleTTLSec: 3600         # must exceed perObjectTimeoutSec (FBS_STALETTLSEC)
 metricsPort: 4004         # FBS_METRICSPORT
+# scratchDir: /scratch    # reconcile stages a decoded object here (FBS_SCRATCHDIR); "" = OS temp. Point at a SIZED volume.
 
 # Symmetric targets — every object goes to every target; "done" requires all.
 # Secrets injected per target by name: FBS_TARGET_<NAME>_ACCESSKEY / _SECRETKEY
@@ -43,6 +44,7 @@ targets:
     useSSL: true                     # required for s3 (TLS)
     sse: true                        # required for s3 (encryption at rest)
     # compression: zstd              # optional per-target
+    # worm: true                     # PutObject-only immutable target: audit expects Exists to deny
   - name: local2
     type: filesystem
     path: /backup

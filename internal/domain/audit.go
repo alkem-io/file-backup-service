@@ -12,15 +12,21 @@ const auditConcurrency = 16
 // TargetAudit is one target's audit outcome.
 type TargetAudit struct {
 	Target  string
-	Checked int // objects checked (up to the sample)
-	Missing int // ledger records stored, but Exists says absent — silent loss
-	Errors  int // Exists could not determine presence (e.g. a PutObject-only WORM credential)
+	Worm    bool // unverifiability is EXPECTED (a read-denying PutObject-only credential)
+	Checked int  // objects checked (up to the sample)
+	Missing int  // ledger records stored, but Exists says absent — silent loss
+	Errors  int  // Exists could not determine presence (e.g. a PutObject-only WORM credential)
 }
 
 // Unverifiable reports whether the audit gave NO real coverage for this target: every
 // check errored (and at least one ran) — the definitional WORM case, where Exists always
 // 403s. Missing==0 then means "couldn't look", NOT "clean", so it must not read as coverage.
 func (t TargetAudit) Unverifiable() bool { return t.Checked > 0 && t.Errors == t.Checked }
+
+// UnexpectedlyUnverifiable is an Unverifiable target that was NOT declared Worm — a
+// normally-readable target whose read path broke (expired credential, moved endpoint).
+// This must fail the audit; an expected-Worm Unverifiable target must not.
+func (t TargetAudit) UnexpectedlyUnverifiable() bool { return t.Unverifiable() && !t.Worm }
 
 // AuditReport is the per-target audit result.
 type AuditReport struct {
@@ -48,7 +54,7 @@ func (r AuditReport) Missing() int {
 func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int) (AuditReport, error) {
 	rep := AuditReport{Targets: make([]TargetAudit, 0, len(targets))}
 	for _, t := range targets {
-		ta := TargetAudit{Target: t.Sink.Name()}
+		ta := TargetAudit{Target: t.Sink.Name(), Worm: t.Worm}
 		after := ""
 		for {
 			// A cancelled audit (SIGINT / a cron timeout) MUST surface the error, not

@@ -42,14 +42,24 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	ctx := context.Background()
 	led := newFakeLedger()
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "hashA"},
-		[]TargetStatus{{Target: "worm", State: StateStored}})
+		[]TargetStatus{{Target: "t", State: StateStored}, {Target: "worm", State: StateStored}})
 
-	rep, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}}}, 0)
+	// A target NOT marked Worm whose Exists always errors is UNEXPECTEDLY unverifiable
+	// (a broken read path — an alert). The SAME sink marked Worm is expected (not an alert).
+	repBad, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "t"}}}}, 0)
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
-	if len(rep.Targets) != 1 || !rep.Targets[0].Unverifiable() || rep.Missing() != 0 {
-		t.Fatalf("report: %+v (want the worm target Unverifiable, 0 missing)", rep)
+	if !repBad.Targets[0].Unverifiable() || !repBad.Targets[0].UnexpectedlyUnverifiable() {
+		t.Fatalf("non-worm all-errored target must be UnexpectedlyUnverifiable: %+v", repBad.Targets[0])
+	}
+
+	repWorm, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}, Worm: true}}, 0)
+	if err != nil {
+		t.Fatalf("audit worm: %v", err)
+	}
+	if !repWorm.Targets[0].Unverifiable() || repWorm.Targets[0].UnexpectedlyUnverifiable() {
+		t.Fatalf("worm target must be Unverifiable but EXPECTED: %+v", repWorm.Targets[0])
 	}
 }
 
