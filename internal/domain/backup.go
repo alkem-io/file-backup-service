@@ -136,14 +136,7 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (d
 		return false, false, ferr
 	}
 
-	// Fold per-target results into the circuit breaker ONLY on the clean (non-aborted)
-	// path, where each target's success/failure is genuinely ITS OWN. A shared ctx abort
-	// (per-object timeout or shutdown) must NOT be folded: the fanout is a barrier, so ONE
-	// hung target stalls every target into the SAME timeout — folding it would trip the
-	// HEALTHY targets' circuits in lockstep with the hung one, storing objects nowhere. A
-	// hung target is instead dropped INDIVIDUALLY by the fanout's per-target stall timeout
-	// (fanoutCopy), surfacing as its own failure on this clean path — correct attribution.
-	if !aborted {
+	if shouldRecordCircuit(ctx, aborted, results) {
 		p.recordCircuit(pending, results)
 	}
 
@@ -207,6 +200,33 @@ func (p *Pipeline) pendingTargets(stored map[string]bool) (pending []Target, ski
 		pending = append(pending, t)
 	}
 	return pending, skippedOpen
+}
+
+// shouldRecordCircuit decides whether to fold per-target results into the circuit breaker.
+// Fold on the clean path (each target's outcome is its own), OR on a per-object TIMEOUT
+// where at least one target durably STORED. The stall-drop handles a mid-STREAM hang, but a
+// FINALIZATION hang (a target that drained + verified the stream, then hangs on S3
+// CompleteMultipartUpload / fsync+rename) reaches the aborted path with siblings already
+// stored — anyStored proves it's a target-SPECIFIC hang, not a shared-barrier stall where
+// NOTHING stored (there, folding would trip healthy targets in lockstep). Without this a
+// finalize-hung target never trips → its objects FAIL not DEFER → dead-letter (the T017a mode).
+func shouldRecordCircuit(ctx context.Context, aborted bool, results []targetResult) bool {
+	if !aborted {
+		return true
+	}
+	return errors.Is(ctx.Err(), context.DeadlineExceeded) && anyStored(results)
+}
+
+// anyStored reports whether at least one target durably stored — proof the stream
+// completed, so a concurrent abort is a target-specific finalization hang (some stored)
+// rather than a shared-barrier stall (nothing stored).
+func anyStored(results []targetResult) bool {
+	for i := range results {
+		if results[i].err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // recordCircuit folds each fanned target's Store result into the circuit breaker.

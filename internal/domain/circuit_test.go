@@ -122,6 +122,47 @@ func TestCircuitBreakerFlakyTarget(t *testing.T) {
 	}
 }
 
+// finalizeHangSink drains its stream to EOF (so the fanout barrier completes and a sibling
+// stores) but then HANGS before returning — modelling an S3 CompleteMultipartUpload /
+// fsync-on-a-wedged-mount hang in the FINALIZATION phase (after the stream verified).
+type finalizeHangSink struct {
+	stubSink
+	release chan struct{}
+}
+
+func (h *finalizeHangSink) Store(ctx context.Context, _ string, r io.Reader) (int64, error) {
+	_, _ = io.Copy(io.Discard, r) // drain to EOF — the barrier completes, the sibling stores
+	select {
+	case <-h.release:
+		return 0, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// TestFinalizeHangTripsCircuit: a target that hangs on FINALIZE (post-stream) is caught by
+// the per-object timeout on the aborted path; because a sibling stored (anyStored), its
+// failure folds into the circuit and it trips — instead of never tripping and dead-lettering.
+func TestFinalizeHangTripsCircuit(t *testing.T) {
+	up := newMemSink("up")
+	hung := &finalizeHangSink{stubSink: stubSink{name: "hung"}, release: make(chan struct{})}
+	defer close(hung.release)
+	led := newFakeLedger()
+	p := NewPipeline(nil, led, []Target{{Sink: up, Codec: CodecNone}, {Sink: hung, Codec: CodecNone}})
+	p.Circuit = NewCircuitBreaker(3, time.Minute) // trips at 3 failures in the window
+
+	for i := 0; i < 6 && !p.Circuit.Down("hung"); i++ {
+		data := bytes.Repeat([]byte("x"), 20+i) // distinct content per object
+		h, _ := sum(bytes.NewReader(data))
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, _, _ = p.backupFrom(ctx, fakeSource{data}, OutboxEntry{ExternalID: h})
+		cancel()
+	}
+	if !p.Circuit.Down("hung") {
+		t.Fatal("a finalize-hung target must trip its circuit (via the timeout+anyStored fold), not dead-letter forever")
+	}
+}
+
 // TestBackupOneDefersOnDownTarget: when a target's circuit is open (down), an object that
 // stored on every reachable target is DEFERRED (no genuine failure), not Failed — so a
 // single-target outage doesn't march the corpus to dead-letter (T017a).

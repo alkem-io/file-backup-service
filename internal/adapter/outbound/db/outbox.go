@@ -150,15 +150,21 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 // BacklogStats returns the number of pending outbox entries and the age (seconds) of
 // the oldest one — the backlog-depth + lag signal (FR-026). Age is 0 when empty.
 func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSec float64, err error) {
-	// Match Claim's visibility predicate: count only CLAIMABLE rows (visibleAt NULL or
-	// due), not every pending row. Otherwise objects in Fail-backoff and — during a
-	// single-target outage — every Deferred object (T017a: pending, visibleAt continuously
-	// pushed forward by the defer backoff, never claimed) inflate the backlog + oldest-age RPO gauge and fire a FALSE
-	// backup-lag page, even though those objects ARE backed up on every reachable target.
+	// Count only rows that represent REAL un-backed-up work, so the RPO gauge doesn't fire a
+	// false backup-lag page during a single-target outage. Excludes:
+	//   - not-yet-visible rows (visibleAt in the future) — matches Claim's visibility.
+	//   - DEFERRED objects (T017a) — these ARE backed up on every reachable target; they're
+	//     uniquely identified by attempts=0 AND visibleAt IS NOT NULL (Fail bumps attempts;
+	//     a fresh row has visibleAt NULL). They cycle through visibility every backoff, so a
+	//     plain visibleAt filter isn't enough — their old createdDate would still dominate
+	//     min() in the brief visible window and spike oldest-age to hours.
+	// A row counts iff: fresh (visibleAt NULL) OR a genuinely-retrying failure that is due
+	// (visibleAt <= now() AND attempts > 0).
 	const q = `SELECT count(*),
 	  COALESCE(EXTRACT(EPOCH FROM now() - min("createdDate")), 0)
 	FROM file_backup_outbox
-	WHERE status='pending' AND ("visibleAt" IS NULL OR "visibleAt" <= now())`
+	WHERE status='pending'
+	  AND ("visibleAt" IS NULL OR ("visibleAt" <= now() AND COALESCE(attempts,0) > 0))`
 	if err := r.p.QueryRow(ctx, q).Scan(&pending, &oldestAgeSec); err != nil {
 		return 0, 0, fmt.Errorf("backlog stats: %w", err)
 	}
