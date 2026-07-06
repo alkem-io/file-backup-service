@@ -237,7 +237,10 @@ func runReconcile(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if err := cfg.Validate(); err != nil {
+	// Only the targets need validating — reconcile is target-to-target and never touches
+	// fileServiceBase or the outbox DB (so it runs in the DR state it exists for). The
+	// ledger DSN is checked by NewPool + ledger.Probe below.
+	if err := cfg.ValidateTargets(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 	ctx, stop := signalContext()
@@ -261,19 +264,21 @@ func runReconcile(args []string) error {
 	return err
 }
 
-// sinkFor loads config, validates the named target, and builds its sink. It
-// validates the single target (not full serve config) so a DR restore fails with a
-// clear config error (bad type/region/missing bucket) instead of a raw minio/os one.
+// sinkFor loads config, validates the target set, and builds the named target's sink.
+// It validates the whole target set (not the full serve config) so a DR restore fails
+// with a clear config error — including an env-token collision that would silently
+// build the sink with a sibling target's injected secret — instead of a raw minio/os
+// error or a wrong-store restore.
 func sinkFor(cfgPath, name string) (domain.Sink, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
+	if err := cfg.ValidateTargets(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	for _, t := range cfg.Targets {
 		if t.Name == name {
-			if err := config.ValidateTarget(t); err != nil {
-				return nil, fmt.Errorf("invalid target %q: %w", name, err)
-			}
 			return buildSink(t)
 		}
 	}

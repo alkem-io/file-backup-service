@@ -76,6 +76,12 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 // done-gate); a flaky target leaves the object not-done for retry while never
 // blocking the healthy targets.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
+	return p.backupFrom(ctx, p.Source, e)
+}
+
+// backupFrom is BackupOne parameterized on the source, so reconcile can supply a
+// target-backed source per call without mutating shared Pipeline state.
+func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (bool, error) {
 	// Dedup is per content-hash, NOT per outbox row: a fresh row (attempts=0) can
 	// reference an already-stored externalID (duplicate content, or a backfill/
 	// reconcile re-enqueue), so the StoredTargets read must run unconditionally —
@@ -96,7 +102,7 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 		return true, nil // every target already has it
 	}
 
-	results, verified, ferr := p.fanOut(ctx, e, pending)
+	results, verified, ferr := p.fanOut(ctx, src, e, pending)
 	// A SOURCE error records nothing — the object is bad or was never fetched. That is
 	// either (a) nil results: the fetch itself failed BEFORE any per-target result
 	// (including a ctx-cancelled fetch, where ctx.Err()!=nil — so this must NOT rely on
@@ -192,8 +198,8 @@ func (e *eofReader) Read(p []byte) (int, error) {
 // nothing is committed anywhere. Returns per-target results and the VERIFIED byte
 // count (>=0 only when the full stream was read and hash-verified, else -1); a
 // non-nil error is a SOURCE failure (integrity mismatch or ctx cancellation).
-func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) ([]targetResult, int64, error) {
-	rc, err := p.Source.FetchContent(ctx, e.FileID)
+func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, targets []Target) ([]targetResult, int64, error) {
+	rc, err := src.FetchContent(ctx, e.FileID)
 	if err != nil {
 		return nil, -1, err
 	}

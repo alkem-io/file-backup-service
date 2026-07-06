@@ -34,6 +34,14 @@ func ParseCodec(s string) (Codec, error) {
 	}
 }
 
+// newZstdDecoder builds the single-goroutine zstd decoder used by BOTH decode paths
+// (restore + reconcile) — one owner for the concurrency cap (WithDecoderConcurrency(1)
+// avoids the per-core block-decoder allocation). The DECODED-output bomb bound is
+// applied by each caller (copyVerify's limit in restore, a LimitReader in reconcile).
+func newZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
+	return zstd.NewReader(r, zstd.WithDecoderConcurrency(1))
+}
+
 // zstdEncoderPool reuses single-goroutine zstd encoders across objects — each
 // NewWriter eagerly allocates GOMAXPROCS block encoders (~1.25 MiB of hash tables
 // each), so a fresh one per object per zstd target churns tens of MiB and GC.

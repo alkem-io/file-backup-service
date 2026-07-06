@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/klauspost/compress/zstd"
-
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
@@ -31,6 +29,11 @@ var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 // errTryRaw signals that a zstd-magic object did not decode+hash as zstd, so the
 // stored bytes must be the plaintext (which happens to start with the zstd magic).
 var errTryRaw = errors.New("not zstd after all")
+
+// errBomb marks a zstd stream whose decoded size exceeds the cap — a decompression
+// bomb. Unlike errTryRaw it is NOT retried as raw (that would re-fetch + re-scan for a
+// hostile input); decodeStream surfaces it as a hard failure.
+var errBomb = errors.New("decompression bomb: decoded size exceeds cap")
 
 // errHashMismatch means the decoded content did not hash to the requested key.
 var errHashMismatch = errors.New("hash mismatch")
@@ -180,16 +183,21 @@ func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
 // is what keeps a raw-stored object that is ITSELF a valid zstd bomb restorable from
 // its small raw bytes. Only when BOTH interpretations fail is it genuinely corrupt.
 func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
-	// Serial single-stream decode — cap concurrency so NewReader doesn't eagerly
-	// allocate a block decoder per core (mirrors the encoder's WithEncoderConcurrency).
-	zr, err := zstd.NewReader(io.LimitReader(r, maxRestoreBytes+1), zstd.WithDecoderConcurrency(1))
+	zr, err := newZstdDecoder(io.LimitReader(r, maxRestoreBytes+1))
 	if err != nil {
 		return errTryRaw
 	}
 	defer zr.Close()
 	// Cap the DECODED output (bomb protection); a tiny zstd frame can expand to PB.
-	if overCap, verr := copyVerify(dst, zr, hash, maxRestoreBytes); verr != nil || overCap {
-		return errTryRaw
+	overCap, verr := copyVerify(dst, zr, hash, maxRestoreBytes)
+	switch {
+	case overCap:
+		// The decoded plaintext exceeds the cap — a bomb, not a raw object that merely
+		// starts with the zstd magic (that case is a hash MISMATCH below, which does
+		// fall back). Don't waste a raw re-read on a bomb.
+		return errBomb
+	case verr != nil:
+		return errTryRaw // not zstd, or the decoded plaintext doesn't hash — try raw
 	}
 	return nil
 }

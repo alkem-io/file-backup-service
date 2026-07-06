@@ -45,7 +45,11 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 	var st ReconcileStats
 	var pace <-chan time.Time
 	if ratePerSec > 0 {
-		t := time.NewTicker(time.Second / time.Duration(ratePerSec))
+		interval := time.Second / time.Duration(ratePerSec)
+		if interval <= 0 {
+			interval = time.Nanosecond // an absurd rate: effectively unlimited, never NewTicker(0)
+		}
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		pace = t.C
 	}
@@ -65,45 +69,48 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 			case <-pace:
 			}
 		}
-		src, ok := rc.pickSource(ctx, externalID, stored)
-		if !ok {
-			st.Skipped++ // nowhere holds it — reconcile can't repair; a backfill must re-fetch
-			return nil
-		}
-		p.Source = decodingSource{src: src.Sink, codec: src.Codec}
-		done, rerr := p.BackupOne(ctx, OutboxEntry{FileID: externalID, ExternalID: externalID})
-		switch {
-		case rerr != nil && ctx.Err() != nil:
-			return rerr // shutdown — stop the pass
-		case rerr != nil || !done:
-			st.Failed++
-		default:
-			st.Repaired++
-		}
-		return nil
+		rc.repair(ctx, p, externalID, stored, &st)
+		return ctx.Err() // stop the pass on shutdown
 	})
 	return st, err
 }
 
-// pickSource returns a configured target that holds externalID, preferring one whose
-// presence can be Exists-verified (so a stale ledger row isn't chosen as the source);
-// it falls back to the ledger's word when no candidate is introspectable (all WORM).
-func (rc *Reconciler) pickSource(ctx context.Context, externalID string, stored map[string]bool) (Target, bool) {
-	var fallback Target
-	var have bool
+// repair brings one under-replicated object to full replication. It tries each target
+// the ledger says holds it AS THE SOURCE, falling through to the next if a source is
+// gone/corrupt (a Fetch error, or the pipeline's VerifyReader rejecting bad bytes) —
+// no upfront Exists probe, and no reliance on a possibly-stale ledger. backupFrom
+// dedups the source + re-fans-out to the missing targets + records the ledger. A panic
+// in one repair is contained (counted failed) so a poison object can't crash the pass.
+func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string, stored map[string]bool, st *ReconcileStats) {
+	defer func() {
+		if r := recover(); r != nil {
+			st.Failed++
+		}
+	}()
+	entry := OutboxEntry{FileID: externalID, ExternalID: externalID}
+	tried := false
 	for name := range stored {
-		t, ok := rc.byName[name]
+		src, ok := rc.byName[name]
 		if !ok {
 			continue // stale status for a removed target
 		}
-		if !have {
-			fallback, have = t, true
+		tried = true
+		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink, codec: src.Codec}, entry)
+		if err == nil && done {
+			st.Repaired++
+			return
 		}
-		if present, err := t.Sink.Exists(ctx, externalID); err == nil && present {
-			return t, true
+		if ctx.Err() != nil {
+			st.Failed++ // shutdown mid-repair
+			return
 		}
+		// this source was gone/corrupt (or a missing target failed) — try the next source
 	}
-	return fallback, have
+	if !tried {
+		st.Skipped++ // no configured target holds it — needs a backfill from the primary store
+		return
+	}
+	st.Failed++ // every source failed
 }
 
 // decodingSource adapts a backup target into a pipeline Source: it Fetches the stored
@@ -124,20 +131,24 @@ func (d decodingSource) FetchContent(ctx context.Context, externalID string) (io
 	if d.codec != CodecZstd {
 		return rc, nil // stored raw == plaintext
 	}
-	zr, err := zstd.NewReader(io.LimitReader(rc, maxRestoreBytes+1), zstd.WithDecoderConcurrency(1))
+	zr, err := newZstdDecoder(rc)
 	if err != nil {
 		_ = rc.Close()
 		return nil, fmt.Errorf("zstd decode: %w", err)
 	}
-	return &zstdReadCloser{zr: zr, under: rc}, nil
+	// Bound the DECODED output (not just the compressed input): a compromised target
+	// could hold a tiny frame that expands to PB. The pipeline's VerifyReader then
+	// rejects a bomb (the capped stream won't hash to externalID) with nothing committed.
+	return &zstdReadCloser{r: io.LimitReader(zr, maxRestoreBytes+1), zr: zr, under: rc}, nil
 }
 
 type zstdReadCloser struct {
+	r     io.Reader // decoded stream, bomb-capped
 	zr    *zstd.Decoder
 	under io.Closer
 }
 
-func (z *zstdReadCloser) Read(p []byte) (int, error) { return z.zr.Read(p) }
+func (z *zstdReadCloser) Read(p []byte) (int, error) { return z.r.Read(p) }
 
 // Close releases the decoder and the underlying stored-object reader.
 func (z *zstdReadCloser) Close() error {

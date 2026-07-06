@@ -283,11 +283,20 @@ func (c *Config) Validate() error {
 	if err := c.LedgerDB.validate("ledgerDB"); err != nil {
 		return err
 	}
-	if len(c.Targets) == 0 {
-		return errors.New("at least one target is required")
-	}
 	if err := c.validateLimits(); err != nil {
 		return err
+	}
+	return c.ValidateTargets()
+}
+
+// ValidateTargets validates the target set — each target's fields plus no env-token
+// collisions (two names mapping to one FBS_TARGET_<TOKEN>_* would silently share
+// secrets). It is the whole check the DR subcommands (restore/verify/reconcile) need:
+// they never touch fileServiceBase or the outbox DB, so requiring the full serve config
+// would make them unusable in the degraded/DR environment they exist for.
+func (c *Config) ValidateTargets() error {
+	if len(c.Targets) == 0 {
+		return errors.New("at least one target is required")
 	}
 	seen := make(map[string]string, len(c.Targets))
 	for i, t := range c.Targets {
@@ -330,12 +339,6 @@ func (c *Config) validateLimits() error {
 		return fmt.Errorf("maxDeliveries (%d) out of range 1-1000", c.MaxDeliveries)
 	}
 	return nil
-}
-
-// ValidateTarget checks a single target in isolation — used by the restore/verify
-// CLI, which don't run full serve validation.
-func ValidateTarget(t Target) error {
-	return validateTarget(0, t, map[string]string{})
 }
 
 func validateTarget(i int, t Target, seen map[string]string) error {
