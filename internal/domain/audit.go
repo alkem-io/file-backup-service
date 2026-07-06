@@ -2,7 +2,9 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 )
 
 // auditConcurrency bounds the parallel Exists probes per page (each is an independent
@@ -60,15 +62,22 @@ func (r AuditReport) Missing() int {
 // checks min(sample, total) objects — a high random start doesn't under-check and read as
 // a false clean pass. A full audit (samplePerTarget<=0) passes "" and never wraps.
 func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int, startAfter string) (AuditReport, error) {
-	rep := AuditReport{Targets: make([]TargetAudit, 0, len(targets))}
-	for _, t := range targets {
-		ta, err := auditTarget(ctx, led, t, samplePerTarget, startAfter)
-		if err != nil {
-			return rep, err
-		}
-		rep.Targets = append(rep.Targets, ta)
+	// Sweep targets CONCURRENTLY — each is an independent backend + keyset with its own
+	// TargetAudit, so wall-clock is the slowest target, not the sum. Results are written to
+	// distinct indices (config order preserved); a cancelled sweep on any target surfaces
+	// its error via errors.Join.
+	rep := AuditReport{Targets: make([]TargetAudit, len(targets))}
+	errs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t Target) {
+			defer wg.Done()
+			rep.Targets[i], errs[i] = auditTarget(ctx, led, t, samplePerTarget, startAfter)
+		}(i, t)
 	}
-	return rep, nil
+	wg.Wait()
+	return rep, errors.Join(errs...)
 }
 
 // auditTarget sweeps one target: for up to samplePerTarget objects the ledger records
@@ -96,33 +105,47 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 		if err != nil {
 			return ta, fmt.Errorf("audit target %s: %w", ta.Target, err)
 		}
-		if len(page) == 0 {
+		// A short page (incl. empty) is the end of this segment. On the WRAPPED pass, also
+		// stop at startAfter — trim objects >= it (already checked in pass 1) BEFORE tallying,
+		// so the boundary page isn't double-counted.
+		segmentEnd := len(page) < limit
+		if wrapped {
+			var atBoundary bool
+			if page, atBoundary = trimAtBoundary(page, startAfter); atBoundary {
+				segmentEnd = true
+			}
+		}
+		if len(page) > 0 {
+			results := existsPage(ctx, t.Sink, page)
+			// If cancellation landed mid-page, the in-flight Exists calls returned ctx.Canceled
+			// — don't count those tainted errors (they'd falsely trip Unverifiable); surface it.
+			if err := ctx.Err(); err != nil {
+				return ta, err
+			}
+			ta.tally(results)
+			after = page[len(page)-1].ExternalID
+		}
+		if segmentEnd {
 			if wrapEnd(samplePerTarget, startAfter, &wrapped) {
-				after = ""
-				continue // end of keyspace with budget left → wrap once to the start
+				after = "" // end of [startAfter,end) with budget left → wrap once to the start
+				continue
 			}
 			break
 		}
-		results := existsPage(ctx, t.Sink, page)
-		// If cancellation landed mid-page, the in-flight Exists calls returned ctx.Canceled
-		// — don't count those tainted errors (they'd falsely trip Unverifiable); surface it.
-		if err := ctx.Err(); err != nil {
-			return ta, err
-		}
-		ta.tally(results)
-		after = page[len(page)-1].ExternalID
-		if wrapped && after >= startAfter {
-			break // wrapped back to the start — full circle
-		}
-		if len(page) < limit {
-			if wrapEnd(samplePerTarget, startAfter, &wrapped) {
-				after = ""
-				continue
-			}
-			break // a short page is the last
-		}
 	}
 	return ta, nil
+}
+
+// trimAtBoundary returns page truncated at the first object whose externalID >= boundary
+// (the wrapped pass must not re-check objects already covered in pass 1), and whether it
+// trimmed (reached the boundary).
+func trimAtBoundary(page []ObjectMeta, boundary string) ([]ObjectMeta, bool) {
+	for i := range page {
+		if page[i].ExternalID >= boundary {
+			return page[:i], true
+		}
+	}
+	return page, false
 }
 
 // tally folds one page's Exists results into the target's counters.

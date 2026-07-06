@@ -104,6 +104,29 @@ func TestAuditSampleWrapsFromHighStart(t *testing.T) {
 	_ = ids
 }
 
+// TestAuditSampleNoBoundaryDoubleCount: a mid-keyspace start that wraps must NOT re-check
+// (double-count) the objects it already checked in pass 1 — Checked must not exceed the
+// distinct object count.
+func TestAuditSampleNoBoundaryDoubleCount(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	a := newMemSink("a")
+	for i := 0; i < 10; i++ {
+		id := "0" + string(rune('0'+i)) // "00".."09"
+		_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: id}, []TargetStatus{{Target: "a", State: StateStored}})
+		a.store[id] = []byte("x")
+	}
+	// Start at "05" with sample 20 (> the 10 objects): pass 1 checks 06-09 (4), wraps,
+	// pass 2 checks 00-04 (5). Must be 9 distinct (05 itself is skipped by keyset >), never 14.
+	rep, err := Audit(ctx, led, []Target{{Sink: a}}, 20, "05")
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if c := rep.Targets[0].Checked; c != 9 {
+		t.Fatalf("wrapped sample must not double-count the boundary: Checked=%d (want 9 distinct)", c)
+	}
+}
+
 // existsErrSink models a PutObject-only WORM credential: Exists always errors (403).
 type existsErrSink struct{ stubSink }
 

@@ -334,10 +334,14 @@ func (c *Config) Validate() error {
 
 // ValidateDR is the check the ledger-DB DR subcommands (reconcile/audit) need: the
 // numeric limits (so a huge perObjectTimeoutSec can't overflow to a negative Duration on
-// this path) PLUS the target set — but NOT fileServiceBase/outbox, so it still runs in
-// the degraded/DR environment. serve's full Validate is the superset.
+// this path), the LedgerDB (they connect to it — so a malformed DSN fails with a clear
+// 'ledgerDB.host is required' here, not an opaque pgx parse error later), PLUS the target
+// set — but NOT fileServiceBase/outbox, so it still runs in the degraded/DR environment.
 func (c *Config) ValidateDR() error {
 	if err := c.validateLimits(); err != nil {
+		return err
+	}
+	if err := c.LedgerDB.Validate("ledgerDB"); err != nil {
 		return err
 	}
 	return c.ValidateTargets()
