@@ -153,7 +153,7 @@ func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSe
 	// Match Claim's visibility predicate: count only CLAIMABLE rows (visibleAt NULL or
 	// due), not every pending row. Otherwise objects in Fail-backoff and — during a
 	// single-target outage — every Deferred object (T017a: pending, visibleAt continuously
-	// +30s, never claimed) inflate the backlog + oldest-age RPO gauge and fire a FALSE
+	// pushed forward by the defer backoff, never claimed) inflate the backlog + oldest-age RPO gauge and fire a FALSE
 	// backup-lag page, even though those objects ARE backed up on every reachable target.
 	const q = `SELECT count(*),
 	  COALESCE(EXTRACT(EPOCH FROM now() - min("createdDate")), 0)

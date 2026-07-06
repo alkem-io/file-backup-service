@@ -395,11 +395,20 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 // when fn cannot (a filesystem call blocked in a hung fsync/write on a wedged mount — a
 // regular-file syscall Go can't interrupt): on ctx cancellation it returns ctx.Err() and
 // ABANDONS the goroutine (bounded, one per wedged op), so the caller unblocks rather than
-// pinning forever. The one owner of the "sink op that can't wedge shutdown" pattern,
-// shared by the manifest writer and storeWithCtx.
+// pinning forever. It RECOVERS a panic in fn (the goroutine is on the other side of a
+// boundary the caller's recover can't reach — same reason storeWithCtx recovers its own
+// Store goroutine) and returns it as an error, so a panicking sink op fails its target
+// instead of crashing the process. The manifest writer's abandonment path.
 func callWithCtx(ctx context.Context, fn func() error) error {
 	ch := make(chan error, 1) // buffered so an abandoned goroutine never blocks
-	go func() { ch <- fn() }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- PanicErr("sink op", r)
+			}
+		}()
+		ch <- fn()
+	}()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

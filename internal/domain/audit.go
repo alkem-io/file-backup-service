@@ -55,60 +55,98 @@ func (r AuditReport) Missing() int {
 // startAfter seeds the keyset cursor. For a SAMPLED audit the caller passes a RANDOM
 // externalID so repeated runs sample a different band each time — otherwise a fixed ""
 // start would re-check the same lowest-externalID prefix every run, a permanent blind
-// spot for every object past the first N. A full audit (samplePerTarget<=0) passes "".
+// spot for every object past the first N. When a sampled sweep reaches the end of the
+// keyspace with budget remaining it WRAPS ONCE to "" (bounded by the start), so it still
+// checks min(sample, total) objects — a high random start doesn't under-check and read as
+// a false clean pass. A full audit (samplePerTarget<=0) passes "" and never wraps.
 func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int, startAfter string) (AuditReport, error) {
 	rep := AuditReport{Targets: make([]TargetAudit, 0, len(targets))}
 	for _, t := range targets {
-		ta := TargetAudit{Target: t.Sink.Name(), Worm: t.Worm}
-		after := startAfter
-		for {
-			// A cancelled audit (SIGINT / a cron timeout) MUST surface the error, not
-			// return a partial report as a clean pass — an incomplete integrity check that
-			// exits 0 is read as "verified" by a monitoring cron.
-			if err := ctx.Err(); err != nil {
-				return rep, err
-			}
-			limit := storedPageSize
-			if samplePerTarget > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
-				remaining := samplePerTarget - ta.Checked
-				if remaining <= 0 {
-					break
-				}
-				if remaining < limit {
-					limit = remaining
-				}
-			}
-			page, err := led.StoredObjectsPage(ctx, ta.Target, after, limit)
-			if err != nil {
-				return rep, fmt.Errorf("audit target %s: %w", ta.Target, err)
-			}
-			if len(page) == 0 {
-				break
-			}
-			results := existsPage(ctx, t.Sink, page)
-			// If cancellation landed mid-page, the in-flight Exists calls returned
-			// ctx.Canceled — don't count those tainted errors (they'd falsely trip
-			// Unverifiable); surface the cancellation instead.
-			if err := ctx.Err(); err != nil {
-				return rep, err
-			}
-			for _, e := range results {
-				ta.Checked++
-				switch {
-				case e.err != nil:
-					ta.Errors++
-				case !e.present:
-					ta.Missing++
-				}
-			}
-			after = page[len(page)-1].ExternalID
-			if len(page) < limit {
-				break // a short page is the last
-			}
+		ta, err := auditTarget(ctx, led, t, samplePerTarget, startAfter)
+		if err != nil {
+			return rep, err
 		}
 		rep.Targets = append(rep.Targets, ta)
 	}
 	return rep, nil
+}
+
+// auditTarget sweeps one target: for up to samplePerTarget objects the ledger records
+// stored on it, confirm the target still holds them (Sink.Exists), keyset-paged from
+// startAfter with a single wrap (see Audit's doc). A cancelled sweep returns the error.
+func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int, startAfter string) (TargetAudit, error) {
+	ta := TargetAudit{Target: t.Sink.Name(), Worm: t.Worm}
+	after := startAfter
+	wrapped := false
+	for {
+		if err := ctx.Err(); err != nil { // a cancelled audit must error, not read as a clean pass
+			return ta, err
+		}
+		limit := storedPageSize
+		if samplePerTarget > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
+			remaining := samplePerTarget - ta.Checked
+			if remaining <= 0 {
+				break
+			}
+			if remaining < limit {
+				limit = remaining
+			}
+		}
+		page, err := led.StoredObjectsPage(ctx, ta.Target, after, limit)
+		if err != nil {
+			return ta, fmt.Errorf("audit target %s: %w", ta.Target, err)
+		}
+		if len(page) == 0 {
+			if wrapEnd(samplePerTarget, startAfter, &wrapped) {
+				after = ""
+				continue // end of keyspace with budget left → wrap once to the start
+			}
+			break
+		}
+		results := existsPage(ctx, t.Sink, page)
+		// If cancellation landed mid-page, the in-flight Exists calls returned ctx.Canceled
+		// — don't count those tainted errors (they'd falsely trip Unverifiable); surface it.
+		if err := ctx.Err(); err != nil {
+			return ta, err
+		}
+		ta.tally(results)
+		after = page[len(page)-1].ExternalID
+		if wrapped && after >= startAfter {
+			break // wrapped back to the start — full circle
+		}
+		if len(page) < limit {
+			if wrapEnd(samplePerTarget, startAfter, &wrapped) {
+				after = ""
+				continue
+			}
+			break // a short page is the last
+		}
+	}
+	return ta, nil
+}
+
+// tally folds one page's Exists results into the target's counters.
+func (t *TargetAudit) tally(results []existsResult) {
+	for _, e := range results {
+		t.Checked++
+		switch {
+		case e.err != nil:
+			t.Errors++
+		case !e.present:
+			t.Missing++
+		}
+	}
+}
+
+// wrapEnd reports whether a sampled sweep that reached the end of the keyspace with budget
+// remaining should WRAP ONCE to the start (it started mid-keyspace and hasn't wrapped yet);
+// it flips *wrapped so the wrap happens at most once.
+func wrapEnd(samplePerTarget int, startAfter string, wrapped *bool) bool {
+	if samplePerTarget > 0 && !*wrapped && startAfter != "" {
+		*wrapped = true
+		return true
+	}
+	return false
 }
 
 type existsResult struct {

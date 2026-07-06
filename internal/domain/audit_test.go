@@ -78,6 +78,32 @@ func TestAuditCancelledPropagates(t *testing.T) {
 	}
 }
 
+// TestAuditSampleWrapsFromHighStart: a sampled audit starting near the END of the keyspace
+// must WRAP to the start and still check the full sample — not under-check (a high random
+// start reporting Checked<<sample, exit 0, would be a false clean pass).
+func TestAuditSampleWrapsFromHighStart(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	a := newMemSink("a")
+	// 10 objects with externalIDs "00".."09"; store all on target "a".
+	var ids []string
+	for i := 0; i < 10; i++ {
+		id := string(rune('0'+i/10)) + string(rune('0'+i%10))
+		ids = append(ids, id)
+		_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: id}, []TargetStatus{{Target: "a", State: StateStored}})
+		a.store[id] = []byte("x")
+	}
+	// Start ABOVE the highest id ("09") so pass 1 finds nothing → must wrap to "" and check 5.
+	rep, err := Audit(ctx, led, []Target{{Sink: a}}, 5, "zz")
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if rep.Targets[0].Checked != 5 {
+		t.Fatalf("a high-start sampled audit must wrap and check the full sample, got Checked=%d", rep.Targets[0].Checked)
+	}
+	_ = ids
+}
+
 // existsErrSink models a PutObject-only WORM credential: Exists always errors (403).
 type existsErrSink struct{ stubSink }
 
