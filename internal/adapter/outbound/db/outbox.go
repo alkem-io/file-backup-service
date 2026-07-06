@@ -148,9 +148,15 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 // BacklogStats returns the number of pending outbox entries and the age (seconds) of
 // the oldest one — the backlog-depth + lag signal (FR-026). Age is 0 when empty.
 func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSec float64, err error) {
+	// Match Claim's visibility predicate: count only CLAIMABLE rows (visibleAt NULL or
+	// due), not every pending row. Otherwise objects in Fail-backoff and — during a
+	// single-target outage — every Deferred object (T017a: pending, visibleAt continuously
+	// +30s, never claimed) inflate the backlog + oldest-age RPO gauge and fire a FALSE
+	// backup-lag page, even though those objects ARE backed up on every reachable target.
 	const q = `SELECT count(*),
 	  COALESCE(EXTRACT(EPOCH FROM now() - min("createdDate")), 0)
-	FROM file_backup_outbox WHERE status='pending'`
+	FROM file_backup_outbox
+	WHERE status='pending' AND ("visibleAt" IS NULL OR "visibleAt" <= now())`
 	if err := r.p.QueryRow(ctx, q).Scan(&pending, &oldestAgeSec); err != nil {
 		return 0, 0, fmt.Errorf("backlog stats: %w", err)
 	}
