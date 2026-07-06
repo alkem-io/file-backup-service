@@ -200,7 +200,7 @@ func (e *eofReader) Read(p []byte) (int, error) {
 // count (>=0 only when the full stream was read and hash-verified, else -1); a
 // non-nil error is a SOURCE failure (integrity mismatch or ctx cancellation).
 func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, targets []Target) ([]targetResult, int64, error) {
-	rc, err := src.FetchContent(ctx, e.FileID)
+	rc, err := src.FetchContent(ctx, e)
 	if err != nil {
 		return nil, -1, err
 	}

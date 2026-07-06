@@ -61,7 +61,7 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 		targets[i], states[i], storedBytes[i] = s.Target, s.State, s.StoredBytes
 	}
 	if _, err := r.p.Exec(ctx, recordBackupSQL,
-		obj.ExternalID, obj.Size, uuidOrNull(obj.CreatedBy), timestamptzOrNull(obj.SourceCreatedDate),
+		obj.ExternalID, obj.Size, obj.CreatedBy, timestamptzOrNull(obj.SourceCreatedDate),
 		targets, states, storedBytes, obj.SizeVerified); err != nil {
 		return fmt.Errorf("record backup: %w", err)
 	}
@@ -74,7 +74,7 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 // WHERE + ORDER an index-ordered range scan — no full sort, and the connection is
 // released when the page returns (not held for the whole manifest upload / audit sweep).
 func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]domain.ObjectMeta, error) {
-	const q = `SELECT o."externalID", o.size, COALESCE(o."createdBy"::text,''), o."sourceCreatedDate"
+	const q = `SELECT o."externalID", o.size, o."createdBy", o."sourceCreatedDate"
 	FROM file_backup_object o
 	JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
 	WHERE ts.target = $1 AND ts.state = 'stored' AND o."externalID" > $2
@@ -205,18 +205,6 @@ func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[
 		}
 	}
 	return out, nil
-}
-
-// uuidOrNull parses a DB-sourced UUID text (via COALESCE("createdBy"::text,”))
-// into a pgtype.UUID; "" maps to SQL NULL. The source is a UUID column, so a real
-// value cannot fail to parse — the only "" case is a genuine NULL breadcrumb.
-func uuidOrNull(s string) pgtype.UUID {
-	var u pgtype.UUID
-	if s == "" {
-		return u
-	}
-	_ = u.Scan(s)
-	return u
 }
 
 func timestamptzOrNull(t time.Time) pgtype.Timestamptz {

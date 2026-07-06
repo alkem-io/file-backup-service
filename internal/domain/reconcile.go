@@ -66,7 +66,7 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 // in one repair is contained (counted failed) so a poison object can't crash the pass.
 func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string, stored map[string]bool, st *ReconcileStats) {
 	defer recoverFailed(&st.Failed)
-	entry := OutboxEntry{FileID: externalID, ExternalID: externalID}
+	entry := OutboxEntry{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
 	tried := false
 	for name := range stored {
 		src, ok := rc.byName[name]
@@ -116,7 +116,10 @@ type decodingSource struct {
 }
 
 // FetchContent implements Source: decode the stored object to a temp file and serve it.
-func (d decodingSource) FetchContent(ctx context.Context, externalID string) (io.ReadCloser, error) {
+// It keys on e.ExternalID (the content hash — the target is content-addressed), NOT
+// e.FileID, so reconcile no longer fakes a FileID.
+func (d decodingSource) FetchContent(ctx context.Context, e OutboxEntry) (io.ReadCloser, error) {
+	externalID := e.ExternalID
 	tmp, err := os.CreateTemp("", "reconcile-*.plain")
 	if err != nil {
 		return nil, fmt.Errorf("reconcile temp: %w", err)

@@ -28,7 +28,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 	sink := newMemSink("t1")
 	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
-	corpus := fakeCorpus{entries: []OutboxEntry{{FileID: "f1", ExternalID: h}}}
+	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: h}}}
 
 	st, err := NewBackfiller(corpus, p).Run(context.Background(), 0)
 	if err != nil {

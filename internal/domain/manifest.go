@@ -58,7 +58,11 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 			if !m.SourceCreatedDate.IsZero() {
 				created = &m.SourceCreatedDate
 			}
-			return enc.Encode(manifestLine{m.ExternalID, m.Size, m.CreatedBy, created})
+			createdBy := "" // omitted when the breadcrumb is a NULL uuid
+			if m.CreatedBy.Valid {
+				createdBy = m.CreatedBy.UUID.String()
+			}
+			return enc.Encode(manifestLine{m.ExternalID, m.Size, createdBy, created})
 		})
 		_ = pw.CloseWithError(err)
 	}()

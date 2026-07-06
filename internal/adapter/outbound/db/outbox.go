@@ -38,8 +38,8 @@ WHERE id IN (
   LIMIT $1
   FOR UPDATE SKIP LOCKED
 )
-RETURNING id, "fileId"::text, "externalID", COALESCE(size,0),
-  COALESCE("createdBy"::text,''), COALESCE("createdDate", now())`
+RETURNING id, "fileId", "externalID", COALESCE(size,0),
+  "createdBy", COALESCE("createdDate", now())`
 
 // Claim atomically claims up to n pending rows.
 func (r *OutboxRepo) Claim(ctx context.Context, n int) ([]domain.OutboxEntry, error) {

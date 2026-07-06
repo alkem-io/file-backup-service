@@ -3,17 +3,19 @@ package domain
 import (
 	"context"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // OutboxEntry is a claimed backup-outbox row (Alkemio DB). Priority is not carried
 // into Go — ordering is done DB-side in the claim SQL.
 type OutboxEntry struct {
 	ID          int64
-	FileID      string
-	ExternalID  string
-	Size        int64     // object size (from the outbox) — recorded up front
-	CreatedBy   string    // uuid text, "" if null — breadcrumb
-	CreatedDate time.Time // when the source object was created — breadcrumb
+	FileID      uuid.UUID     // native uuid (file.id) — pgx scans/encodes it directly
+	ExternalID  string        // content hash (SHA3-256), NOT a uuid
+	Size        int64         // object size (from the outbox) — recorded up front
+	CreatedBy   uuid.NullUUID // breadcrumb; Valid=false for a NULL createdBy
+	CreatedDate time.Time     // when the source object was created — breadcrumb
 }
 
 // Outbox is the read/claim side of the backup outbox in the Alkemio DB, accessed
@@ -48,9 +50,9 @@ type Outbox interface {
 type ObjectMeta struct {
 	ExternalID        string
 	Size              int64
-	SizeVerified      bool      // Size came from the hash-verified stream, not outbox hearsay
-	CreatedBy         string    // uuid text, or "" for null
-	SourceCreatedDate time.Time // outbox createdDate; zero => null
+	SizeVerified      bool          // Size came from the hash-verified stream, not outbox hearsay
+	CreatedBy         uuid.NullUUID // breadcrumb; Valid=false for a NULL createdBy
+	SourceCreatedDate time.Time     // outbox createdDate; zero => null
 }
 
 // TargetStatus is one (object, target) completion record.
