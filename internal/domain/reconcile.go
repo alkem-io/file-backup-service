@@ -82,21 +82,30 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 		}
 		tried = true
 		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink}, entry)
-		if err == nil && done {
-			st.Repaired++
+		if err == nil {
+			// The source fetched + verified cleanly. Either fully repaired (done), or a
+			// DESTINATION target failed (!done) — and rotating to another source can't fix
+			// a down destination (it fails identically for any source), so STOP re-fetching
+			// rather than re-reading the whole object from every holder to retry a dead
+			// destination. Only a SOURCE failure (err != nil) is worth trying the next source.
+			if done {
+				st.Repaired++
+			} else {
+				st.Failed++
+			}
 			return
 		}
 		if ctx.Err() != nil {
 			st.Failed++ // shutdown mid-repair
 			return
 		}
-		// this source was gone/corrupt (or a missing target failed) — try the next source
+		// this source was gone/corrupt — try the next source
 	}
 	if !tried {
 		st.Skipped++ // no configured target holds it — needs a backfill from the primary store
 		return
 	}
-	st.Failed++ // every source failed
+	st.Failed++ // every source failed to fetch
 }
 
 // decodingSource adapts a backup target into a pipeline Source: it Fetches the stored

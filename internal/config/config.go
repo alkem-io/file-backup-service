@@ -314,6 +314,21 @@ func (c *Config) ValidateTargets() error {
 	return nil
 }
 
+// PoolSize returns a pgx pool max-conns of Concurrency + headroom, CLAMPED to a sane
+// range. serve validates Concurrency (errors on >1024), but the DR subcommands
+// (reconcile/audit) only validate targets, so this clamp is their safety net — it makes
+// the int32 conversion provably non-overflowing on every path, not just serve's.
+func (c *Config) PoolSize(headroom int) int32 {
+	n := c.Concurrency
+	if n < 1 {
+		n = 1
+	}
+	if n > 1024 {
+		n = 1024
+	}
+	return int32(n + headroom) //nolint:gosec // n clamped to <=1024, so n+headroom fits int32
+}
+
 // validateLimits range-checks the numeric knobs (kept out of Validate for clarity +
 // cyclomatic budget).
 func (c *Config) validateLimits() error {

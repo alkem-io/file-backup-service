@@ -91,7 +91,9 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 	if err != nil {
 		return err
 	}
-	br := bufio.NewReaderSize(rc, 8<<10)
+	// ctxReader so a large decode from a filesystem source (os.File.Read ignores ctx)
+	// honors SIGINT/SIGTERM mid-read, not only at the CommitWrite gate afterward.
+	br := bufio.NewReaderSize(ctxReader{ctx, rc}, 8<<10)
 	magic, _ := br.Peek(4) // short object → short magic, simply won't match
 	if bytes.Equal(magic, zstdMagic) {
 		derr := decodeZstd(br, hash, dst)
@@ -113,20 +115,16 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 			return ferr
 		}
 		defer func() { _ = rc2.Close() }()
-		return decodeRaw(rc2, hash, dst)
+		return decodeRaw(ctxReader{ctx, rc2}, hash, dst)
 	}
 	// No zstd magic — zstd always begins with it, so the bytes are the plaintext.
 	defer func() { _ = rc.Close() }()
 	return decodeRaw(br, hash, dst)
 }
 
-// copyVerify streams src into dst, hashing via the shared object-hash primitive so
-// restore verifies by the exact same digest rule as backup (hash.go). If limit > 0
-// it caps the copy and returns overCap=true past it (decompression-bomb protection
-// on the zstd path); limit <= 0 is uncapped (the RAW path — the stored bytes ARE the
-// object, no amplification, so a legitimately-large object must not be rejected).
 // ctxReader makes a Read loop cancellable: it returns ctx.Err() before each Read so a
-// long local-file read (the pre-existing-intact check) honors SIGINT/SIGTERM.
+// long source read (a filesystem restore, the pre-existing-intact check) honors
+// SIGINT/SIGTERM rather than running to completion (os.File.Read ignores ctx).
 type ctxReader struct {
 	ctx context.Context
 	r   io.Reader
@@ -139,6 +137,11 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+// copyVerify streams src into dst, hashing via the shared object-hash primitive so
+// restore verifies by the exact same digest rule as backup (hash.go). If limit > 0 it
+// caps the copy and returns overCap=true past it (decompression-bomb protection on the
+// zstd path); limit <= 0 is uncapped (the RAW path — the stored bytes ARE the object, no
+// amplification, so a legitimately-large object must not be rejected).
 func copyVerify(dst io.Writer, src io.Reader, want string, limit int64) (overCap bool, err error) {
 	h := newHash()
 	rdr := src

@@ -116,12 +116,12 @@ func serve(cfgPath string) error {
 	// config.Load guarantees both DSNs and >=1 target — no silent no-op mode.
 	// Size for: 1 permanent LISTEN + up to Concurrency in-flight bookkeeping +
 	// health + margin, so a NOTIFY burst can't starve MarkDone/Fail.
-	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), int32(cfg.Concurrency)+8) //nolint:gosec // Concurrency is a small operator-set value
+	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(8))
 	if err != nil {
 		return fmt.Errorf("alkemio pool: %w", err)
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is a small operator-set value
+	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
 	if err != nil {
 		return fmt.Errorf("ledger pool: %w", err)
 	}
@@ -250,7 +250,7 @@ func ledgerJob(ctx context.Context, cfgPath string) (*db.LedgerRepo, *db.Pool, [
 	if err := cfg.ValidateTargets(); err != nil {
 		return nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
-	pool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	pool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("ledger pool: %w", err)
 	}
@@ -306,12 +306,12 @@ func runBackfill(args []string) error {
 	ctx, stop := signalContext()
 	defer stop()
 
-	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(4))
 	if err != nil {
 		return fmt.Errorf("alkemio pool: %w", err)
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
 	if err != nil {
 		return fmt.Errorf("ledger pool: %w", err)
 	}
