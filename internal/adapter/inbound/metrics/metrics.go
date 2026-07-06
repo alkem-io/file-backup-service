@@ -68,7 +68,7 @@ func New() *Metrics {
 		}),
 		lastSuccessAge: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_last_success_age_seconds",
-			Help: "Seconds since the most recent verified backup (0 until the first).",
+			Help: "Age of the STALEST target's most recent verified backup (max over targets; pessimistic so one lagging target drives it unhealthy). 0 until the first.",
 		}),
 		underReplicated: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_under_replicated_objects",

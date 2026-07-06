@@ -146,15 +146,22 @@ func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int
 	return n, nil
 }
 
-// LastVerifiedAge returns seconds since the most recent per-target verify (FR-026's
-// last-successful-backup-age signal). ok=false when nothing has been verified yet.
+// LastVerifiedAge returns the age (seconds) of the STALEST target's most recent verify
+// — the max over targets of now()-max(verifiedAt) (FR-026's RPO signal). It is
+// PESSIMISTIC on purpose: a global max(verifiedAt) reads healthy while a single target
+// (e.g. the immutable off-site copy) silently receives nothing, because another target's
+// traffic keeps the global max current. Aggregating per-target and taking the worst
+// makes one lagging target drive the signal unhealthy. ok=false when nothing verified yet.
 func (r *LedgerRepo) LastVerifiedAge(ctx context.Context) (ageSec float64, ok bool, err error) {
-	const q = `SELECT EXTRACT(EPOCH FROM now() - max("verifiedAt")) FROM file_backup_target_status`
+	const q = `SELECT EXTRACT(EPOCH FROM max(now() - mv)) FROM (
+	  SELECT max("verifiedAt") AS mv FROM file_backup_target_status
+	  WHERE state = 'stored' GROUP BY target
+	) t`
 	var age *float64
 	if err := r.p.QueryRow(ctx, q).Scan(&age); err != nil {
 		return 0, false, fmt.Errorf("last verified age: %w", err)
 	}
-	if age == nil { // no verified rows yet
+	if age == nil { // no verified rows yet on any target
 		return 0, false, nil
 	}
 	return *age, true, nil

@@ -13,14 +13,18 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
-// maxRestoreBytes is the maximum decoded PLAINTEXT size the restore/verify path
-// accepts, on BOTH the raw and zstd paths. It bounds a corrupt/tampered stream (a
-// decompression bomb, or an oversized raw blob from a compromised target) so it can't
-// fill the DR host disk before the hash check fails. It is the effective supported
-// object size: an object whose plaintext exceeds it is unrestorable even if it backed
-// up, so raise it deliberately if the corpus ever needs larger objects. A var (not a
-// const) only so tests can lower it to exercise the over-cap paths.
-var maxRestoreBytes int64 = 64 << 30 // 64 GiB
+// MaxObjectBytes is the maximum plaintext object size the service supports END TO END:
+// the restore/verify decode cap AND the object size every sink must admit. It is ONE
+// policy so a sink's own ceiling can't silently fall below the restore cap — e.g. the S3
+// sink sizes its multipart parts from this so the 10,000-part limit doesn't reject an
+// object that a filesystem target accepted (which would perpetually retry + dead-letter).
+// Raise it deliberately if the corpus ever needs larger objects.
+const MaxObjectBytes int64 = 64 << 30 // 64 GiB
+
+// maxRestoreBytes bounds the decoded PLAINTEXT on BOTH the raw and zstd restore paths
+// (bomb / oversized-blob protection). It is MaxObjectBytes as a var only so tests can
+// lower it to exercise the over-cap paths.
+var maxRestoreBytes = MaxObjectBytes
 
 // zstdMagic is the zstd frame magic (RFC 8878). A stored object is zstd iff it
 // begins with these bytes — so a 4-byte peek picks the codec without a probe write.
