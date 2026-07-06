@@ -20,11 +20,14 @@ type Metrics struct {
 	bytes      *prometheus.CounterVec
 	deadletter prometheus.Counter
 	timeout    prometheus.Counter
+	sourceGone prometheus.Counter
 	// RPO/lag gauges — the alerting spine (FR-026/SC-001). Set periodically by the
 	// serve sampler, not on the per-object path.
 	backlogPending   prometheus.Gauge
 	oldestPendingAge prometheus.Gauge
 	lastSuccessAge   prometheus.Gauge
+	underReplicated  prometheus.Gauge // objects not yet stored on every target (coverage)
+	sampleErrors     prometheus.Counter
 }
 
 // New builds a Metrics with its own registry.
@@ -50,6 +53,10 @@ func New() *Metrics {
 			Name: "filebackup_object_timeout_total",
 			Help: "Objects that hit the per-object timeout (a slow or wedged target).",
 		}),
+		sourceGone: f.NewCounter(prometheus.CounterOpts{
+			Name: "filebackup_source_gone_total",
+			Help: "Entries skipped because the source object was absent (404/410) — a mass spike means a wrong fileServiceBase, not benign deletions.",
+		}),
 		backlogPending: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_outbox_pending", Help: "Outbox entries awaiting backup (backlog depth).",
 		}),
@@ -60,6 +67,14 @@ func New() *Metrics {
 		lastSuccessAge: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_last_success_age_seconds",
 			Help: "Seconds since the most recent verified backup (0 until the first).",
+		}),
+		underReplicated: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_under_replicated_objects",
+			Help: "Objects not yet stored on every configured target — coverage backstop that a dead-lettered object (drained from the backlog) can't hide from.",
+		}),
+		sampleErrors: f.NewCounter(prometheus.CounterOpts{
+			Name: "filebackup_metrics_sample_errors_total",
+			Help: "Failed RPO/coverage sampling passes — alert on rate>0 so a frozen (stale-green) gauge is itself detectable.",
 		}),
 	}
 }
@@ -72,6 +87,12 @@ func (m *Metrics) SetBacklog(pending int, oldestAgeSec float64) {
 
 // SetLastSuccessAge records seconds since the most recent verified backup.
 func (m *Metrics) SetLastSuccessAge(ageSec float64) { m.lastSuccessAge.Set(ageSec) }
+
+// SetUnderReplicated records the count of objects not stored on every target.
+func (m *Metrics) SetUnderReplicated(n int) { m.underReplicated.Set(float64(n)) }
+
+// SampleError records a failed sampling pass so a frozen gauge is alertable.
+func (m *Metrics) SampleError() { m.sampleErrors.Inc() }
 
 // ObjectStored implements domain.Metrics.
 func (m *Metrics) ObjectStored(target string, storedBytes int64) {
@@ -94,6 +115,9 @@ func (m *Metrics) DeadLetter() { m.deadletter.Inc() }
 // alertable signal of a slow/wedged target (a wedge otherwise only shows as a
 // slowly-climbing go_goroutines from abandoned stores).
 func (m *Metrics) ObjectTimeout() { m.timeout.Inc() }
+
+// SourceGone records an entry skipped because its source object was absent.
+func (m *Metrics) SourceGone() { m.sourceGone.Inc() }
 
 // Handler returns the Prometheus HTTP handler.
 func (m *Metrics) Handler() http.Handler {

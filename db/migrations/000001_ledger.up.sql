@@ -17,3 +17,12 @@ CREATE TABLE file_backup_target_status (
     "verifiedAt"  TIMESTAMPTZ,
     PRIMARY KEY ("externalID", target)
 );
+
+-- The RPO sampler reads max("verifiedAt") every 15s; without this it's a full-table
+-- scan that degrades linearly with the corpus.
+CREATE INDEX file_backup_target_status_verified_idx
+    ON file_backup_target_status ("verifiedAt" DESC);
+
+-- Per-target manifest / audit stream the objects stored on one target.
+CREATE INDEX file_backup_target_status_target_state_idx
+    ON file_backup_target_status (target, state);

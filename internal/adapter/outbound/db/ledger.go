@@ -128,6 +128,24 @@ func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn fun
 	return rows.Err()
 }
 
+// CoverageGaps counts objects NOT stored on every configured target — the coverage
+// backstop gauge (a dead-lettered object leaves the pending backlog but is still
+// under-replicated, invisible to the backlog/lag gauges). Same filter as TargetGaps.
+func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int, error) {
+	const q = `SELECT count(*) FROM (
+	  SELECT o."externalID"
+	  FROM file_backup_object o
+	  LEFT JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
+	  GROUP BY o."externalID"
+	  HAVING count(*) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)) < $1
+	) g`
+	var n int
+	if err := r.p.QueryRow(ctx, q, len(allTargets), allTargets).Scan(&n); err != nil {
+		return 0, fmt.Errorf("coverage gaps: %w", err)
+	}
+	return n, nil
+}
+
 // LastVerifiedAge returns seconds since the most recent per-target verify (FR-026's
 // last-successful-backup-age signal). ok=false when nothing has been verified yet.
 func (r *LedgerRepo) LastVerifiedAge(ctx context.Context) (ageSec float64, ok bool, err error) {

@@ -160,6 +160,7 @@ func serve(cfgPath string) error {
 		PerObjectTimeout: cfg.PerObjectTimeout(),
 		OnDeadLetter:     mx.DeadLetter,
 		OnObjectTimeout:  mx.ObjectTimeout,
+		OnSourceGone:     mx.SourceGone,
 		Logger:           logger,
 	})
 
@@ -167,8 +168,9 @@ func serve(cfgPath string) error {
 	// pool Close defers above): the RPO/lag gauges (FR-026) and the periodic ledger
 	// snapshot to each target (FR-015, standalone-restorability).
 	var bgWG sync.WaitGroup
-	bgWG.Add(2)
+	bgWG.Add(3)
 	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, mx) }()
+	go func() { defer bgWG.Done(); sampleCoverage(ctx, ledger, targets, mx) }()
 	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger) }()
 	defer bgWG.Wait()
 
@@ -323,21 +325,15 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 	return nil, fmt.Errorf("target %q not found in config", name)
 }
 
-// sampleRPO periodically refreshes the backlog/lag/last-success gauges until ctx is
-// cancelled. Best-effort: a failed sample is skipped (the counters still flow), and a
-// slow query is bounded so it can't wedge shutdown.
-func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, mx *metrics.Metrics) {
-	const every = 15 * time.Second
-	t := time.NewTicker(every)
+// everyTick runs fn immediately and then every interval until ctx is cancelled. Each
+// fn call gets a timeout-bounded child ctx (derived from ctx, so shutdown aborts it)
+// so a slow pass can't wedge shutdown. The shared skeleton for the background samplers.
+func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(context.Context)) {
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if pending, ageSec, err := outbox.BacklogStats(sctx); err == nil {
-			mx.SetBacklog(pending, ageSec)
-		}
-		if ageSec, ok, err := ledger.LastVerifiedAge(sctx); err == nil && ok {
-			mx.SetLastSuccessAge(ageSec)
-		}
+		fctx, cancel := context.WithTimeout(ctx, timeout)
+		fn(fctx)
 		cancel()
 		select {
 		case <-ctx.Done():
@@ -347,53 +343,94 @@ func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo
 	}
 }
 
+// sampleRPO refreshes the backlog/lag/last-success gauges (FR-026). A failed pass
+// increments the sample-error counter (alert on rate>0) so a frozen, stale-green gauge
+// is itself detectable, rather than silently holding its last value.
+func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, mx *metrics.Metrics) {
+	everyTick(ctx, 15*time.Second, 5*time.Second, func(fctx context.Context) {
+		failed := false
+		if pending, ageSec, err := outbox.BacklogStats(fctx); err == nil {
+			mx.SetBacklog(pending, ageSec)
+		} else {
+			failed = true
+		}
+		if ageSec, ok, err := ledger.LastVerifiedAge(fctx); err != nil {
+			failed = true
+		} else if ok {
+			mx.SetLastSuccessAge(ageSec)
+		}
+		if failed {
+			mx.SampleError()
+		}
+	})
+}
+
+// sampleCoverage refreshes the under-replication gauge on a coarse cadence (the count
+// is a full-ledger scan, so not every 15s) — the coverage backstop a dead-lettered
+// object can't hide from.
+func sampleCoverage(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, mx *metrics.Metrics) {
+	names := make([]string, len(targets))
+	for i, t := range targets {
+		names[i] = t.Sink.Name()
+	}
+	everyTick(ctx, 5*time.Minute, 30*time.Second, func(fctx context.Context) {
+		if n, err := ledger.CoverageGaps(fctx, names); err == nil {
+			mx.SetUnderReplicated(n)
+		} else {
+			mx.SampleError()
+		}
+	})
+}
+
 // manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),
-// starting immediately, until ctx is cancelled. Best-effort: a failed snapshot is
-// logged, not fatal (a target's manifest is a DR convenience, not the backup itself).
+// starting immediately. Best-effort: a failed snapshot is logged, not fatal (a target's
+// manifest is a DR convenience, not the backup itself).
 func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, every time.Duration, logger *zap.Logger) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		// Generous bound for a full ledger dump; derived from ctx so shutdown aborts it.
-		mctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-		if err := domain.WriteManifests(mctx, ledger, targets, domain.ManifestName(time.Now())); err != nil && ctx.Err() == nil {
+	everyTick(ctx, every, 30*time.Minute, func(fctx context.Context) {
+		if err := domain.WriteManifests(fctx, ledger, targets, domain.ManifestName(time.Now())); err != nil && ctx.Err() == nil {
 			logger.Warn("manifest snapshot", zap.Error(err))
 		}
-		cancel()
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
+	})
 }
 
 // startupChecks fails serve loudly if any dependency is unusable: the outbox (scoped
 // role reads the schema + holds the UPDATE grant), the ledger (schema/migrate), and
 // every target sink (creds/bucket/path). Bounded by a deadline so a hung dial fails
-// fast; the sink preflights (independent RTTs) run concurrently.
+// fast. All checks run CONCURRENTLY (they hit independent pools/endpoints), each with a
+// recover so a driver panic in one is reported, not a crash.
 func startupChecks(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := outbox.Probe(ctx); err != nil {
-		return fmt.Errorf("outbox not accessible (scoped role / schema?): %w", err)
+
+	type check struct {
+		name string
+		fn   func(context.Context) error
 	}
-	if err := outbox.CheckWriteGrant(ctx); err != nil {
-		return fmt.Errorf("outbox not writable: %w", err)
+	checks := make([]check, 0, 3+len(targets))
+	checks = append(checks,
+		check{"outbox not accessible (scoped role / schema?)", outbox.Probe},
+		check{"outbox not writable", outbox.CheckWriteGrant},
+		check{"ledger not accessible (schema / migrate?)", ledger.Probe},
+	)
+	for _, t := range targets {
+		checks = append(checks, check{"target " + t.Sink.Name() + " preflight", t.Sink.Preflight})
 	}
-	if err := ledger.Probe(ctx); err != nil {
-		return fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
-	}
-	errs := make([]error, len(targets))
+
+	errs := make([]error, len(checks))
 	var wg sync.WaitGroup
-	for i, t := range targets {
+	for i, c := range checks {
 		wg.Add(1)
-		go func(i int, t domain.Target) {
+		go func(i int, c check) {
 			defer wg.Done()
-			if err := t.Sink.Preflight(ctx); err != nil {
-				errs[i] = fmt.Errorf("target %s preflight: %w", t.Sink.Name(), err)
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = fmt.Errorf("%s panicked: %v", c.name, r)
+				}
+			}()
+			if err := c.fn(ctx); err != nil {
+				errs[i] = fmt.Errorf("%s: %w", c.name, err)
 			}
-		}(i, t)
+		}(i, c)
 	}
 	wg.Wait()
 	return errors.Join(errs...)

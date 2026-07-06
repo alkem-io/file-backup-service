@@ -45,6 +45,14 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		wg.Add(1)
 		go func(i int, p Prober) {
 			defer wg.Done()
+			// A driver panic in Probe must report unusable, not crash the serve process:
+			// this goroutine is spawned per readiness scrape, and chi's Recoverer only
+			// wraps the request goroutine, not its children.
+			defer func() {
+				if r := recover(); r != nil {
+					details[i] = "unusable"
+				}
+			}()
 			if p == nil { // a missing dependency is UNHEALTHY, never silently skipped
 				details[i] = "not configured"
 				return

@@ -39,6 +39,9 @@ type Deps struct {
 	// OnObjectTimeout is called when an object hits the per-object timeout (a
 	// slow/wedged target, as distinct from a graceful shutdown) (optional).
 	OnObjectTimeout func()
+	// OnSourceGone is called when the source object is absent (file-service 404/410)
+	// and the entry is skipped — so a mass skip is visible, not a silent drop (optional).
+	OnSourceGone func()
 	// Logger is the structured logger.
 	Logger *zap.Logger
 }
@@ -195,7 +198,12 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 		}
 	case errors.Is(err, domain.ErrSourceGone):
 		// The source was deleted before we could back it up — benign and terminal.
-		// Skip it so it doesn't burn ~10 retries and page on a non-problem.
+		// Skip it so it doesn't burn ~10 retries and page on a non-problem. Emit a
+		// metric so a MASS skip (e.g. a wrong fileServiceBase 404ing every path) is
+		// visible/alertable rather than a silent, invisible drop to zero coverage.
+		if c.d.OnSourceGone != nil {
+			c.d.OnSourceGone()
+		}
 		c.d.Logger.Info("source gone, skipping", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID))
 		if serr := c.d.Outbox.Skip(bctx, e.ID); serr != nil {
 			c.d.Logger.Error("skip vanished source", zap.Int64("id", e.ID), zap.Error(serr))
