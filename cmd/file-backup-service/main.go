@@ -51,6 +51,11 @@ func main() {
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
+	case "audit":
+		err = runAudit(args)
+		if errors.Is(err, context.Canceled) {
+			err = nil
+		}
 	case "backfill", "drill":
 		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
 		os.Exit(1)
@@ -225,6 +230,35 @@ func runVerify(args []string) error {
 		})
 }
 
+// ledgerJob opens config for a ledger-DB-only subcommand (reconcile/audit): it
+// validates the targets (not the full serve config — these run in the DR state without
+// file-service / the outbox DB), opens + probes the ledger pool, and builds the sinks.
+// The caller MUST close the returned pool.
+func ledgerJob(ctx context.Context, cfgPath string) (*db.LedgerRepo, *db.Pool, []domain.Target, error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load config: %w", err)
+	}
+	if err := cfg.ValidateTargets(); err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid config: %w", err)
+	}
+	pool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("ledger pool: %w", err)
+	}
+	ledger := db.NewLedgerRepo(pool)
+	if err := ledger.Probe(ctx); err != nil {
+		pool.Close()
+		return nil, nil, nil, fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
+	}
+	targets, err := buildTargets(cfg.Targets)
+	if err != nil {
+		pool.Close()
+		return nil, nil, nil, err
+	}
+	return ledger, pool, targets, nil
+}
+
 // runReconcile repairs under-replicated objects target-to-target (FR-025/T029): for
 // each object the ledger shows not stored on every target, fetch it from a target that
 // has it and re-fan-out to the missing ones. Needs only the ledger DB + the targets.
@@ -233,34 +267,38 @@ func runReconcile(args []string) error {
 	cfgPath := fs.String("config", "config.yaml", "config file")
 	ratePerSec := fs.Int("rate", 0, "max repairs per second (0 = unlimited)")
 	_ = fs.Parse(args)
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-	// Only the targets need validating — reconcile is target-to-target and never touches
-	// fileServiceBase or the outbox DB (so it runs in the DR state it exists for). The
-	// ledger DSN is checked by NewPool + ledger.Probe below.
-	if err := cfg.ValidateTargets(); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
-	}
 	ctx, stop := signalContext()
 	defer stop()
-
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
-	if err != nil {
-		return fmt.Errorf("ledger pool: %w", err)
-	}
-	defer ledgerPool.Close()
-	ledger := db.NewLedgerRepo(ledgerPool)
-	if err := ledger.Probe(ctx); err != nil {
-		return fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
-	}
-	targets, err := buildTargets(cfg.Targets)
+	ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
+	defer pool.Close()
 	st, err := domain.NewReconciler(ledger, targets).Run(ctx, *ratePerSec)
 	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d\n", st.Repaired, st.Skipped, st.Failed)
+	return err
+}
+
+// runAudit verifies the ledger against reality (FR-014/T030): for a sample per target,
+// confirm the target actually still holds what the ledger records as stored. A nonzero
+// 'missing' count means silent loss on a target — a nonzero exit so cron/CI can alert.
+func runAudit(args []string) error {
+	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "config file")
+	sample := fs.Int("sample", 0, "objects to check per target (0 = all)")
+	_ = fs.Parse(args)
+	ctx, stop := signalContext()
+	defer stop()
+	ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	rep, err := domain.Audit(ctx, ledger, targets, *sample)
+	fmt.Printf("audit: checked=%d missing=%d errors=%d\n", rep.Checked, rep.Missing, rep.Errors)
+	if err == nil && rep.Missing > 0 {
+		err = fmt.Errorf("%d ledger-stored objects are missing from their target", rep.Missing)
+	}
 	return err
 }
 
@@ -426,5 +464,5 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: file-backup-service <serve|migrate|restore|verify|backfill|reconcile|drill> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: file-backup-service <serve|migrate|restore|verify|reconcile|audit|backfill|drill> [flags]")
 }
