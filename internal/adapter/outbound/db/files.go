@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
@@ -18,33 +19,54 @@ type FileRepo struct{ p *Pool }
 // NewFileRepo binds a FileRepo to the alkemio pool.
 func NewFileRepo(p *Pool) *FileRepo { return &FileRepo{p: p} }
 
-// EachFile streams every non-temporary file as a domain.OutboxEntry (the backfill
-// work-list), ordered by id for a stable, resumable pass. temporaryLocation files are
-// excluded — mid-upload staging the producer also never enqueues (data-model §1).
-// Streaming (not ReadAll) keeps memory bounded across the whole corpus.
+// EachFile invokes fn for every non-temporary file (the backfill work-list), ordered by
+// id for a stable, resumable pass. It KEYSET-PAGES the `file` table (id > after ORDER BY
+// id LIMIT), releasing the pool connection between pages — a backfill runs the full
+// rate-limited BackupOne per object, so a held cursor would pin one connection + an open
+// snapshot on the SHARED production Alkemio DB for the whole (hours-to-days) pass,
+// holding back xmin and blocking autovacuum. Paging keeps each query short.
+// temporaryLocation IS NOT TRUE (not "= FALSE") so a NULL never silently drops a file.
 func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) error) error {
-	// Native uuid: id → OutboxEntry.FileID (uuid.UUID), createdBy → CreatedBy
-	// (uuid.NullUUID) — pgx scans both directly, no ::text. temporaryLocation IS NOT TRUE
-	// (not "= FALSE") so a NULL never silently drops a real object from the sweep.
+	after := uuid.Nil // the zero uuid sorts first; no real file.id is nil (gen_random_uuid)
+	for {
+		page, err := r.filesPage(ctx, after, dbPageSize)
+		if err != nil {
+			return err
+		}
+		for i := range page {
+			if err := fn(page[i]); err != nil {
+				return err
+			}
+		}
+		if len(page) < dbPageSize {
+			return nil // a short page is the last
+		}
+		after = page[len(page)-1].FileID
+	}
+}
+
+// filesPage returns one keyset page of non-temporary files after `after` (id order).
+func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([]domain.OutboxEntry, error) {
+	// Native uuid: id → FileID, createdBy → CreatedBy (pgx scans both directly). The `file`
+	// PK on id serves the id > $1 ORDER BY id keyset.
 	const q = `SELECT id, "externalID", "createdBy", "createdDate", size
-	FROM file WHERE "temporaryLocation" IS NOT TRUE ORDER BY id`
-	rows, err := r.p.Query(ctx, q)
+	FROM file WHERE "temporaryLocation" IS NOT TRUE AND id > $1 ORDER BY id LIMIT $2`
+	rows, err := r.p.Query(ctx, q, after, limit)
 	if err != nil {
-		return fmt.Errorf("stream files: %w", err)
+		return nil, fmt.Errorf("files page: %w", err)
 	}
 	defer rows.Close()
+	out := make([]domain.OutboxEntry, 0, limit)
 	for rows.Next() {
 		var e domain.OutboxEntry
 		var createdDate pgtype.Timestamptz
 		if err := rows.Scan(&e.FileID, &e.ExternalID, &e.CreatedBy, &createdDate, &e.Size); err != nil {
-			return fmt.Errorf("scan file: %w", err)
+			return nil, fmt.Errorf("scan file: %w", err)
 		}
 		e.CreatedDate = nullTime(createdDate)
-		if err := fn(e); err != nil {
-			return err
-		}
+		out = append(out, e)
 	}
-	return rows.Err()
+	return out, rows.Err()
 }
 
 // Probe verifies the `file` table is readable via the pool's scoped role, so a missing

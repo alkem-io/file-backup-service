@@ -97,37 +97,66 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 	return out, rows.Err()
 }
 
-// TargetGaps streams objects NOT stored on every configured target, with the set of
-// CURRENT targets that DO hold each — the reconcile work-list. An object stored on all
-// of allTargets is excluded; stale statuses for removed targets are ignored (the
-// count + agg filter to allTargets).
+// TargetGaps invokes fn for every object NOT stored on every configured target, with the
+// set of CURRENT targets that DO hold each — the reconcile work-list. It KEYSET-PAGES by
+// externalID, releasing the ledger connection between pages: reconcile runs the full
+// per-object repair (fetch + decode-to-tempfile + fan-out + nested ledger writes) inside
+// fn, so a held cursor would pin a connection + an open snapshot for the whole multi-hour
+// pass (blocking VACUUM on the ledger). An object stored on all of allTargets is excluded;
+// stale statuses for removed targets are ignored (the count/agg filter to allTargets).
 func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
+	after := ""
+	for {
+		page, err := r.targetGapsPage(ctx, allTargets, after, dbPageSize)
+		if err != nil {
+			return err
+		}
+		for i := range page {
+			if err := fn(page[i].externalID, page[i].stored); err != nil {
+				return err
+			}
+		}
+		if len(page) < dbPageSize {
+			return nil // a short page is the last
+		}
+		after = page[len(page)-1].externalID
+	}
+}
+
+type targetGap struct {
+	externalID string
+	stored     map[string]bool
+}
+
+// targetGapsPage returns one keyset page (externalID order) of under-replicated objects.
+func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, after string, limit int) ([]targetGap, error) {
 	const q = `SELECT o."externalID",
 	  COALESCE(array_agg(ts.target) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)), '{}')
 	FROM file_backup_object o
 	LEFT JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
+	WHERE o."externalID" > $3
 	GROUP BY o."externalID"
-	HAVING count(*) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)) < $1`
-	rows, err := r.p.Query(ctx, q, len(allTargets), allTargets)
+	HAVING count(*) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)) < $1
+	ORDER BY o."externalID" LIMIT $4`
+	rows, err := r.p.Query(ctx, q, len(allTargets), allTargets, after, limit)
 	if err != nil {
-		return fmt.Errorf("target gaps: %w", err)
+		return nil, fmt.Errorf("target gaps page: %w", err)
 	}
 	defer rows.Close()
+	out := make([]targetGap, 0, limit)
 	for rows.Next() {
-		var externalID string
+		var g targetGap
 		var storedList []string
-		if err := rows.Scan(&externalID, &storedList); err != nil {
-			return fmt.Errorf("scan gap: %w", err)
+		if err := rows.Scan(&g.externalID, &storedList); err != nil {
+			return nil, fmt.Errorf("scan gap: %w", err)
 		}
-		stored := make(map[string]bool, len(storedList))
+		g.stored = make(map[string]bool, len(storedList))
 		for _, t := range storedList {
-			stored[t] = true
+			g.stored[t] = true
 		}
-		if err := fn(externalID, stored); err != nil {
-			return err
-		}
+		out = append(out, g)
 	}
-	return rows.Err()
+	return out, rows.Err()
 }
 
 // CoverageGaps counts objects NOT stored on every configured target — the coverage
