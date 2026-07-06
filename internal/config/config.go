@@ -80,7 +80,9 @@ func (d DBConfig) DSN() string {
 	return u.String()
 }
 
-func (d DBConfig) validate(name string) error {
+// Validate checks the DB connection parts (host/user/dbName required, port in range).
+// name labels the errors (e.g. "ledgerDB"). Used by serve/full Validate and by migrate.
+func (d DBConfig) Validate(name string) error {
 	switch {
 	case d.Host == "":
 		return fmt.Errorf("%s.host is required", name)
@@ -284,10 +286,10 @@ func (c *Config) Validate() error {
 	if c.FileServiceBase == "" {
 		return errors.New("fileServiceBase is required")
 	}
-	if err := c.AlkemioDB.validate("alkemioDB"); err != nil {
+	if err := c.AlkemioDB.Validate("alkemioDB"); err != nil {
 		return err
 	}
-	if err := c.LedgerDB.validate("ledgerDB"); err != nil {
+	if err := c.LedgerDB.Validate("ledgerDB"); err != nil {
 		return err
 	}
 	if err := c.validateLimits(); err != nil {

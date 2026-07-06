@@ -11,8 +11,13 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
-// LedgerRepo implements domain.Ledger over the sqlc-generated queries (own DB),
-// plus one raw pgx CTE (RecordBackup) that sqlc's analyzer can't type.
+// LedgerRepo implements domain.Ledger over sqlc-generated queries plus a few hand-written
+// pgx queries that sqlc's model can't express (constitution §IV exceptions):
+//   - RecordBackup: a multi-arg unnest() CTE (sqlc's analyzer can't type it).
+//   - StoredObjectsPage / TargetGaps: array_agg / keyset streaming shapes returning a
+//     custom row set (TargetGaps also streams to bound memory).
+//   - CoverageGaps / LastVerifiedAge: aggregate scalars over a text[] target filter.
+//   - Probe: a schema-existence check, not a data query.
 type LedgerRepo struct {
 	p *Pool
 	q *queries.Queries
@@ -129,15 +134,22 @@ func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn fun
 
 // CoverageGaps counts objects NOT stored on every configured target — the coverage
 // backstop gauge (a dead-lettered object leaves the pending backlog but is still
-// under-replicated, invisible to the backlog/lag gauges). Same filter as TargetGaps.
+// under-replicated, invisible to the backlog/lag gauges). Computed as total objects
+// MINUS fully-replicated objects: the fully-replicated term scans only
+// file_backup_target_status (state='stored' AND target=ANY, GROUP BY externalID HAVING
+// count>=N), served by the (target,state,externalID) index at scale — avoiding the
+// LEFT JOIN + GROUP BY over the whole object heap this ran every 5 min. It MUST stay
+// consistent with TargetGaps' "stored on
+// target" predicate — TargetGaps streams the gap objects, CoverageGaps counts them; a
+// change to one's stored-on-target rule must change the other (see coverage integration test).
 func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int, error) {
-	const q = `SELECT count(*) FROM (
-	  SELECT o."externalID"
-	  FROM file_backup_object o
-	  LEFT JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
-	  GROUP BY o."externalID"
-	  HAVING count(*) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)) < $1
-	) g`
+	const q = `SELECT
+	  (SELECT count(*) FROM file_backup_object)
+	  - (SELECT count(*) FROM (
+	      SELECT "externalID" FROM file_backup_target_status
+	      WHERE state = 'stored' AND target = ANY($2)
+	      GROUP BY "externalID" HAVING count(*) >= $1
+	    ) fully)`
 	var n int
 	if err := r.p.QueryRow(ctx, q, len(allTargets), allTargets).Scan(&n); err != nil {
 		return 0, fmt.Errorf("coverage gaps: %w", err)

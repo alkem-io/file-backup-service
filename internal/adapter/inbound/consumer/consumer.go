@@ -255,8 +255,10 @@ func (c *Consumer) reap(ctx context.Context) {
 		// exists for is invisible to alerting.
 		if deadLettered > 0 {
 			c.d.Logger.Error("crash-loop dead-lettered", zap.Int("count", deadLettered))
-			for i := 0; i < deadLettered && c.d.OnDeadLetter != nil; i++ {
-				c.d.OnDeadLetter()
+			if c.d.OnDeadLetter != nil {
+				for i := 0; i < deadLettered; i++ {
+					c.d.OnDeadLetter()
+				}
 			}
 		}
 	}

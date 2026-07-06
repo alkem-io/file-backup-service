@@ -71,7 +71,7 @@ func ZstdReader(src io.Reader) io.ReadCloser {
 		// state, so it is dropped (GC'd), never returned to the pool.
 		defer func() {
 			if r := recover(); r != nil {
-				pw.CloseWithError(panicErr("zstd encode", r))
+				pw.CloseWithError(PanicErr("zstd encode", r))
 			}
 		}()
 		enc := zstdEncoderPool.Get().(*zstd.Encoder)

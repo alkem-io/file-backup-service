@@ -13,9 +13,10 @@ import (
 // full verified stream — it must never be recorded as "stored".
 var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stream")
 
-// panicErr renders a recovered panic as an error for the pipeline's per-target
-// recover guards (each lives on a different goroutine, so they can't share a defer).
-func panicErr(what string, r any) error {
+// PanicErr renders a recovered panic as an error — the one owner of the "<what>
+// panicked: <v>" convention, shared by the pipeline's per-target recover guards (each on
+// a different goroutine, so they can't share a defer) and the CLI's startup-check guard.
+func PanicErr(what string, r any) error {
 	return fmt.Errorf("%s panicked: %v", what, r)
 }
 
@@ -221,7 +222,7 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 			// on the other side of a goroutine boundary this recover can't reach).
 			defer func() {
 				if r := recover(); r != nil {
-					results[i] = targetResult{err: panicErr("sink "+t.Sink.Name(), r)}
+					results[i] = targetResult{err: PanicErr("sink "+t.Sink.Name(), r)}
 					_ = pr.CloseWithError(errAbortedBeforeEOF)
 				}
 			}()
@@ -312,7 +313,7 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, er *eofReader) ta
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				ch <- targetResult{err: panicErr("sink "+sink.Name(), rec)}
+				ch <- targetResult{err: PanicErr("sink "+sink.Name(), rec)}
 			}
 		}()
 		sn, serr := sink.Store(ctx, hash, er)

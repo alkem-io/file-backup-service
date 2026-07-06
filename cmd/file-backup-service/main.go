@@ -85,8 +85,8 @@ func runMigrate(cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.LedgerDB.Host == "" || cfg.LedgerDB.User == "" || cfg.LedgerDB.DBName == "" {
-		return errors.New("ledgerDB.host, ledgerDB.user and ledgerDB.dbName are required for migrate")
+	if err := cfg.LedgerDB.Validate("ledgerDB"); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
 	}
 	if err := db.Migrate(cfg.LedgerDB.DSN()); err != nil {
 		return err
@@ -489,7 +489,7 @@ func runChecks(ctx context.Context, checks []startCheck) []error {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					errs[i] = fmt.Errorf("%s panicked: %v", c.name, r)
+					errs[i] = domain.PanicErr(c.name, r)
 				}
 			}()
 			if err := c.fn(ctx); err != nil {
