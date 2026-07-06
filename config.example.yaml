@@ -30,7 +30,7 @@ concurrency: 8            # FBS_CONCURRENCY
 perObjectTimeoutSec: 1800 # per-object backup deadline (FBS_PEROBJECTTIMEOUTSEC)
 staleTTLSec: 3600         # must exceed perObjectTimeoutSec (FBS_STALETTLSEC)
 metricsPort: 4004         # FBS_METRICSPORT
-circuitThreshold: 5       # consecutive per-target failures that trip its circuit open (T017a; FBS_CIRCUITTHRESHOLD)
+circuitThreshold: 5       # per-target failures within the last 2x this many outcomes that trip its circuit (T017a; FBS_CIRCUITTHRESHOLD)
 circuitCooldownSec: 60    # how long a tripped target's circuit stays open before a probe (FBS_CIRCUITCOOLDOWNSEC)
 fanoutStallSec: 60        # a target not draining a fan-out chunk in this long is dropped as hung (FBS_FANOUTSTALLSEC)
 # scratchDir: /scratch    # reconcile stages a decoded object here (FBS_SCRATCHDIR); "" = OS temp. Point at a SIZED volume.

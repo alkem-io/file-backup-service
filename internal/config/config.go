@@ -116,7 +116,7 @@ type Config struct {
 	MaxAttempts         int      `yaml:"maxAttempts"`        // genuine-failure dead-letter threshold (FR-029)
 	MaxDeliveries       int      `yaml:"maxDeliveries"`      // crash-loop dead-letter threshold (FR-029)
 	ManifestEverySec    int      `yaml:"manifestEverySec"`   // ledger-snapshot cadence to each target (FR-015)
-	CircuitThreshold    int      `yaml:"circuitThreshold"`   // consecutive per-target failures that trip its circuit open (T017a)
+	CircuitThreshold    int      `yaml:"circuitThreshold"`   // per-target failures within the last 2x this many outcomes that trip its circuit open (T017a)
 	CircuitCooldownSec  int      `yaml:"circuitCooldownSec"` // how long a tripped target's circuit stays open before a probe half-opens it
 	FanoutStallSec      int      `yaml:"fanoutStallSec"`     // per-chunk drain deadline: a target not consuming a fan-out chunk in this long is dropped (hung-sink isolation)
 	// ScratchDir is where reconcile stages a decoded object before re-fanning it out.
@@ -264,7 +264,7 @@ func (c *Config) applyDefaults() {
 		c.ManifestEverySec = 24 * 60 * 60 // daily
 	}
 	if c.CircuitThreshold <= 0 {
-		c.CircuitThreshold = 5 // trip a target's circuit after 5 consecutive failures
+		c.CircuitThreshold = 5 // trip a target's circuit at 5 failures within its last 10 outcomes
 	}
 	if c.CircuitCooldownSec <= 0 {
 		c.CircuitCooldownSec = 60 // re-probe a down target once a minute
@@ -364,9 +364,9 @@ func (c *Config) ValidateTargets() error {
 }
 
 // PoolSize returns a pgx pool max-conns of Concurrency + headroom, CLAMPED to a sane
-// range. serve validates Concurrency (errors on >1024), but the DR subcommands
-// (reconcile/audit) only validate targets, so this clamp is their safety net — it makes
-// the int32 conversion provably non-overflowing on every path, not just serve's.
+// range. Both serve (Validate) and the DR subcommands (ValidateDR) run validateLimits,
+// which rejects Concurrency>1024 — so this clamp is a belt-and-suspenders guard that makes
+// the int32 conversion provably non-overflowing at the call site regardless of validation.
 func (c *Config) PoolSize(headroom int) int32 {
 	n := c.Concurrency
 	if n < 1 {

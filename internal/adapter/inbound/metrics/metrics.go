@@ -70,11 +70,11 @@ func New() *Metrics {
 		}),
 		lastSuccessAge: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_last_success_age_seconds",
-			Help: "Age of the STALEST target's most recent verified backup (max over targets; pessimistic so one lagging target drives it unhealthy). 0 until the first.",
+			Help: "Age of the STALEST target's most recent verified backup (max over targets; one lagging target drives it). It is time-since-last-NEW-store, so it climbs during a quiet or all-duplicate period even when fully replicated — ALERT ON IT TOGETHER WITH filebackup_outbox_pending>0 (real lag = work exists AND isn't getting done). 0 until the first.",
 		}),
 		underReplicated: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_under_replicated_objects",
-			Help: "Objects not yet stored on every configured target — coverage backstop that a dead-lettered object (drained from the backlog) can't hide from.",
+			Help: "Objects with a ledger row not yet stored on every configured target — the coverage backstop for a partially-stored object that dead-lettered (drained from the backlog). A source-poison object that NEVER stored has no ledger row and shows only in filebackup_deadletter_total, so alert on both.",
 		}),
 		neverVerified: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_targets_never_verified",

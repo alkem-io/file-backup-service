@@ -15,6 +15,12 @@ import (
 // truth for backfill (US2/T022): the authoritative list of what SHOULD be backed up,
 // including objects created before this service (which the outbox never carried).
 // Read-only; the scoped role needs SELECT on `file` (Probe fails loud if it doesn't).
+//
+// Constitution §IV waiver (as with OutboxRepo): these queries are hand-written pgx, not
+// sqlc. `file` is a FOREIGN, server-owned table in the Alkemio DB — NOT in this repo's
+// ledger migrations that sqlc's schema points at — so sqlc has no schema to type it. The
+// column-covering Probe is the compensating control (a server-side schema drift fails at
+// startup, not mid-backfill).
 type FileRepo struct{ p *Pool }
 
 // NewFileRepo binds a FileRepo to the alkemio pool.
