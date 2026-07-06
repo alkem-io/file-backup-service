@@ -73,25 +73,19 @@ func (s *Sink) prefixed(key string) string { return path.Join(s.prefix, key) }
 
 func (s *Sink) key(hash string) string { return s.prefixed(fsutil.ShardKey(hash)) }
 
-// Preflight checks the target is reachable at startup rather than dead-lettering
-// every object. BucketExists returns (true,nil) when the bucket exists and is
-// introspectable, (false,nil) when it is MISSING, and an error when unreachable or
-// access-denied. Note the limit: BucketExists is a HEAD, which has no body for
-// minio-go to read the real S3 code from, so every 403 (a write-only WORM cred, a
-// wrong secret, or a wrong key) collapses to "AccessDenied" — those are
-// indistinguishable here and can only be caught by an actual write. So this catches
-// the common misconfigs loudly (missing/typo'd bucket, unreachable endpoint, wrong
-// region that isn't 403) and treats any 403 as "reachable, write-only".
+// Preflight validates the target end-to-end at startup rather than dead-lettering
+// every object. It does a sentinel 0-byte PutObject — the ONLY operation that
+// exercises a PutObject-only WORM credential (creds + region + SSE + write grant +
+// bucket existence). BucketExists (a HEAD) can't: a write-only cred can't HEAD, and a
+// HEAD 403 is indistinguishable from a wrong secret (no response body for the real
+// code). A PUT's error DOES carry the real S3 code, so a wrong cred / missing bucket /
+// bad region all fail loudly. The key is unique per run so object-lock can't reject an
+// overwrite on restart; these tiny objects live under the reserved fsutil.PreflightKey
+// prefix (reconcile/audit skip it) and expire with the bucket's retention.
 func (s *Sink) Preflight(ctx context.Context) error {
-	ok, err := s.client.BucketExists(ctx, s.bucket)
-	if err != nil {
-		if minio.ToErrorResponse(err).Code == "AccessDenied" {
-			return nil // 403: write-only WORM cred (or an unverifiable wrong cred) — reachable
-		}
-		return fmt.Errorf("s3 preflight %q (creds/region/endpoint?): %w", s.name, err)
-	}
-	if !ok {
-		return fmt.Errorf("s3 preflight %q: bucket %q does not exist", s.name, s.bucket)
+	key := s.prefixed(fsutil.PreflightKey())
+	if _, err := s.client.PutObject(ctx, s.bucket, key, bytes.NewReader(nil), 0, s.opts); err != nil {
+		return fmt.Errorf("s3 preflight %q (creds/region/bucket/write-grant?): %w", s.name, err)
 	}
 	return nil
 }

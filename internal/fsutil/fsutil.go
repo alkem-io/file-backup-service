@@ -6,11 +6,35 @@ package fsutil
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
+	"time"
 )
+
+const (
+	manifestPrefix  = "_manifest"
+	preflightPrefix = "_preflight"
+)
+
+// PreflightKey returns a unique reserved key for a startup write-probe object. It is
+// unique per run so an object-lock/WORM bucket can't reject an overwrite on restart.
+func PreflightKey() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:]) //nolint:errcheck // rand.Read never fails; the value only needs to be unique-ish
+	return path.Join(preflightPrefix, fmt.Sprintf("%d-%s", time.Now().UTC().UnixNano(), hex.EncodeToString(b[:])))
+}
+
+// IsReserved reports whether a stored key is a service-internal object (a manifest
+// snapshot or a preflight probe) that object enumeration — reconcile / audit — must
+// skip rather than treat as a backed-up object.
+func IsReserved(key string) bool {
+	return strings.HasPrefix(key, manifestPrefix+"/") || strings.HasPrefix(key, preflightPrefix+"/")
+}
 
 // ShardKey returns the two-level hex-sharded key for a content hash —
 // <hash[0:2]>/<hash[2:4]>/<hash> — joined with "/" (S3/URL style; filesystem
@@ -92,7 +116,7 @@ func CommitFile(tmpName, dest string, mode os.FileMode) error {
 // (`_manifest/<base>`). Owning this layout in ONE place keeps the sinks and the
 // DR-restore tooling from diverging on where manifests live.
 func ManifestKey(name string) string {
-	return path.Join("_manifest", path.Base(name))
+	return path.Join(manifestPrefix, path.Base(name))
 }
 
 // SyncDir fsyncs a directory so a create/rename within it is durable
