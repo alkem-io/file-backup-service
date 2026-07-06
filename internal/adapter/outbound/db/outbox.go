@@ -12,6 +12,12 @@ import (
 )
 
 // OutboxRepo reads/claims the backup outbox in the Alkemio DB (scoped role).
+//
+// Constitution §IV waiver: these queries are hand-written pgx, not sqlc. The outbox is
+// a FOREIGN, server-owned table in the Alkemio DB — it is NOT in this repo's ledger
+// migrations that sqlc.yaml's `schema` points at, so sqlc has no schema to type-check it
+// against. The startup Probe (which SELECTs every consumed column) is the compensating
+// control: a server-side schema drift fails loudly at deploy instead of at runtime.
 type OutboxRepo struct {
 	p             *Pool
 	maxAttempts   int // genuine-failure dead-letter threshold
