@@ -83,7 +83,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 // missed — ONE shared ticker feeding the wake cascade, instead of one ticker per
 // worker (which fired N empty claims against the shared DB every interval at idle).
 func (c *Consumer) poll(ctx context.Context, wake chan<- struct{}) {
-	t := time.NewTicker(c.d.PollEvery)
+	interval := c.d.PollEvery
+	if interval <= 0 { // floor it (as reap does) so a non-positive PollEvery can't panic NewTicker
+		interval = time.Second
+	}
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {

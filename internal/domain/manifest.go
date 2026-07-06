@@ -40,6 +40,14 @@ func WriteManifests(ctx context.Context, led Ledger, targets []Target, name stri
 		wg.Add(1)
 		go func(i int, t Target) {
 			defer wg.Done()
+			// Recover per goroutine: a driver panic in one target's manifest write must
+			// isolate to that target (best-effort DR snapshot), not crash the serve
+			// process this runs on — the pipeline recovers every sink call for the same reason.
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = PanicErr("manifest to "+t.Sink.Name(), r)
+				}
+			}()
 			if err := writeManifest(ctx, led, t.Sink, name); err != nil {
 				errs[i] = fmt.Errorf("manifest to %s: %w", t.Sink.Name(), err)
 			}

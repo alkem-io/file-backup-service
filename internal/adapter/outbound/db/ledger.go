@@ -169,6 +169,10 @@ func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, af
 // consistent with TargetGaps' "stored on
 // target" predicate — TargetGaps streams the gap objects, CoverageGaps counts them; a
 // change to one's stored-on-target rule must change the other (see coverage integration test).
+// The total is an EXACT count(file_backup_object) (one row per object, index-only on the
+// PK), not a pg_class.reltuples estimate: a coverage backstop must not UNDER-report (a
+// stale-low estimate would clamp the gap to 0 and hide the very under-replication the
+// gauge exists to catch), and the exact count is bounded by the coarse 5-min sample cadence.
 func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int, error) {
 	if len(allTargets) == 0 {
 		return 0, nil // no targets configured → nothing can be under-replicated (matches TargetGaps)

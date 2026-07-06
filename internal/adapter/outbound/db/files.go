@@ -69,11 +69,15 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	return out, rows.Err()
 }
 
-// Probe verifies the `file` table is readable via the pool's scoped role, so a missing
-// SELECT grant fails loud at startup instead of a silent zero-object backfill.
+// Probe verifies the `file` table is readable via the scoped role AND has every column
+// EachFile reads (id/externalID/createdBy/createdDate/size/temporaryLocation) — so a
+// missing SELECT grant OR a server-side schema/column drift fails LOUD at startup, not
+// mid-pass when EachFile's Scan hits a renamed column (mirrors OutboxRepo.Probe).
 func (r *FileRepo) Probe(ctx context.Context) error {
-	if _, err := r.p.Exec(ctx, `SELECT 1 FROM file LIMIT 1`); err != nil {
-		return fmt.Errorf("file table not readable (scoped role SELECT grant on file?): %w", err)
+	const q = `SELECT id, "externalID", "createdBy", "createdDate", size, "temporaryLocation"
+	FROM file LIMIT 1`
+	if _, err := r.p.Exec(ctx, q); err != nil {
+		return fmt.Errorf("file table not readable (scoped role SELECT grant / schema drift on file?): %w", err)
 	}
 	return nil
 }
