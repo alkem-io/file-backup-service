@@ -25,6 +25,13 @@ import (
 
 const envPrefix = "FBS_"
 
+// Target type vocabulary — one owner, so config validation and the sink builder can't
+// disagree on a type string (as compression is owned by domain.ParseCodec).
+const (
+	TargetTypeS3         = "s3"
+	TargetTypeFilesystem = "filesystem"
+)
+
 // Target is one configured backup sink (symmetric — no required/optional).
 type Target struct {
 	Name        string `yaml:"name"`
@@ -360,11 +367,11 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 	}
 	seen[tok] = t.Name
 	switch t.Type {
-	case "filesystem":
+	case TargetTypeFilesystem:
 		if t.Path == "" {
 			return fmt.Errorf("target %q: filesystem requires path", t.Name)
 		}
-	case "s3":
+	case TargetTypeS3:
 		if t.Endpoint == "" || t.Bucket == "" || t.Region == "" {
 			// region is mandatory: PutObject-only creds can't auto-discover it and SigV4
 			// signs it — an empty region fails every request with SignatureDoesNotMatch.

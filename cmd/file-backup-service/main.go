@@ -142,13 +142,14 @@ func serve(cfgPath string) error {
 	}
 	defer shutdown(srv)
 
+	fsClient := fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil)
 	// Fail loudly if any dependency is unusable at startup (bounded so a hung dial
 	// fails fast instead of hanging), rather than a silent no-op with /health green.
-	if err := startupChecks(ctx, outbox, ledger, targets); err != nil {
+	if err := startupChecks(ctx, fsClient, outbox, ledger, targets); err != nil {
 		return err
 	}
 
-	pipeline := domain.NewPipeline(fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil), ledger, targets)
+	pipeline := domain.NewPipeline(fsClient, ledger, targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
@@ -398,7 +399,7 @@ func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.T
 // every target sink (creds/bucket/path). Bounded by a deadline so a hung dial fails
 // fast. All checks run CONCURRENTLY (they hit independent pools/endpoints), each with a
 // recover so a driver panic in one is reported, not a crash.
-func startupChecks(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
+func startupChecks(ctx context.Context, fs *fileservice.Client, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -406,8 +407,9 @@ func startupChecks(ctx context.Context, outbox *db.OutboxRepo, ledger *db.Ledger
 		name string
 		fn   func(context.Context) error
 	}
-	checks := make([]check, 0, 3+len(targets))
+	checks := make([]check, 0, 4+len(targets))
 	checks = append(checks,
+		check{"file-service unreachable", fs.Preflight},
 		check{"outbox not accessible (scoped role / schema?)", outbox.Probe},
 		check{"outbox not writable", outbox.CheckWriteGrant},
 		check{"ledger not accessible (schema / migrate?)", ledger.Probe},
@@ -454,9 +456,9 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 
 func buildSink(t config.Target) (domain.Sink, error) {
 	switch t.Type {
-	case "filesystem":
+	case config.TargetTypeFilesystem:
 		return filesystem.New(t.Name, t.Path), nil
-	case "s3":
+	case config.TargetTypeS3:
 		return s3.New(s3.Config{
 			Name: t.Name, Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket, Prefix: t.Prefix,
 			AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,

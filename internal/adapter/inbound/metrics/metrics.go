@@ -4,6 +4,7 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -28,6 +29,7 @@ type Metrics struct {
 	lastSuccessAge   prometheus.Gauge
 	underReplicated  prometheus.Gauge // objects not yet stored on every target (coverage)
 	sampleErrors     prometheus.Counter
+	byTarget         sync.Map // target name -> *targetCounters (resolved once, per target)
 }
 
 // New builds a Metrics with its own registry.
@@ -94,19 +96,40 @@ func (m *Metrics) SetUnderReplicated(n int) { m.underReplicated.Set(float64(n)) 
 // SampleError records a failed sampling pass so a frozen gauge is alertable.
 func (m *Metrics) SampleError() { m.sampleErrors.Inc() }
 
+// targetCounters holds a target's resolved Counter handles, so the per-object hot path
+// does a direct .Inc()/.Add() instead of re-hashing the label tuple + a CounterVec map
+// lookup on every observation (matters on a backlog/backfill drain).
+type targetCounters struct {
+	stored, failed, dedup, bytes prometheus.Counter
+}
+
+// counters returns target's cached handle set, resolving it once on first use.
+func (m *Metrics) counters(target string) *targetCounters {
+	if v, ok := m.byTarget.Load(target); ok {
+		return v.(*targetCounters)
+	}
+	tc := &targetCounters{
+		stored: m.objects.WithLabelValues(domain.StateStored, target),
+		failed: m.objects.WithLabelValues(domain.StateFailed, target),
+		dedup:  m.objects.WithLabelValues("dedup", target),
+		bytes:  m.bytes.WithLabelValues(target),
+	}
+	actual, _ := m.byTarget.LoadOrStore(target, tc)
+	return actual.(*targetCounters)
+}
+
 // ObjectStored implements domain.Metrics.
 func (m *Metrics) ObjectStored(target string, storedBytes int64) {
-	m.objects.WithLabelValues(domain.StateStored, target).Inc()
-	m.bytes.WithLabelValues(target).Add(float64(storedBytes))
+	tc := m.counters(target)
+	tc.stored.Inc()
+	tc.bytes.Add(float64(storedBytes))
 }
 
 // ObjectFailed implements domain.Metrics.
-func (m *Metrics) ObjectFailed(target string) {
-	m.objects.WithLabelValues(domain.StateFailed, target).Inc()
-}
+func (m *Metrics) ObjectFailed(target string) { m.counters(target).failed.Inc() }
 
 // ObjectDedup implements domain.Metrics.
-func (m *Metrics) ObjectDedup(target string) { m.objects.WithLabelValues("dedup", target).Inc() }
+func (m *Metrics) ObjectDedup(target string) { m.counters(target).dedup.Inc() }
 
 // DeadLetter records an entry moved to dead-letter.
 func (m *Metrics) DeadLetter() { m.deadletter.Inc() }

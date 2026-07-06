@@ -5,6 +5,7 @@ package fileservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -75,4 +76,23 @@ func (c *Client) FetchContent(ctx context.Context, fileID string) (io.ReadCloser
 		return nil, fmt.Errorf("file-service GET %s: status %d", reqURL, resp.StatusCode)
 	}
 	return resp.Body, nil
+}
+
+// Preflight checks file-service is reachable at startup (parity with the DB/sink
+// checks): a GET for a nonexistent object. Any HTTP response — including the expected
+// 404 (ErrSourceGone) for the probe id — means the server answered; only a
+// connection/dial/timeout error (wrong host, down) fails. It can't detect a wrong path
+// PREFIX (that also 404s, indistinguishable from a missing object) — a mass
+// filebackup_source_gone_total spike surfaces that at runtime.
+func (c *Client) Preflight(ctx context.Context) error {
+	rc, err := c.FetchContent(ctx, "00000000-0000-0000-0000-000000000000")
+	switch {
+	case err == nil:
+		_ = rc.Close()
+		return nil
+	case errors.Is(err, domain.ErrSourceGone):
+		return nil // 404/410: reachable, the probe id simply doesn't exist
+	default:
+		return fmt.Errorf("file-service unreachable: %w", err)
+	}
 }
