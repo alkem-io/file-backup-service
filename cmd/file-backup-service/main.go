@@ -46,7 +46,12 @@ func main() {
 		err = runRestore(args)
 	case "verify":
 		err = runVerify(args)
-	case "backfill", "reconcile", "drill":
+	case "reconcile":
+		err = runReconcile(args)
+		if errors.Is(err, context.Canceled) {
+			err = nil
+		}
+	case "backfill", "drill":
 		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
 		os.Exit(1)
 	default:
@@ -218,6 +223,42 @@ func runVerify(args []string) error {
 			fmt.Printf("verified %s\n", hash)
 			return nil
 		})
+}
+
+// runReconcile repairs under-replicated objects target-to-target (FR-025/T029): for
+// each object the ledger shows not stored on every target, fetch it from a target that
+// has it and re-fan-out to the missing ones. Needs only the ledger DB + the targets.
+func runReconcile(args []string) error {
+	fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "config file")
+	ratePerSec := fs.Int("rate", 0, "max repairs per second (0 = unlimited)")
+	_ = fs.Parse(args)
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	ctx, stop := signalContext()
+	defer stop()
+
+	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	if err != nil {
+		return fmt.Errorf("ledger pool: %w", err)
+	}
+	defer ledgerPool.Close()
+	ledger := db.NewLedgerRepo(ledgerPool)
+	if err := ledger.Probe(ctx); err != nil {
+		return fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
+	}
+	targets, err := buildTargets(cfg.Targets)
+	if err != nil {
+		return err
+	}
+	st, err := domain.NewReconciler(ledger, targets).Run(ctx, *ratePerSec)
+	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d\n", st.Repaired, st.Skipped, st.Failed)
+	return err
 }
 
 // sinkFor loads config, validates the named target, and builds its sink. It

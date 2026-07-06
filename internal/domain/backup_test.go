@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -52,8 +53,14 @@ func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []Ta
 	}
 	return nil
 }
-func (f *fakeLedger) StoredTargets(context.Context, string) (map[string]bool, error) {
-	return map[string]bool{}, nil
+func (f *fakeLedger) StoredTargets(_ context.Context, externalID string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for k, v := range f.states {
+		if v == StateStored && strings.HasPrefix(k, externalID+"/") {
+			out[strings.TrimPrefix(k, externalID+"/")] = true
+		}
+	}
+	return out, nil
 }
 func (f *fakeLedger) Probe(context.Context) error { return nil }
 func (f *fakeLedger) EachObject(_ context.Context, fn func(ObjectMeta) error) error {
