@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -43,31 +42,16 @@ type ReconcileStats struct {
 // ctx cancellation.
 func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, error) {
 	var st ReconcileStats
-	var pace <-chan time.Time
-	if ratePerSec > 0 {
-		interval := time.Second / time.Duration(ratePerSec)
-		if interval <= 0 {
-			interval = time.Nanosecond // an absurd rate: effectively unlimited, never NewTicker(0)
-		}
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		pace = t.C
-	}
+	wait, stop := newPacer(ratePerSec)
+	defer stop()
 	names := make([]string, len(rc.targets))
 	for i, t := range rc.targets {
 		names[i] = t.Sink.Name()
 	}
 	p := NewPipeline(nil, rc.ledger, rc.targets)
 	err := rc.ledger.TargetGaps(ctx, names, func(externalID string, stored map[string]bool) error {
-		if err := ctx.Err(); err != nil {
+		if err := wait(ctx); err != nil {
 			return err
-		}
-		if pace != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-pace:
-			}
 		}
 		rc.repair(ctx, p, externalID, stored, &st)
 		return ctx.Err() // stop the pass on shutdown

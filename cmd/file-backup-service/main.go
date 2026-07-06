@@ -56,7 +56,12 @@ func main() {
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
-	case "backfill", "drill":
+	case "backfill":
+		err = runBackfill(args)
+		if errors.Is(err, context.Canceled) {
+			err = nil
+		}
+	case "drill":
 		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
 		os.Exit(1)
 	default:
@@ -282,6 +287,73 @@ func runReconcile(args []string) error {
 	return err
 }
 
+// runBackfill backs up the pre-existing corpus (US2/T022): it enumerates the
+// file-service `file` table and runs each object through the normal pipeline (which
+// dedups against the ledger, so it's resumable + repeatable). Needs the full config —
+// it fetches from file-service AND reads the alkemio `file` table AND writes the ledger.
+func runBackfill(args []string) error {
+	fs := flag.NewFlagSet("backfill", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "config file")
+	ratePerSec := fs.Int("rate", 0, "max backups per second (0 = unlimited)")
+	_ = fs.Parse(args)
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	ctx, stop := signalContext()
+	defer stop()
+
+	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	if err != nil {
+		return fmt.Errorf("alkemio pool: %w", err)
+	}
+	defer alkemioPool.Close()
+	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), int32(cfg.Concurrency)+4) //nolint:gosec // Concurrency is validated <=1024
+	if err != nil {
+		return fmt.Errorf("ledger pool: %w", err)
+	}
+	defer ledgerPool.Close()
+
+	ledger := db.NewLedgerRepo(ledgerPool)
+	files := db.NewFileRepo(alkemioPool)
+	fsClient := fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil)
+	targets, err := buildTargets(cfg.Targets)
+	if err != nil {
+		return err
+	}
+
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return fmt.Errorf("logger: %w", err)
+	}
+	defer func() { _ = logger.Sync() }()
+
+	// Required infrastructure for backfill: the source (file-service), the ledger, and
+	// the `file` corpus. NOT the outbox (backfill reads `file`, not the queue). Targets
+	// use the same per-target isolation as serve.
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if jerr := errors.Join(runChecks(cctx, []startCheck{
+		{"file-service unreachable", fsClient.Preflight},
+		{"ledger not accessible (schema / migrate?)", ledger.Probe},
+		{"file corpus not readable", files.Probe},
+	})...); jerr != nil {
+		cancel()
+		return jerr
+	}
+	perr := preflightTargets(cctx, logger, targets)
+	cancel()
+	if perr != nil {
+		return perr
+	}
+
+	st, err := domain.NewBackfiller(files, domain.NewPipeline(fsClient, ledger, targets)).Run(ctx, *ratePerSec)
+	fmt.Printf("backfill: backed=%d failed=%d\n", st.Backed, st.Failed)
+	return err
+}
+
 // runAudit verifies the ledger against reality (FR-014/T030): for a sample per target,
 // confirm the target actually still holds what the ledger records as stored. A nonzero
 // 'missing' count means silent loss on a target — a nonzero exit so cron/CI can alert.
@@ -442,7 +514,14 @@ func startupChecks(ctx context.Context, logger *zap.Logger, fs *fileservice.Clie
 	})...); err != nil {
 		return err
 	}
+	return preflightTargets(ctx, logger, targets)
+}
 
+// preflightTargets runs the target preflights with per-target isolation (FR-012),
+// shared by serve and backfill: a target that fails is logged LOUD and left DEGRADED
+// (retried at runtime), NOT fatal; only NO usable target is fatal (nothing could be
+// backed up) — one target's transient blip must not CrashLoop the whole worker.
+func preflightTargets(ctx context.Context, logger *zap.Logger, targets []domain.Target) error {
 	tChecks := make([]startCheck, len(targets))
 	for i, t := range targets {
 		tChecks[i] = startCheck{"target " + t.Sink.Name(), t.Sink.Preflight}
