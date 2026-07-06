@@ -19,6 +19,12 @@ import (
 //     custom row set (TargetGaps also streams to bound memory).
 //   - CoverageGaps / LastVerifiedAge: aggregate scalars over a text[] target filter.
 //   - Probe: a schema-existence check, not a data query.
+//
+// The SQL literals `state = 'stored'` throughout this file MUST equal domain.StateStored
+// (the single source of truth). They're inlined rather than const-concatenated to keep the
+// complex CTE/aggregate queries readable; StateStored is a stable ledger-schema value that
+// can only change via a coordinated migration, at which point grep 'stored' in this file
+// finds every site. (Not a positional param: the value appears in 9 spots across 5 queries.)
 type LedgerRepo struct {
 	p *Pool
 	q *queries.Queries
@@ -105,22 +111,12 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 // pass (blocking VACUUM on the ledger). An object stored on all of allTargets is excluded;
 // stale statuses for removed targets are ignored (the count/agg filter to allTargets).
 func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
-	after := ""
-	for {
-		page, err := r.targetGapsPage(ctx, allTargets, after, dbPageSize)
-		if err != nil {
-			return err
-		}
-		for i := range page {
-			if err := fn(page[i].externalID, page[i].stored); err != nil {
-				return err
-			}
-		}
-		if len(page) < dbPageSize {
-			return nil // a short page is the last
-		}
-		after = page[len(page)-1].externalID
-	}
+	return keysetLoop("",
+		func(after string, limit int) ([]targetGap, error) {
+			return r.targetGapsPage(ctx, allTargets, after, limit)
+		},
+		func(g targetGap) string { return g.externalID },
+		func(g targetGap) error { return fn(g.externalID, g.stored) })
 }
 
 type targetGap struct {

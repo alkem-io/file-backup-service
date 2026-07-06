@@ -625,7 +625,14 @@ func (f *fanoutWriter) collect(dispatched int) {
 			got++
 		case <-tick:
 			tick = nil // fire once, then block-collect the forced completions below
-			// Drain already-finished pumps first so only GENUINELY stalled ones are dropped.
+			// Drain already-finished pumps first, so a pump whose done-signal is already
+			// buffered isn't dropped. A residual ~ns window remains: a pump whose w.Write
+			// just returned but hasn't yet run its (buffered) `done <- i` send is still seen
+			// as pending and dropped — a spurious drop of a healthy target right at the
+			// stall boundary. Accepted: bounded (object retried, no commit/corruption —
+			// nothing commits without EOF), per-index (siblings untouched), self-healing, and
+			// an ~ns window against a 60s stall; a grace-period second timer would add real
+			// complexity for a negligible gain.
 			for drained := false; !drained; {
 				select {
 				case i := <-f.done:
@@ -636,7 +643,7 @@ func (f *fanoutWriter) collect(dispatched int) {
 				}
 			}
 			for i := range f.pending {
-				if f.pending[i] { // still hung: isolate it so its pump write unblocks (errStalled)
+				if f.pending[i] { // still outstanding at the deadline: isolate it (its pump write unblocks with errStalled)
 					f.drop(i)
 				}
 			}

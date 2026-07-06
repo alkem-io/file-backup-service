@@ -34,22 +34,11 @@ func NewFileRepo(p *Pool) *FileRepo { return &FileRepo{p: p} }
 // holding back xmin and blocking autovacuum. Paging keeps each query short.
 // temporaryLocation IS NOT TRUE (not "= FALSE") so a NULL never silently drops a file.
 func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) error) error {
-	after := uuid.Nil // the zero uuid sorts first; no real file.id is nil (gen_random_uuid)
-	for {
-		page, err := r.filesPage(ctx, after, dbPageSize)
-		if err != nil {
-			return err
-		}
-		for i := range page {
-			if err := fn(page[i]); err != nil {
-				return err
-			}
-		}
-		if len(page) < dbPageSize {
-			return nil // a short page is the last
-		}
-		after = page[len(page)-1].FileID
-	}
+	// uuid.Nil sorts first; no real file.id is nil (gen_random_uuid).
+	return keysetLoop(uuid.Nil,
+		func(after uuid.UUID, limit int) ([]domain.OutboxEntry, error) { return r.filesPage(ctx, after, limit) },
+		func(e domain.OutboxEntry) uuid.UUID { return e.FileID },
+		fn)
 }
 
 // filesPage returns one keyset page of non-temporary files after `after` (id order).

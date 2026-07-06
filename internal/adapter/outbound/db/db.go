@@ -16,6 +16,30 @@ import (
 // pool connection for the whole pass.
 const dbPageSize = 1000
 
+// keysetLoop drives a keyset-paginated sweep: fetch pages via pageFn(after, dbPageSize)
+// until a SHORT page (the last), invoking fn per item; cursorOf extracts the next `after`
+// from the last item. The one owner of the after-cursor + short-page-stops loop, so a copy
+// can't mis-treat a short page and silently stop a sweep early. Paging (not a held cursor)
+// releases the DB connection between pages for a slow per-item consumer.
+func keysetLoop[C any, T any](start C, pageFn func(after C, limit int) ([]T, error), cursorOf func(T) C, fn func(T) error) error {
+	after := start
+	for {
+		page, err := pageFn(after, dbPageSize)
+		if err != nil {
+			return err
+		}
+		for i := range page {
+			if err := fn(page[i]); err != nil {
+				return err
+			}
+		}
+		if len(page) < dbPageSize {
+			return nil // a short page is the last
+		}
+		after = cursorOf(page[len(page)-1])
+	}
+}
+
 // nullTime maps a scanned nullable TIMESTAMPTZ to a time.Time (zero when SQL NULL) — one
 // owner for the pgtype→domain breadcrumb mapping shared by the ledger + corpus readers.
 func nullTime(t pgtype.Timestamptz) time.Time {
