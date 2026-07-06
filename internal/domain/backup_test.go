@@ -63,8 +63,11 @@ func (f *fakeLedger) StoredTargets(_ context.Context, externalID string) (map[st
 	return out, nil
 }
 func (f *fakeLedger) Probe(context.Context) error { return nil }
-func (f *fakeLedger) EachObject(_ context.Context, fn func(ObjectMeta) error) error {
+func (f *fakeLedger) EachStoredObject(_ context.Context, target string, fn func(ObjectMeta) error) error {
 	for id := range f.objects {
+		if f.states[id+"/"+target] != StateStored {
+			continue
+		}
 		if err := fn(ObjectMeta{ExternalID: id, Size: f.sizes[id]}); err != nil {
 			return err
 		}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -25,16 +26,24 @@ func ManifestName(t time.Time) string {
 	return t.UTC().Format("2006-01-02T150405Z") + ".jsonl"
 }
 
-// WriteManifests streams the ledger as a JSONL snapshot to every target's
+// WriteManifests writes each target's OWN inventory as a JSONL snapshot to its
 // _manifest/<name> (FR-015), so any single target is restorable standalone without the
-// ledger DB. A per-target failure is isolated (the others still get their snapshot).
+// ledger DB. Each target's snapshot lists only what that target holds. Per-target
+// failure is isolated, and the targets are written concurrently (each is a distinct
+// query + upload, so there's nothing to share).
 func WriteManifests(ctx context.Context, led Ledger, targets []Target, name string) error {
-	var errs []error
-	for _, t := range targets {
-		if err := writeManifest(ctx, led, t.Sink, name); err != nil {
-			errs = append(errs, fmt.Errorf("manifest to %s: %w", t.Sink.Name(), err))
-		}
+	errs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t Target) {
+			defer wg.Done()
+			if err := writeManifest(ctx, led, t.Sink, name); err != nil {
+				errs[i] = fmt.Errorf("manifest to %s: %w", t.Sink.Name(), err)
+			}
+		}(i, t)
 	}
+	wg.Wait()
 	return errors.Join(errs...)
 }
 
@@ -42,10 +51,15 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 	pr, pw := io.Pipe()
 	go func() {
 		enc := json.NewEncoder(pw) // JSONL: Encode appends a newline per record
-		err := led.EachObject(ctx, func(m ObjectMeta) error {
+		err := led.EachStoredObject(ctx, sink.Name(), func(m ObjectMeta) error {
 			return enc.Encode(manifestLine{m.ExternalID, m.Size, m.CreatedBy, m.SourceCreatedDate})
 		})
 		_ = pw.CloseWithError(err)
 	}()
-	return sink.PutManifest(ctx, name, pr)
+	err := sink.PutManifest(ctx, name, pr)
+	// Unblock the encoder goroutine if PutManifest returned before draining the pipe
+	// (an upload error / timeout) — otherwise it parks forever on pw.Write, pinning the
+	// ledger cursor's DB connection.
+	_ = pr.CloseWithError(err)
+	return err
 }

@@ -63,14 +63,20 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	return nil
 }
 
-// EachObject streams every ledger object for the manifest snapshot, invoking fn per
-// row (FR-015). Streaming (not ReadAll) keeps memory bounded across millions of rows.
-func (r *LedgerRepo) EachObject(ctx context.Context, fn func(domain.ObjectMeta) error) error {
-	const q = `SELECT "externalID", size, COALESCE("createdBy"::text,''), "sourceCreatedDate"
-	FROM file_backup_object ORDER BY "externalID"`
-	rows, err := r.p.Query(ctx, q)
+// EachStoredObject streams the objects currently stored ON target for that target's
+// manifest snapshot (FR-015), invoking fn per row. It joins target_status so a target's
+// manifest lists ONLY what the target holds — not the whole ledger — so a standalone
+// restore from an under-replicated target doesn't read a false inventory. Streaming
+// (not ReadAll) keeps memory bounded across millions of rows.
+func (r *LedgerRepo) EachStoredObject(ctx context.Context, target string, fn func(domain.ObjectMeta) error) error {
+	const q = `SELECT o."externalID", o.size, COALESCE(o."createdBy"::text,''), o."sourceCreatedDate"
+	FROM file_backup_object o
+	JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
+	WHERE ts.target = $1 AND ts.state = 'stored'
+	ORDER BY o."externalID"`
+	rows, err := r.p.Query(ctx, q, target)
 	if err != nil {
-		return fmt.Errorf("stream objects: %w", err)
+		return fmt.Errorf("stream stored objects: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
