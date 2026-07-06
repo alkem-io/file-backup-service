@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -79,7 +81,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 			continue // stale status for a removed target
 		}
 		tried = true
-		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink, codec: src.Codec}, entry)
+		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink}, entry)
 		if err == nil && done {
 			st.Repaired++
 			return
@@ -98,33 +100,48 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 }
 
 // decodingSource adapts a backup target into a pipeline Source: it Fetches the stored
-// bytes and, per the source target's codec, yields the PLAINTEXT for the pipeline to
-// re-verify against externalID and re-fan-out. A corrupt source is caught by the
-// pipeline's VerifyReader (nothing is committed).
+// bytes and yields the PLAINTEXT for the pipeline to re-verify against externalID and
+// re-fan-out. It arbitrates the codec from the STORED BYTES (zstd-magic peek), NOT the
+// target's configured codec — so flipping a target's compression config doesn't make
+// its already-stored objects unreconcilable (the recovery path must survive a config
+// change the same way restore does). BOTH branches bound the yielded plaintext at
+// maxRestoreBytes+1 (a compromised/oversized source can't fill the recovery host disk),
+// and a wrong decode (a rare raw-object-that-looks-like-zstd) is caught by the
+// pipeline's VerifyReader (hash mismatch → nothing committed → repair rotates source).
 type decodingSource struct {
-	src   Sink
-	codec Codec
+	src Sink
 }
 
-// FetchContent implements Source: fetch the stored bytes and yield the plaintext.
+// FetchContent implements Source: fetch the stored bytes and yield the (bounded) plaintext.
 func (d decodingSource) FetchContent(ctx context.Context, externalID string) (io.ReadCloser, error) {
 	rc, err := d.src.Fetch(ctx, externalID)
 	if err != nil {
 		return nil, err
 	}
-	if d.codec != CodecZstd {
-		return rc, nil // stored raw == plaintext
+	br := bufio.NewReaderSize(rc, 8<<10)
+	magic, _ := br.Peek(4) // short object → short magic, simply won't match
+	if !bytes.Equal(magic, zstdMagic) {
+		return &boundedReadCloser{r: io.LimitReader(br, maxRestoreBytes+1), under: rc}, nil // stored raw == plaintext
 	}
-	zr, err := newZstdDecoder(rc)
+	zr, err := newZstdDecoder(br)
 	if err != nil {
 		_ = rc.Close()
 		return nil, fmt.Errorf("zstd decode: %w", err)
 	}
-	// Bound the DECODED output (not just the compressed input): a compromised target
-	// could hold a tiny frame that expands to PB. The pipeline's VerifyReader then
-	// rejects a bomb (the capped stream won't hash to externalID) with nothing committed.
 	return &zstdReadCloser{r: io.LimitReader(zr, maxRestoreBytes+1), zr: zr, under: rc}, nil
 }
+
+// boundedReadCloser yields a bounded reader and closes the underlying stored-object reader.
+type boundedReadCloser struct {
+	r     io.Reader
+	under io.Closer
+}
+
+// Read yields the bounded stream.
+func (b *boundedReadCloser) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// Close releases the underlying stored-object reader.
+func (b *boundedReadCloser) Close() error { return b.under.Close() }
 
 type zstdReadCloser struct {
 	r     io.Reader // decoded stream, bomb-capped

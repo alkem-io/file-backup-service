@@ -58,6 +58,43 @@ func TestReconcileSkipsWhenNoSource(t *testing.T) {
 	}
 }
 
+// TestReconcileSurvivesCodecFlip: an object stored zstd on A while A's CONFIGURED codec
+// is now CodecNone (operator flipped compression after storage). decodingSource
+// arbitrates from the stored bytes (zstd magic), not the stale config, so reconcile
+// still repairs — the recovery path survives a config change (the old config-codec
+// path would mis-read the zstd bytes as raw and fail on the hash).
+func TestReconcileSurvivesCodecFlip(t *testing.T) {
+	ctx := context.Background()
+	data := bytes.Repeat([]byte("flip me "), 30)
+	h, err := Sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newMemSink("a")
+	zr := ZstdReader(bytes.NewReader(data))
+	compressed, err := io.ReadAll(zr)
+	_ = zr.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.store[h] = compressed // stored zstd
+	b := newMemSink("b")
+
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(data))},
+		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
+
+	// A's configured codec is now None (flipped) — the stored bytes are still zstd.
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}})
+	st, err := rec.Run(ctx, 0)
+	if err != nil || st.Repaired != 1 {
+		t.Fatalf("reconcile after codec flip: stats=%+v err=%v", st, err)
+	}
+	if !bytes.Equal(b.store[h], data) {
+		t.Fatal("B should hold the decoded plaintext despite the config flip")
+	}
+}
+
 // TestReconcileZstdSource: repair works when the source target stored the object zstd —
 // it's decoded to plaintext, re-verified, and re-fanned out.
 func TestReconcileZstdSource(t *testing.T) {

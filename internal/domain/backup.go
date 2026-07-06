@@ -258,28 +258,34 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 			results[i].err = errAbortedBeforeEOF
 		}
 	}
-	if copyErr != nil {
-		// A cancelled/timed-out ctx is a real abort — surface it so the consumer
-		// releases (shutdown) or fails+backs-off (per-object timeout) rather than
-		// mislabeling it. With a live ctx, io.ErrClosedPipe means every target pipe
-		// died (all sinks failed), NOT a source problem: the per-target results
-		// already record each failure, so fall through and let BackupOne write the
-		// per-target failed status + metrics. Only a genuine source error (integrity
-		// mismatch, fetch read error) short-circuits as "source read".
-		switch {
-		case ctx.Err() != nil:
-			return results, -1, fmt.Errorf("backup aborted: %w", ctx.Err())
-		case errors.Is(copyErr, io.ErrClosedPipe):
-			// All targets dead — results carry the per-target errors; not a source
-			// fault. The stream was NOT read to EOF/hash-verified, so the size is
-			// unknown: return -1 so BackupOne falls back to the outbox size (recorded
-			// with SizeVerified=false so it can't downgrade a later verified size).
-			return results, -1, nil
-		default:
-			return results, -1, fmt.Errorf("source read: %w", copyErr)
+	// A cancelled/timed-out ctx is a real abort — surface it so the consumer releases
+	// (shutdown) or fails+backs-off (per-object timeout). This is checked BEFORE copyErr:
+	// a timeout during a sink's FINALIZATION phase (S3 CompleteMultipartUpload / a slow
+	// fsync+rename, AFTER the stream already verified so copyErr==nil) leaves the abort
+	// only in a per-target results[i].err, and this is the sole place that surfaces it as
+	// the abort/timeout the metric + retry path key on. If the stream verified before the
+	// abort (copyErr==nil), vr.Total is the true size so committed targets record it;
+	// otherwise the size is unknown (-1).
+	if ctx.Err() != nil {
+		size := int64(-1)
+		if copyErr == nil {
+			size = vr.Total
 		}
+		return results, size, fmt.Errorf("backup aborted: %w", ctx.Err())
 	}
-	// copyErr == nil here means the full stream was read and VerifyReader confirmed
+	if copyErr != nil {
+		// With a live ctx, io.ErrClosedPipe means every target pipe died (all sinks
+		// failed), NOT a source problem: the per-target results already record each
+		// failure, so fall through and let BackupOne write the per-target failed status +
+		// metrics. The stream was NOT hash-verified, so size is unknown (-1) → BackupOne
+		// falls back to the outbox size (SizeVerified=false, can't downgrade a later
+		// verified size). Only a genuine source error short-circuits as "source read".
+		if errors.Is(copyErr, io.ErrClosedPipe) {
+			return results, -1, nil
+		}
+		return results, -1, fmt.Errorf("source read: %w", copyErr)
+	}
+	// copyErr == nil and ctx live: the full stream was read and VerifyReader confirmed
 	// the hash, so vr.Total is the true verified plaintext size.
 	return results, vr.Total, nil
 }
