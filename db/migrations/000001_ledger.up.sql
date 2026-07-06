@@ -18,10 +18,12 @@ CREATE TABLE file_backup_target_status (
     PRIMARY KEY ("externalID", target)
 );
 
--- The RPO sampler reads max("verifiedAt") every 15s; without this it's a full-table
--- scan that degrades linearly with the corpus.
-CREATE INDEX file_backup_target_status_verified_idx
-    ON file_backup_target_status ("verifiedAt" DESC);
+-- The RPO sampler reads max("verifiedAt") PER TARGET every 15s; this serves the
+-- per-target max as an index-only lookup (a single-column "verifiedAt" index can't
+-- answer a per-target GROUP BY).
+CREATE INDEX file_backup_target_status_target_verified_idx
+    ON file_backup_target_status (target, "verifiedAt" DESC)
+    WHERE state = 'stored';
 
 -- Per-target manifest / audit keyset-page the objects stored on one target, ORDER BY
 -- "externalID" — this covers the WHERE (target, state) AND the index-ordered range scan

@@ -28,6 +28,7 @@ type Metrics struct {
 	oldestPendingAge prometheus.Gauge
 	lastSuccessAge   prometheus.Gauge
 	underReplicated  prometheus.Gauge // objects not yet stored on every target (coverage)
+	neverVerified    prometheus.Gauge // configured targets that have never verified anything
 	sampleErrors     prometheus.Counter
 	byTarget         sync.Map // target name -> *targetCounters (resolved once, per target)
 }
@@ -74,6 +75,10 @@ func New() *Metrics {
 			Name: "filebackup_under_replicated_objects",
 			Help: "Objects not yet stored on every configured target — coverage backstop that a dead-lettered object (drained from the backlog) can't hide from.",
 		}),
+		neverVerified: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_targets_never_verified",
+			Help: "Configured targets that have never verified a single object — catches a target (e.g. a misconfigured immutable off-site copy) that received nothing since inception, which last_success_age can't see.",
+		}),
 		sampleErrors: f.NewCounter(prometheus.CounterOpts{
 			Name: "filebackup_metrics_sample_errors_total",
 			Help: "Failed RPO/coverage sampling passes — alert on rate>0 so a frozen (stale-green) gauge is itself detectable.",
@@ -87,8 +92,11 @@ func (m *Metrics) SetBacklog(pending int, oldestAgeSec float64) {
 	m.oldestPendingAge.Set(oldestAgeSec)
 }
 
-// SetLastSuccessAge records seconds since the most recent verified backup.
+// SetLastSuccessAge records seconds since the stalest verified target's last backup.
 func (m *Metrics) SetLastSuccessAge(ageSec float64) { m.lastSuccessAge.Set(ageSec) }
+
+// SetNeverVerified records how many configured targets have never verified anything.
+func (m *Metrics) SetNeverVerified(n int) { m.neverVerified.Set(float64(n)) }
 
 // SetUnderReplicated records the count of objects not stored on every target.
 func (m *Metrics) SetUnderReplicated(n int) { m.underReplicated.Set(float64(n)) }

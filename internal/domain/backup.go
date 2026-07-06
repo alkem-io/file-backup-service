@@ -68,6 +68,17 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, Metrics: Nop{}}
 }
 
+// TargetNames returns the sink names of targets — the allTargets argument the ledger's
+// gap/coverage/RPO queries take. One owner so the reconcile work-list and the gauges
+// compute over the same name set.
+func TargetNames(targets []Target) []string {
+	names := make([]string, len(targets))
+	for i, t := range targets {
+		names[i] = t.Sink.Name()
+	}
+	return names
+}
+
 // BackupOne stores the object on every target that still needs it. The source is
 // fetched ONCE and fanned out to all targets concurrently (streamed, bounded
 // memory), so adding a second target does not multiply read load on the primary

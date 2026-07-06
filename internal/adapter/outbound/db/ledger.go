@@ -158,25 +158,31 @@ func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int
 	return n, nil
 }
 
-// LastVerifiedAge returns the age (seconds) of the STALEST target's most recent verify
-// — the max over targets of now()-max(verifiedAt) (FR-026's RPO signal). It is
-// PESSIMISTIC on purpose: a global max(verifiedAt) reads healthy while a single target
-// (e.g. the immutable off-site copy) silently receives nothing, because another target's
-// traffic keeps the global max current. Aggregating per-target and taking the worst
-// makes one lagging target drive the signal unhealthy. ok=false when nothing verified yet.
-func (r *LedgerRepo) LastVerifiedAge(ctx context.Context) (ageSec float64, ok bool, err error) {
-	const q = `SELECT EXTRACT(EPOCH FROM max(now() - mv)) FROM (
-	  SELECT max("verifiedAt") AS mv FROM file_backup_target_status
-	  WHERE state = 'stored' GROUP BY target
-	) t`
+// LastVerifiedAge reports the RPO signal (FR-026) over the CONFIGURED targets: the age
+// (seconds) of the STALEST target that has verified at least once, plus the count of
+// configured targets that have NEVER verified anything. It takes allTargets and probes
+// each per-target max(verifiedAt) so a target that has received NOTHING since inception
+// (the immutable off-site copy misconfigured at deploy — the worst case) is COUNTED as
+// never-verified, not silently absent from a GROUP BY. A global/among-stored-only max
+// would read healthy while such a target has zero coverage. ok=false when nothing has
+// verified on ANY configured target yet (bootstrap).
+func (r *LedgerRepo) LastVerifiedAge(ctx context.Context, allTargets []string) (ageSec float64, neverVerified int, ok bool, err error) {
+	const q = `SELECT
+	  count(*) FILTER (WHERE mv IS NULL),
+	  EXTRACT(EPOCH FROM max(now() - mv))
+	FROM (
+	  SELECT (SELECT max("verifiedAt") FROM file_backup_target_status
+	          WHERE target = t AND state = 'stored') AS mv
+	  FROM unnest($1::text[]) AS t
+	) per_target`
 	var age *float64
-	if err := r.p.QueryRow(ctx, q).Scan(&age); err != nil {
-		return 0, false, fmt.Errorf("last verified age: %w", err)
+	if err := r.p.QueryRow(ctx, q, allTargets).Scan(&neverVerified, &age); err != nil {
+		return 0, 0, false, fmt.Errorf("last verified age: %w", err)
 	}
-	if age == nil { // no verified rows yet on any target
-		return 0, false, nil
+	if age == nil { // nothing verified on any configured target yet
+		return 0, neverVerified, false, nil
 	}
-	return *age, true, nil
+	return *age, neverVerified, true, nil
 }
 
 // Probe verifies both ledger tables exist + are readable via the pool's role. A

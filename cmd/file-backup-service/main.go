@@ -175,7 +175,7 @@ func serve(cfgPath string) error {
 	// snapshot to each target (FR-015, standalone-restorability).
 	var bgWG sync.WaitGroup
 	bgWG.Add(3)
-	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, mx) }()
+	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, targets, mx) }()
 	go func() { defer bgWG.Done(); sampleCoverage(ctx, ledger, targets, mx) }()
 	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger) }()
 	defer bgWG.Wait()
@@ -425,7 +425,8 @@ func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(con
 // sampleRPO refreshes the backlog/lag/last-success gauges (FR-026). A failed pass
 // increments the sample-error counter (alert on rate>0) so a frozen, stale-green gauge
 // is itself detectable, rather than silently holding its last value.
-func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, mx *metrics.Metrics) {
+func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target, mx *metrics.Metrics) {
+	names := domain.TargetNames(targets)
 	everyTick(ctx, 15*time.Second, 5*time.Second, func(fctx context.Context) {
 		failed := false
 		if pending, ageSec, err := outbox.BacklogStats(fctx); err == nil {
@@ -433,10 +434,13 @@ func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo
 		} else {
 			failed = true
 		}
-		if ageSec, ok, err := ledger.LastVerifiedAge(fctx); err != nil {
+		if ageSec, never, ok, err := ledger.LastVerifiedAge(fctx, names); err != nil {
 			failed = true
-		} else if ok {
-			mx.SetLastSuccessAge(ageSec)
+		} else {
+			mx.SetNeverVerified(never) // a from-day-one dead target is counted, not invisible
+			if ok {
+				mx.SetLastSuccessAge(ageSec)
+			}
 		}
 		if failed {
 			mx.SampleError()
@@ -448,10 +452,7 @@ func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo
 // is a full-ledger scan, so not every 15s) — the coverage backstop a dead-lettered
 // object can't hide from.
 func sampleCoverage(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, mx *metrics.Metrics) {
-	names := make([]string, len(targets))
-	for i, t := range targets {
-		names[i] = t.Sink.Name()
-	}
+	names := domain.TargetNames(targets)
 	everyTick(ctx, 5*time.Minute, 30*time.Second, func(fctx context.Context) {
 		if n, err := ledger.CoverageGaps(fctx, names); err == nil {
 			mx.SetUnderReplicated(n)

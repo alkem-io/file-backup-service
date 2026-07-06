@@ -43,10 +43,7 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 	var st ReconcileStats
 	wait, stop := newPacer(ratePerSec)
 	defer stop()
-	names := make([]string, len(rc.targets))
-	for i, t := range rc.targets {
-		names[i] = t.Sink.Name()
-	}
+	names := TargetNames(rc.targets)
 	p := NewPipeline(nil, rc.ledger, rc.targets)
 	err := rc.ledger.TargetGaps(ctx, names, func(externalID string, stored map[string]bool) error {
 		if err := wait(ctx); err != nil {
