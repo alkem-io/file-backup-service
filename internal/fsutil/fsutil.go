@@ -84,15 +84,15 @@ func CommitWrite(ctx context.Context, dir, base string, mode os.FileMode, fill f
 	if err := ctx.Err(); err != nil {
 		return err // cancelled mid-write — don't commit a late/orphaned object
 	}
-	committed = true // CommitFile owns the temp from here (removes it on its own error)
-	return CommitFile(tmp, filepath.Join(dir, base), mode)
+	committed = true // commitFile owns the temp from here (removes it on its own error)
+	return commitFile(tmp, filepath.Join(dir, base), mode)
 }
 
-// CommitFile durably publishes an already-written+closed temp to dest: chmod mode,
+// commitFile durably publishes an already-written+closed temp to dest: chmod mode,
 // atomic rename, and a parent-dir fsync (atomic != durable). The temp is removed on
 // any error so a failure never leaks it. Callers gate on ctx BEFORE calling this so
 // a cancelled write is never committed.
-func CommitFile(tmpName, dest string, mode os.FileMode) error {
+func commitFile(tmpName, dest string, mode os.FileMode) error {
 	if err := os.Chmod(tmpName, mode); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("chmod: %w", err)
@@ -101,7 +101,7 @@ func CommitFile(tmpName, dest string, mode os.FileMode) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename: %w", err)
 	}
-	return SyncDir(filepath.Dir(dest))
+	return syncDir(filepath.Dir(dest))
 }
 
 // ManifestKey returns the slash-style key for a ledger-snapshot manifest object
@@ -111,9 +111,9 @@ func ManifestKey(name string) string {
 	return path.Join(manifestPrefix, path.Base(name))
 }
 
-// SyncDir fsyncs a directory so a create/rename within it is durable
+// syncDir fsyncs a directory so a create/rename within it is durable
 // (atomic != durable). Used after every content write.
-func SyncDir(dir string) error {
+func syncDir(dir string) error {
 	d, err := os.Open(dir) //nolint:gosec // caller-provided path under a configured root
 	if err != nil {
 		return err

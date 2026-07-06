@@ -47,7 +47,7 @@ func (c fakeCorpus) EachFile(_ context.Context, fn func(OutboxEntry) error) erro
 // a second pass dedups against the ledger (no re-store) yet still counts it backed.
 func TestBackfillBacksUpCorpus(t *testing.T) {
 	data := []byte("legacy object never enqueued")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}

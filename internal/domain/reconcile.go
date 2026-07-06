@@ -129,13 +129,7 @@ func (d decodingSource) FetchContent(ctx context.Context, e OutboxEntry) (io.Rea
 	if err != nil {
 		return nil, fmt.Errorf("reconcile temp: %w", err)
 	}
-	reset := func() error { // rewind the temp for decodeStream's raw fallback
-		if _, e := tmp.Seek(0, io.SeekStart); e != nil {
-			return e
-		}
-		return tmp.Truncate(0)
-	}
-	if err := decodeStream(ctx, d.src, externalID, tmp, reset); err != nil {
+	if err := decodeStream(ctx, d.src, externalID, tmp, func() error { return rewindTruncate(tmp) }); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return nil, err

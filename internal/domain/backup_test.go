@@ -145,7 +145,7 @@ func (m *memSink) PutManifest(_ context.Context, name string, r io.Reader) error
 
 func TestPipelineBackupOne(t *testing.T) {
 	data := []byte("back me up")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func (s truncatedSource) FetchContent(context.Context, OutboxEntry) (io.ReadClos
 // (short read) must fail the hash gate, not be silently committed as a verified backup.
 func TestPipelineTruncatedSourceNotCommitted(t *testing.T) {
 	full := bytes.Repeat([]byte("truncate me "), 500)
-	h, err := Sum(bytes.NewReader(full))
+	h, err := sum(bytes.NewReader(full))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func (c *countingSource) FetchContent(context.Context, OutboxEntry) (io.ReadClos
 // must not multiply reads on the source (the primary store).
 func TestPipelineSingleFetchFanOut(t *testing.T) {
 	data := bytes.Repeat([]byte("payload "), 100)
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestPipelineSingleFetchFanOut(t *testing.T) {
 // compressed bytes that decompress back to the plaintext.
 func TestPipelineZstdTarget(t *testing.T) {
 	data := bytes.Repeat([]byte("zstd fan-out payload "), 100)
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestPipelineZstdTarget(t *testing.T) {
 // (>1 MiB → several io.ReadFull passes) fanned concurrently to two targets.
 func TestPipelineLargeObjectMultiChunk(t *testing.T) {
 	data := bytes.Repeat([]byte("large fan-out payload "), 130*1024) // ~2.7 MiB
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +346,7 @@ type nonConsumingSink struct{ stubSink }
 // object is not marked done, while the healthy target still stores.
 func TestPipelineNonConsumingSinkFails(t *testing.T) {
 	data := []byte("hello dead pipe")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestPipelineNonConsumingSinkFails(t *testing.T) {
 // check must.
 func TestPipelineNonConsumingZstdSinkFails(t *testing.T) {
 	data := bytes.Repeat([]byte("compress me "), 8) // small: fits the encoder's buffer
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestPipelineNonConsumingZstdSinkFails(t *testing.T) {
 // it must be recorded as a 'failed' target_status, NOT masquerade as a source error.
 func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 	data := []byte("all targets down")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 // distinguishable.
 func TestPipelineAllTargetsFailRecordsOutboxSize(t *testing.T) {
 	data := bytes.Repeat([]byte("x"), 200*1024) // > 32 KiB io.Copy buffer
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func (f *failSink) Store(context.Context, string, io.Reader) (int64, error) {
 // "done" until every target has it.
 func TestPipelineTargetIsolation(t *testing.T) {
 	data := []byte("hello isolation")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}

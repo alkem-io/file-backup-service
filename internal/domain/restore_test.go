@@ -11,7 +11,7 @@ import (
 
 func TestRestoreRoundTripRaw(t *testing.T) {
 	data := []byte("restore me raw")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestRestoreRoundTripRaw(t *testing.T) {
 
 func TestRestoreRoundTripZstd(t *testing.T) {
 	data := bytes.Repeat([]byte("restore me zstd "), 100)
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestRestoreRoundTripZstd(t *testing.T) {
 // stored with CodecNone) must still restore, by re-reading as raw.
 func TestRestoreRawStartingWithZstdMagic(t *testing.T) {
 	data := append([]byte{0x28, 0xB5, 0x2F, 0xFD}, []byte(" not a real zstd frame payload")...)
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestRestoreRawOversizedZstdFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := Sum(bytes.NewReader(frame)) // stored RAW: the FRAME bytes hash to h
+	h, err := sum(bytes.NewReader(frame)) // stored RAW: the FRAME bytes hash to h
 	if err != nil {
 		t.Fatal(err)
 	}

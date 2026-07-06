@@ -13,7 +13,7 @@ import (
 func TestReconcileRepairsGap(t *testing.T) {
 	ctx := context.Background()
 	data := []byte("reconcile me please")
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestReconcileSkipsWhenNoSource(t *testing.T) {
 func TestReconcileSurvivesCodecFlip(t *testing.T) {
 	ctx := context.Background()
 	data := bytes.Repeat([]byte("flip me "), 30)
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestReconcileRawZstdLookalike(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := Sum(bytes.NewReader(frame)) // stored RAW: the FRAME bytes are the object
+	h, err := sum(bytes.NewReader(frame)) // stored RAW: the FRAME bytes are the object
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestReconcileRawZstdLookalike(t *testing.T) {
 func TestReconcileZstdSource(t *testing.T) {
 	ctx := context.Background()
 	data := bytes.Repeat([]byte("zstd reconcile "), 20)
-	h, err := Sum(bytes.NewReader(data))
+	h, err := sum(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
 	}

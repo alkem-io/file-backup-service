@@ -52,7 +52,7 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 		if f, oerr := os.Open(dest); oerr == nil { //nolint:gosec // primary-store path
 			// Bounded + ctx-cancellable: a large stale/corrupt file must not read
 			// unboundedly nor swallow the operator's SIGINT/SIGTERM.
-			overCap, verr := copyVerify(io.Discard, ctxReader{ctx, f}, hash, maxRestoreBytes)
+			overCap, verr := copyVerify(io.Discard, ctxReader{ctx, f}, hash)
 			_ = f.Close()
 			if verr == nil && !overCap {
 				return nil // already present and intact
@@ -67,13 +67,7 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	// ctx-gate/commit ceremony is the same durable spine the sink write uses.
 	return fsutil.CommitWrite(ctx, destDir, hash, 0o644, func(tmp *os.File) error {
 		// reset rewinds the temp if the rare magic-collision fallback re-decodes it.
-		reset := func() error {
-			if _, e := tmp.Seek(0, io.SeekStart); e != nil {
-				return e
-			}
-			return tmp.Truncate(0)
-		}
-		return decodeStream(ctx, src, hash, tmp, reset)
+		return decodeStream(ctx, src, hash, tmp, func() error { return rewindTruncate(tmp) })
 	})
 }
 
@@ -139,22 +133,28 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// copyVerify streams src into dst, hashing via the shared object-hash primitive so
-// restore verifies by the exact same digest rule as backup (hash.go). If limit > 0 it
-// caps the copy and returns overCap=true past it (decompression-bomb protection on the
-// zstd path); limit <= 0 is uncapped (the RAW path — the stored bytes ARE the object, no
-// amplification, so a legitimately-large object must not be rejected).
-func copyVerify(dst io.Writer, src io.Reader, want string, limit int64) (overCap bool, err error) {
-	h := newHash()
-	rdr := src
-	if limit > 0 {
-		rdr = io.LimitReader(src, limit+1)
+// rewindTruncate resets f to empty — the reset callback decodeStream's raw-fallback uses
+// to re-decode into the same temp file. Shared by restore + reconcile (one owner for the
+// load-bearing rewind: a missed Truncate would re-read into non-rewound bytes).
+func rewindTruncate(f *os.File) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
-	n, err := io.Copy(io.MultiWriter(dst, h), rdr)
+	return f.Truncate(0)
+}
+
+// copyVerify streams src into dst, hashing via the shared object-hash primitive so
+// restore verifies by the exact same digest rule as backup (hash.go). It caps the copy at
+// maxRestoreBytes and returns overCap=true past it (the decompression-bomb / oversized-blob
+// guard on BOTH the raw and zstd paths — every caller passes the same cap, so there is no
+// uncapped mode).
+func copyVerify(dst io.Writer, src io.Reader, want string) (overCap bool, err error) {
+	h := newHash()
+	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(src, maxRestoreBytes+1))
 	if err != nil {
 		return false, err
 	}
-	if limit > 0 && n > limit {
+	if n > maxRestoreBytes {
 		return true, nil
 	}
 	if hexSum(h) != want {
@@ -168,7 +168,7 @@ func copyVerify(dst io.Writer, src io.Reader, want string, limit int64) (overCap
 // a CodecNone object can't fill the restore disk before the hash check fails (the
 // plaintext cap applies to the raw path too, not only zstd).
 func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
-	overCap, err := copyVerify(dst, r, hash, maxRestoreBytes)
+	overCap, err := copyVerify(dst, r, hash)
 	switch {
 	case err != nil && !errors.Is(err, errHashMismatch):
 		return fmt.Errorf("read: %w", err)
@@ -202,7 +202,7 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	// .zst uploaded as-is) restores from its small raw bytes, while a genuine tampered
 	// zstd bomb fails both paths (the raw bytes don't hash). Never dropping the fallback
 	// costs at most one extra bounded read on hostile input, in exchange for no data loss.
-	if overCap, verr := copyVerify(dst, zr, hash, maxRestoreBytes); overCap || verr != nil {
+	if overCap, verr := copyVerify(dst, zr, hash); overCap || verr != nil {
 		return errTryRaw
 	}
 	return nil

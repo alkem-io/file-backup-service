@@ -20,7 +20,7 @@ func hexSum(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
 
 // Sum returns the lowercase-hex SHA3-256 of r — the file-service externalID
 // scheme (FIPS 202), which is the object's identity, key, and verifier.
-func Sum(r io.Reader) (string, error) {
+func sum(r io.Reader) (string, error) {
 	h := newHash()
 	if _, err := io.Copy(h, r); err != nil {
 		return "", fmt.Errorf("hash: %w", err)
