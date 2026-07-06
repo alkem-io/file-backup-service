@@ -67,6 +67,10 @@ type Pipeline struct {
 	// Circuit trips a persistently-down target out of the fan-out so an object whose only
 	// gap is that target is deferred, not dead-lettered (T017a). Nil (batch paths) disables it.
 	Circuit *CircuitBreaker
+	// StallTimeout is the per-chunk drain deadline: a target that doesn't consume a
+	// fan-out chunk within it is DROPPED individually (its pipe closed) so one hung sink
+	// can't stall the healthy targets on the shared barrier. 0 (batch paths) = unbounded.
+	StallTimeout time.Duration
 }
 
 // NewPipeline constructs a Pipeline.
@@ -85,19 +89,17 @@ func TargetNames(targets []Target) []string {
 	return names
 }
 
-// BackupOne stores the object on every target that still needs it. The source is
-// fetched ONCE and fanned out to all targets concurrently (streamed, bounded
-// memory), so adding a second target does not multiply read load on the primary
-// store — FR: N symmetric configurable targets. Dedup is answered by our own
-// ledger (never by re-reading a target), so it works with PutObject-only WORM
-// credentials. Returns true only when EVERY target is stored (symmetric
-// done-gate); a flaky target leaves the object not-done for retry while never
-// blocking the healthy targets.
+// BackupOne stores the object on every target that still needs it. The source is fetched
+// ONCE and fanned out to all targets concurrently (streamed, bounded memory), so adding a
+// target doesn't multiply read load on the primary store. Dedup is answered by our own
+// ledger (never by re-reading a target), so it works with PutObject-only WORM credentials.
+//
 // done is true only when EVERY target is stored (the symmetric done-gate). deferred is
 // true when the object couldn't complete ONLY because a target's circuit is open (a
 // persistently-down target): the caller re-queues it WITHOUT an attempt (T017a), so a
 // single-target outage doesn't march the corpus to dead-letter — reconcile refills the
-// gap when the target returns.
+// gap when the target returns. A flaky target leaves the object not-done for retry while
+// never blocking the healthy ones.
 func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (done, deferred bool, err error) {
 	return p.backupFrom(ctx, p.Source, e)
 }
@@ -134,11 +136,14 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (d
 		return false, false, ferr
 	}
 
-	// Fold per-target results into the circuit breaker — EXCEPT on a shutdown cancel (not
-	// the target's fault). A per-object-TIMEOUT (DeadlineExceeded) IS folded, so a HUNG
-	// target that keeps timing out trips its circuit open and later objects SKIP it
-	// (bounding a hung target's blast radius — the runtime half of FR-012 isolation).
-	if !aborted || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	// Fold per-target results into the circuit breaker ONLY on the clean (non-aborted)
+	// path, where each target's success/failure is genuinely ITS OWN. A shared ctx abort
+	// (per-object timeout or shutdown) must NOT be folded: the fanout is a barrier, so ONE
+	// hung target stalls every target into the SAME timeout — folding it would trip the
+	// HEALTHY targets' circuits in lockstep with the hung one, storing objects nowhere. A
+	// hung target is instead dropped INDIVIDUALLY by the fanout's per-target stall timeout
+	// (fanoutCopy), surfacing as its own failure on this clean path — correct attribution.
+	if !aborted {
 		p.recordCircuit(pending, results)
 	}
 
@@ -285,13 +290,23 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 	n := len(targets)
 	results := make([]targetResult, n)
 	writers := make([]*io.PipeWriter, n)
+	readers := make([]*io.PipeReader, n)
+	cancels := make([]context.CancelFunc, n)
 	var wg sync.WaitGroup
 	for i, t := range targets {
 		pr, pw := io.Pipe()
 		writers[i] = pw
+		readers[i] = pr
+		// Per-target ctx so the stall-drop can abandon ONE hung target's Store without
+		// touching the healthy targets: closing pr unblocks a Store blocked READING the
+		// pipe; cancelling tctx abandons a Store blocked WRITING to its own wedged backend
+		// (having already drained the pipe) — either way fanOut's wg.Wait() can't hang.
+		tctx, tcancel := context.WithCancel(ctx)
+		cancels[i] = tcancel
 		wg.Add(1)
-		go func(i int, t Target, pr *io.PipeReader) {
+		go func(i int, t Target, pr *io.PipeReader, tctx context.Context) {
 			defer wg.Done()
+			defer tcancel()
 			// A panic in this goroutine's own setup/teardown must fail its target, not
 			// crash the worker (the sink's Store panic is recovered inside storeWithCtx,
 			// on the other side of a goroutine boundary this recover can't reach).
@@ -308,14 +323,21 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 				reader = zr
 			}
 			er := &eofReader{r: reader}
-			res := storeWithCtx(ctx, t.Sink, e.ExternalID, er)
+			res := storeWithCtx(tctx, t.Sink, e.ExternalID, er)
 			results[i] = res
 			// Unblock the dispatcher if Store bailed before draining the pipe.
 			_ = pr.CloseWithError(res.err)
-		}(i, t, pr)
+		}(i, t, pr, tctx)
 	}
 
-	fw := newFanoutWriter(writers)
+	// drop isolates a hung target i: close its READER (unblocks the pump's blocked write
+	// AND a Store blocked reading the pipe) AND cancel its store ctx (abandons a Store
+	// blocked writing to its own wedged backend, having already drained the pipe).
+	drop := func(i int) {
+		_ = readers[i].CloseWithError(errStalled)
+		cancels[i]()
+	}
+	fw := newFanoutWriter(writers, drop, p.StallTimeout)
 	// copyErr is a SOURCE failure: a VerifyReader hash mismatch (corrupt source) or
 	// ctx cancellation/timeout during the read.
 	copyErr := fanoutCopy(fw, vr)
@@ -436,27 +458,45 @@ func fanoutCopy(fw *fanoutWriter, vr io.Reader) error {
 	}
 }
 
-// fanoutWriter writes each source chunk to every still-live target pipe using a
-// fixed set of per-target PUMP goroutines spawned ONCE (not one per chunk) — a
-// large object fanned to N targets would otherwise spawn millions of goroutines.
-// Each Write hands the chunk to every live pump and waits (a reused per-chunk
-// WaitGroup barrier) so the shared buffer isn't reused before every pump has
-// consumed it. Within a chunk the writes run concurrently; across chunks they are
-// paced to the slowest live target (the bounded-memory tradeoff — one shared
-// buffer). A pipe write error marks that target dead and the rest continue; Write
-// fails only once every target is gone. Write is called serially by the single
-// fanoutCopy driver, and each pump touches only its own dead[i] (published by the
-// barrier), so there is no data race.
+// errStalled marks a target dropped from the fan-out because it did not consume a chunk
+// within the stall timeout — a HUNG sink (a black-holed endpoint / wedged mount that
+// accepts the write but never drains). It surfaces as that target's own failure so its
+// circuit records it and later objects skip it (T017a) without the hung target ever
+// stalling the healthy targets.
+var errStalled = errors.New("sink stalled: did not drain a chunk within the stall timeout")
+
+// fanoutWriter writes each source chunk to every still-live target pipe using a fixed set
+// of per-target PUMP goroutines spawned ONCE (not one per chunk) — a large object fanned
+// to N targets would otherwise spawn millions of goroutines. Each Write hands the chunk
+// to every live pump and waits for all to consume it (so the shared buffer isn't reused
+// before every pump has copied it — the bounded-memory tradeoff). Within a chunk the
+// writes run concurrently; across chunks they are paced to the slowest LIVE target — but
+// a pump that doesn't drain a chunk within stall is DROPPED (its reader closed so its
+// write unblocks with an error), so ONE hung target can't stall the healthy targets
+// (runtime FR-012 isolation). A pipe write error marks that target dead and the rest
+// continue; Write fails only once every target is gone. Write is called serially by the
+// single fanoutCopy driver; each pump publishes its own dead[i] to Write via the done
+// channel (happens-before), so there is no data race.
 type fanoutWriter struct {
-	pumps  []chan []byte
-	dead   []bool
-	chunk  sync.WaitGroup // per-chunk barrier, reused across chunks (Write is serial)
-	pumpWg sync.WaitGroup
+	pumps   []chan []byte
+	drop    func(int) // isolate a stalled target i (close reader + cancel its store)
+	dead    []bool
+	pending []bool        // Write-only: which dispatched pumps haven't finished this chunk
+	done    chan int      // a pump signals its index after consuming (or erroring on) a chunk
+	stall   time.Duration // per-chunk drain deadline; 0 = unbounded (batch paths)
+	pumpWg  sync.WaitGroup
 }
 
-func newFanoutWriter(writers []*io.PipeWriter) *fanoutWriter {
+func newFanoutWriter(writers []*io.PipeWriter, drop func(int), stall time.Duration) *fanoutWriter {
 	n := len(writers)
-	f := &fanoutWriter{pumps: make([]chan []byte, n), dead: make([]bool, n)}
+	f := &fanoutWriter{
+		pumps:   make([]chan []byte, n),
+		drop:    drop,
+		dead:    make([]bool, n),
+		pending: make([]bool, n),
+		done:    make(chan int, n), // buffered so a pump's signal never blocks (Write may be timing out)
+		stall:   stall,
+	}
 	for i := range writers {
 		f.pumps[i] = make(chan []byte)
 		f.pumpWg.Add(1)
@@ -464,9 +504,9 @@ func newFanoutWriter(writers []*io.PipeWriter) *fanoutWriter {
 			defer f.pumpWg.Done()
 			for chunk := range f.pumps[i] {
 				if _, err := w.Write(chunk); err != nil {
-					f.dead[i] = true // own index; published to Write by chunk.Wait()
+					f.dead[i] = true // set BEFORE the done send, which publishes it to Write
 				}
-				f.chunk.Done()
+				f.done <- i
 			}
 		}(i, writers[i])
 	}
@@ -474,19 +514,56 @@ func newFanoutWriter(writers []*io.PipeWriter) *fanoutWriter {
 }
 
 func (f *fanoutWriter) Write(p []byte) (int, error) {
+	dispatched := 0
 	for i := range f.pumps {
 		if !f.dead[i] {
-			f.chunk.Add(1)
-			f.pumps[i] <- p
+			f.pending[i] = true
+			f.pumps[i] <- p // a live pump finished its last chunk, so it's ready to receive
+			dispatched++
 		}
 	}
-	f.chunk.Wait()
+	f.collect(dispatched)
 	for i := range f.dead {
 		if !f.dead[i] {
 			return len(p), nil
 		}
 	}
 	return 0, io.ErrClosedPipe
+}
+
+// collect waits for all dispatched pumps to finish the chunk, dropping any that stall
+// past f.stall (their reader is closed so their write unblocks with errStalled → dead).
+func (f *fanoutWriter) collect(dispatched int) {
+	var tick <-chan time.Time
+	if f.stall > 0 {
+		timer := time.NewTimer(f.stall)
+		defer timer.Stop()
+		tick = timer.C
+	}
+	for got := 0; got < dispatched; {
+		select {
+		case i := <-f.done:
+			f.pending[i] = false
+			got++
+		case <-tick:
+			tick = nil // fire once, then block-collect the forced completions below
+			// Drain already-finished pumps first so only GENUINELY stalled ones are dropped.
+			for drained := false; !drained; {
+				select {
+				case i := <-f.done:
+					f.pending[i] = false
+					got++
+				default:
+					drained = true
+				}
+			}
+			for i := range f.pending {
+				if f.pending[i] { // still hung: isolate it so its pump write unblocks (errStalled)
+					f.drop(i)
+				}
+			}
+		}
+	}
 }
 
 // close stops the pumps. Safe once fanoutCopy has returned: every pump finished its

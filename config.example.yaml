@@ -32,6 +32,7 @@ staleTTLSec: 3600         # must exceed perObjectTimeoutSec (FBS_STALETTLSEC)
 metricsPort: 4004         # FBS_METRICSPORT
 circuitThreshold: 5       # consecutive per-target failures that trip its circuit open (T017a; FBS_CIRCUITTHRESHOLD)
 circuitCooldownSec: 60    # how long a tripped target's circuit stays open before a probe (FBS_CIRCUITCOOLDOWNSEC)
+fanoutStallSec: 60        # a target not draining a fan-out chunk in this long is dropped as hung (FBS_FANOUTSTALLSEC)
 # scratchDir: /scratch    # reconcile stages a decoded object here (FBS_SCRATCHDIR); "" = OS temp. Point at a SIZED volume.
 
 # Symmetric targets — every object goes to every target; "done" requires all.

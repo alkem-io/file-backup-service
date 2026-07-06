@@ -160,6 +160,7 @@ func serve(cfgPath string) error {
 	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered.
 	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
 	pipeline.Circuit = breaker
+	pipeline.StallTimeout = cfg.FanoutStall() // drop a hung target individually, don't stall the barrier
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
 		Pipeline:         pipeline,

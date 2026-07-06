@@ -3,9 +3,69 @@ package domain
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
 	"time"
 )
+
+// hungSink accepts the Store call and reads NOTHING until its release channel closes —
+// a black-holed endpoint / wedged mount that stalls the fan-out barrier.
+type hungSink struct {
+	stubSink
+	release chan struct{}
+}
+
+func (h *hungSink) Store(ctx context.Context, _ string, _ io.Reader) (int64, error) {
+	select {
+	case <-h.release:
+		return 0, io.EOF // never used; keeps the type honest
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// TestFanoutDropsHungTarget: with a stall timeout, a HUNG target is dropped individually
+// and the HEALTHY co-fanned target still stores — one hung sink must NOT stall the
+// barrier and starve a healthy target (the Alt-1 / T017a runtime-isolation guarantee).
+// Without the stall-drop this test would hang until the outer timeout.
+func TestFanoutDropsHungTarget(t *testing.T) {
+	data := bytes.Repeat([]byte("fan me out past one chunk "), 100000) // multi-chunk (>1 MiB)
+	h, err := sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newMemSink("up")
+	hung := &hungSink{stubSink: stubSink{name: "hung"}, release: make(chan struct{})}
+	defer close(hung.release)
+	led := newFakeLedger()
+	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: up, Codec: CodecNone}, {Sink: hung, Codec: CodecNone}})
+	p.StallTimeout = 100 * time.Millisecond // drop a non-draining target fast (test)
+
+	done := make(chan struct{})
+	var ok, deferred bool
+	var berr error
+	go func() {
+		ok, deferred, berr = p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("BackupOne hung — the stall-drop did not isolate the hung target")
+	}
+	if berr != nil {
+		t.Fatalf("backup: %v", berr)
+	}
+	if ok || deferred {
+		t.Fatalf("want not-done, not-deferred (hung target failed on its own, not circuit-open yet): ok=%v deferred=%v", ok, deferred)
+	}
+	if !bytes.Equal(up.store[h], data) {
+		t.Fatal("the healthy target must have stored the full object despite the hung sibling")
+	}
+	if led.states[h+"/hung"] == StateStored {
+		t.Fatal("the hung target must NOT be recorded stored")
+	}
+}
 
 func TestCircuitBreaker(t *testing.T) {
 	cb := NewCircuitBreaker(3, 30*time.Millisecond)

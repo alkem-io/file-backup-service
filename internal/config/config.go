@@ -118,6 +118,7 @@ type Config struct {
 	ManifestEverySec    int      `yaml:"manifestEverySec"`   // ledger-snapshot cadence to each target (FR-015)
 	CircuitThreshold    int      `yaml:"circuitThreshold"`   // consecutive per-target failures that trip its circuit open (T017a)
 	CircuitCooldownSec  int      `yaml:"circuitCooldownSec"` // how long a tripped target's circuit stays open before a probe half-opens it
+	FanoutStallSec      int      `yaml:"fanoutStallSec"`     // per-chunk drain deadline: a target not consuming a fan-out chunk in this long is dropped (hung-sink isolation)
 	// ScratchDir is where reconcile stages a decoded object before re-fanning it out.
 	// Empty = the OS temp dir; point it at a SIZED volume (not a small memory-backed
 	// emptyDir/tmpfs) so a large-object repair on the recovery host can't fill /tmp.
@@ -143,6 +144,11 @@ func (c *Config) ManifestEvery() time.Duration {
 // CircuitCooldown is how long a tripped target's circuit stays open before a probe.
 func (c *Config) CircuitCooldown() time.Duration {
 	return time.Duration(c.CircuitCooldownSec) * time.Second
+}
+
+// FanoutStall is the per-chunk drain deadline before a non-consuming target is dropped.
+func (c *Config) FanoutStall() time.Duration {
+	return time.Duration(c.FanoutStallSec) * time.Second
 }
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env
@@ -191,6 +197,7 @@ func (c *Config) applyEnv() error {
 	add(setInt(&c.ManifestEverySec, envPrefix+"MANIFESTEVERYSEC"))
 	add(setInt(&c.CircuitThreshold, envPrefix+"CIRCUITTHRESHOLD"))
 	add(setInt(&c.CircuitCooldownSec, envPrefix+"CIRCUITCOOLDOWNSEC"))
+	add(setInt(&c.FanoutStallSec, envPrefix+"FANOUTSTALLSEC"))
 	add(applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_"))
 	add(applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_"))
 	add(c.applyTargetEnv())
@@ -261,6 +268,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CircuitCooldownSec <= 0 {
 		c.CircuitCooldownSec = 60 // re-probe a down target once a minute
+	}
+	if c.FanoutStallSec <= 0 {
+		c.FanoutStallSec = 60 // a target not draining a 1 MiB chunk in 60s is hung, not slow
 	}
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {

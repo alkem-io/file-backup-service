@@ -73,17 +73,13 @@ func (cb *CircuitBreaker) Record(target string, ok bool) {
 	}
 }
 
-// OpenCount returns how many targets currently have an open circuit — the "targets down"
-// gauge (a deferred object shows as backlog, not dead-letter, so this is the direct signal).
+// OpenCount returns how many targets are currently tripped — the "targets down" gauge.
+// It counts every target with an open-circuit entry, INCLUDING one whose cooldown has
+// elapsed but hasn't been confirmed recovered by a successful probe yet: an entry is
+// cleared ONLY by Record(ok=true), so a cooldown-elapsed-but-unprobed target still reads
+// down (else the gauge would flap to 0 during a traffic lull while the target is still down).
 func (cb *CircuitBreaker) OpenCount() int {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	now := time.Now()
-	n := 0
-	for _, until := range cb.openUntil {
-		if now.Before(until) {
-			n++
-		}
-	}
-	return n
+	return len(cb.openUntil)
 }
