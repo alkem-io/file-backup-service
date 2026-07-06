@@ -338,22 +338,15 @@ func runBackfill(args []string) error {
 	}
 	defer func() { _ = logger.Sync() }()
 
-	// Required infrastructure for backfill: the source (file-service), the ledger, and
-	// the `file` corpus. NOT the outbox (backfill reads `file`, not the queue). Targets
-	// use the same per-target isolation as serve.
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	if jerr := errors.Join(runChecks(cctx, []startCheck{
+	// Required infrastructure for backfill: the source (file-service), the ledger, and the
+	// `file` corpus. NOT the outbox (backfill reads `file`, not the queue). Same startup
+	// gate + per-target isolation as serve.
+	if err := startupGate(ctx, logger, []startCheck{
 		{"file-service unreachable", fsClient.Preflight},
 		{"ledger not accessible (schema / migrate?)", ledger.Probe},
 		{"file corpus not readable", files.Probe},
-	})...); jerr != nil {
-		cancel()
-		return jerr
-	}
-	perr := preflightTargets(cctx, logger, targets)
-	cancel()
-	if perr != nil {
-		return perr
+	}, targets); err != nil {
+		return err
 	}
 
 	st, err := domain.NewBackfiller(files, domain.NewPipeline(fsClient, ledger, targets), cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
@@ -544,15 +537,22 @@ func runChecks(ctx context.Context, checks []startCheck) []error {
 // counter), NOT fatal; serve fails only if NO target is usable (nothing could be backed
 // up). This matches FR-012 rather than turning one target's blip into a fleet CrashLoop.
 func startupChecks(ctx context.Context, logger *zap.Logger, fs *fileservice.Client, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	if err := errors.Join(runChecks(ctx, []startCheck{
+	return startupGate(ctx, logger, []startCheck{
 		{"file-service unreachable", fs.Preflight},
 		{"outbox not accessible (scoped role / schema?)", outbox.Probe},
 		{"outbox not writable", outbox.CheckWriteGrant},
 		{"ledger not accessible (schema / migrate?)", ledger.Probe},
-	})...); err != nil {
+	}, targets)
+}
+
+// startupGate runs the REQUIRED infra checks (fatal on any failure) then the target
+// preflights (per-target isolation, fatal only if none usable), under a bounded deadline —
+// the one owner of the startup policy, called by both serve and backfill with their own
+// required-check list (so the two can't diverge on the deadline or the target policy).
+func startupGate(ctx context.Context, logger *zap.Logger, required []startCheck, targets []domain.Target) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := errors.Join(runChecks(ctx, required)...); err != nil {
 		return err
 	}
 	return preflightTargets(ctx, logger, targets)
