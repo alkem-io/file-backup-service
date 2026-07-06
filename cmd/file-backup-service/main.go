@@ -38,10 +38,7 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "serve":
-		err = serve(configFlag("serve", args))
-		if errors.Is(err, context.Canceled) {
-			err = nil
-		}
+		err = onShutdownOK(serve(configFlag("serve", args)))
 	case "migrate":
 		err = runMigrate(configFlag("migrate", args))
 	case "restore":
@@ -49,20 +46,13 @@ func main() {
 	case "verify":
 		err = runVerify(args)
 	case "reconcile":
-		err = runReconcile(args)
-		if errors.Is(err, context.Canceled) {
-			err = nil
-		}
+		err = onShutdownOK(runReconcile(args))
 	case "audit":
-		// NOT swallowing context.Canceled (unlike serve/reconcile/backfill): an
-		// interrupted audit is an INCOMPLETE integrity check and must exit nonzero, so a
-		// cron doesn't read an aborted verification as passed.
+		// NOTE: no onShutdownOK — an interrupted audit is an INCOMPLETE integrity check and
+		// must exit nonzero, so a cron doesn't read an aborted verification as passed.
 		err = runAudit(args)
 	case "backfill":
-		err = runBackfill(args)
-		if errors.Is(err, context.Canceled) {
-			err = nil
-		}
+		err = onShutdownOK(runBackfill(args))
 	case "drill":
 		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
 		os.Exit(1)
@@ -73,6 +63,16 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+}
+
+// onShutdownOK maps a clean-shutdown context.Canceled to a success exit — a SIGTERM to a
+// long-running subcommand is an orderly drain, not a crash, so k8s/systemd/cron don't read
+// it as a failure. The one owner of this policy; audit deliberately opts out (see the switch).
+func onShutdownOK(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 func configFlag(name string, args []string) string {
@@ -514,28 +514,17 @@ type startCheck struct {
 	fn   func(context.Context) error
 }
 
-// runChecks runs every check CONCURRENTLY (independent pools/endpoints), each with a
-// recover so a driver panic becomes an error, not a crash. Returns per-check errors
-// (nil = ok) in order.
+// runChecks runs every check CONCURRENTLY (independent pools/endpoints), each recovered so
+// a driver panic becomes an error, not a crash. Returns per-check errors (nil = ok) in order.
 func runChecks(ctx context.Context, checks []startCheck) []error {
-	errs := make([]error, len(checks))
-	var wg sync.WaitGroup
-	for i, c := range checks {
-		wg.Add(1)
-		go func(i int, c startCheck) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					errs[i] = domain.PanicErr(c.name, r)
-				}
-			}()
+	return domain.RunParallel(checks,
+		func(c startCheck) string { return c.name },
+		func(c startCheck) error {
 			if err := c.fn(ctx); err != nil {
-				errs[i] = fmt.Errorf("%s: %w", c.name, err)
+				return fmt.Errorf("%s: %w", c.name, err)
 			}
-		}(i, c)
-	}
-	wg.Wait()
-	return errs
+			return nil
+		})
 }
 
 // startupChecks validates dependencies at startup, bounded by a deadline so a hung dial

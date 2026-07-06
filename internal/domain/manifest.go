@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 )
 
@@ -30,30 +29,18 @@ func ManifestName(t time.Time) string {
 
 // WriteManifests writes each target's OWN inventory as a JSONL snapshot to its
 // _manifest/<name> (FR-015), so any single target is restorable standalone without the
-// ledger DB. Each target's snapshot lists only what that target holds. Per-target
-// failure is isolated, and the targets are written concurrently (each is a distinct
-// query + upload, so there's nothing to share).
+// ledger DB. Each target's snapshot lists only what that target holds. Targets run
+// concurrently via RunParallel, which recovers a per-target panic (a driver panic in one
+// target's manifest write must isolate to a best-effort DR snapshot, not crash serve).
 func WriteManifests(ctx context.Context, led Ledger, targets []Target, name string) error {
-	errs := make([]error, len(targets))
-	var wg sync.WaitGroup
-	for i, t := range targets {
-		wg.Add(1)
-		go func(i int, t Target) {
-			defer wg.Done()
-			// Recover per goroutine: a driver panic in one target's manifest write must
-			// isolate to that target (best-effort DR snapshot), not crash the serve
-			// process this runs on — the pipeline recovers every sink call for the same reason.
-			defer func() {
-				if r := recover(); r != nil {
-					errs[i] = PanicErr("manifest to "+t.Sink.Name(), r)
-				}
-			}()
+	errs := RunParallel(targets,
+		func(t Target) string { return "manifest to " + t.Sink.Name() },
+		func(t Target) error {
 			if err := writeManifest(ctx, led, t.Sink, name); err != nil {
-				errs[i] = fmt.Errorf("manifest to %s: %w", t.Sink.Name(), err)
+				return fmt.Errorf("manifest to %s: %w", t.Sink.Name(), err)
 			}
-		}(i, t)
-	}
-	wg.Wait()
+			return nil
+		})
 	return errors.Join(errs...)
 }
 

@@ -78,6 +78,30 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, Metrics: Nop{}}
 }
 
+// RunParallel runs run(item) for every item CONCURRENTLY, each guarded by a recover that
+// converts a panic into an error labelled by label(item) — so one item's driver panic
+// fails just that item, never the process (a recover only catches its own goroutine). The
+// one owner of the concurrent-with-per-item-recover scaffold. Returns per-item errors in
+// order (nil = ok).
+func RunParallel[T any](items []T, label func(T) string, run func(T) error) []error {
+	errs := make([]error, len(items))
+	var wg sync.WaitGroup
+	for i := range items {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = PanicErr(label(items[i]), r)
+				}
+			}()
+			errs[i] = run(items[i])
+		}(i)
+	}
+	wg.Wait()
+	return errs
+}
+
 // TargetNames returns the sink names of targets — the allTargets argument the ledger's
 // gap/coverage/RPO queries take. One owner so the reconcile work-list and the gauges
 // compute over the same name set.
