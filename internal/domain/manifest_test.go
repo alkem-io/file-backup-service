@@ -27,6 +27,10 @@ func TestWriteManifests(t *testing.T) {
 			t.Errorf("manifest missing %q; got %q", want, got)
 		}
 	}
+	// A null/zero source date must be OMITTED, never serialized as a bogus year-1 date.
+	if strings.Contains(got, "sourceCreatedDate") || strings.Contains(got, "0001-01-01") {
+		t.Errorf("null sourceCreatedDate must be omitted, not a year-1 timestamp: %q", got)
+	}
 }
 
 // TestWriteManifestsEmptyLedger: an empty ledger writes an empty (valid) manifest, not

@@ -370,9 +370,15 @@ func runAudit(args []string) error {
 	}
 	defer pool.Close()
 	rep, err := domain.Audit(ctx, ledger, targets, *sample)
-	fmt.Printf("audit: checked=%d missing=%d errors=%d\n", rep.Checked, rep.Missing, rep.Errors)
-	if err == nil && rep.Missing > 0 {
-		err = fmt.Errorf("%d ledger-stored objects are missing from their target", rep.Missing)
+	for _, t := range rep.Targets {
+		status := ""
+		if t.Unverifiable() {
+			status = "  [UNVERIFIABLE — every Exists denied (WORM credential?); no coverage here]"
+		}
+		fmt.Printf("audit %s: checked=%d missing=%d errors=%d%s\n", t.Target, t.Checked, t.Missing, t.Errors, status)
+	}
+	if err == nil && rep.Missing() > 0 {
+		err = fmt.Errorf("%d ledger-stored objects are missing from their target", rep.Missing())
 	}
 	return err
 }

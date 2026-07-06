@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -21,7 +22,40 @@ func TestAuditDetectsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit: %v", err)
 	}
-	if rep.Checked != 2 || rep.Missing != 1 || rep.Errors != 0 {
-		t.Fatalf("report: %+v (want checked=2 missing=1 errors=0)", rep)
+	if rep.Missing() != 1 || len(rep.Targets) != 2 {
+		t.Fatalf("report: %+v (want 1 missing across 2 targets)", rep)
 	}
+	// a: checked=1 missing=0; b: checked=1 missing=1
+	for _, ta := range rep.Targets {
+		if ta.Target == "a" && (ta.Checked != 1 || ta.Missing != 0) {
+			t.Fatalf("target a: %+v", ta)
+		}
+		if ta.Target == "b" && (ta.Checked != 1 || ta.Missing != 1) {
+			t.Fatalf("target b: %+v", ta)
+		}
+	}
+}
+
+// TestAuditWORMTargetUnverifiable: a target whose Exists always errors (WORM) is
+// reported Unverifiable, not clean — so missing=0 there isn't mistaken for coverage.
+func TestAuditWORMTargetUnverifiable(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "hashA"},
+		[]TargetStatus{{Target: "worm", State: StateStored}})
+
+	rep, err := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}}}, 0)
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	if len(rep.Targets) != 1 || !rep.Targets[0].Unverifiable() || rep.Missing() != 0 {
+		t.Fatalf("report: %+v (want the worm target Unverifiable, 0 missing)", rep)
+	}
+}
+
+// existsErrSink models a PutObject-only WORM credential: Exists always errors (403).
+type existsErrSink struct{ stubSink }
+
+func (existsErrSink) Exists(context.Context, string) (bool, error) {
+	return false, errors.New("AccessDenied")
 }
