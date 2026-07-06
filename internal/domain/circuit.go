@@ -16,6 +16,16 @@ import (
 // so a single-target outage under-replicates TEMPORARILY (reconcile refills the gaps when
 // the target returns) instead of dead-lettering. Shared across the worker pool, so
 // mutex-guarded.
+//
+// It is PER-PROCESS (in-memory), not fleet-wide: with >1 worker replica, a down target
+// must be observed independently by each replica's breaker, so during the initial trip
+// window some objects can still take a real attempt (and, unluckily, dead-letter). That is
+// acceptable because RECONCILE is the cross-worker backstop: an object that stored on its
+// reachable targets has a ledger row with those stored statuses, so TargetGaps sees it as
+// under-replicated and refills the down target when it returns — even if its OUTBOX row
+// dead-lettered in the window. Fleet-wide circuit state (persisted in the ledger) would
+// tighten the window but is not worth the coordination/staleness cost for an edge reconcile
+// already recovers.
 type CircuitBreaker struct {
 	mu        sync.Mutex
 	threshold int

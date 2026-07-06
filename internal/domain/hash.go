@@ -18,16 +18,6 @@ func newHash() hash.Hash { return sha3.New256() }
 // hexSum renders a digest as lowercase hex (the externalID encoding).
 func hexSum(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
 
-// Sum returns the lowercase-hex SHA3-256 of r — the file-service externalID
-// scheme (FIPS 202), which is the object's identity, key, and verifier.
-func sum(r io.Reader) (string, error) {
-	h := newHash()
-	if _, err := io.Copy(h, r); err != nil {
-		return "", fmt.Errorf("hash: %w", err)
-	}
-	return hexSum(h), nil
-}
-
 // VerifyReader streams bytes through while hashing them; at end-of-stream it
 // returns an error if the accumulated SHA3-256 does not match want — so a
 // downstream writer (a Sink) sees the error mid-stream and never commits corrupt

@@ -13,6 +13,16 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// sum is a test-only convenience: the lowercase-hex SHA3-256 of r (an externalID). The
+// production paths hash through VerifyReader/copyVerify/newHash, so this lives with the tests.
+func sum(r io.Reader) (string, error) {
+	h := newHash()
+	if _, err := io.Copy(h, r); err != nil {
+		return "", err
+	}
+	return hexSum(h), nil
+}
+
 type fakeSource struct{ data []byte }
 
 func (f fakeSource) FetchContent(context.Context, OutboxEntry) (io.ReadCloser, error) {
