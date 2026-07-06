@@ -63,6 +63,65 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	return nil
 }
 
+// EachObject streams every ledger object for the manifest snapshot, invoking fn per
+// row (FR-015). Streaming (not ReadAll) keeps memory bounded across millions of rows.
+func (r *LedgerRepo) EachObject(ctx context.Context, fn func(domain.ObjectMeta) error) error {
+	const q = `SELECT "externalID", size, COALESCE("createdBy"::text,''), "sourceCreatedDate"
+	FROM file_backup_object ORDER BY "externalID"`
+	rows, err := r.p.Query(ctx, q)
+	if err != nil {
+		return fmt.Errorf("stream objects: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var m domain.ObjectMeta
+		var created pgtype.Timestamptz
+		if err := rows.Scan(&m.ExternalID, &m.Size, &m.CreatedBy, &created); err != nil {
+			return fmt.Errorf("scan object: %w", err)
+		}
+		if created.Valid {
+			m.SourceCreatedDate = created.Time
+		}
+		if err := fn(m); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// TargetGaps streams objects NOT stored on every configured target, with the set of
+// CURRENT targets that DO hold each — the reconcile work-list. An object stored on all
+// of allTargets is excluded; stale statuses for removed targets are ignored (the
+// count + agg filter to allTargets).
+func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
+	const q = `SELECT o."externalID",
+	  COALESCE(array_agg(ts.target) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)), '{}')
+	FROM file_backup_object o
+	LEFT JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
+	GROUP BY o."externalID"
+	HAVING count(*) FILTER (WHERE ts.state = 'stored' AND ts.target = ANY($2)) < $1`
+	rows, err := r.p.Query(ctx, q, len(allTargets), allTargets)
+	if err != nil {
+		return fmt.Errorf("target gaps: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var externalID string
+		var storedList []string
+		if err := rows.Scan(&externalID, &storedList); err != nil {
+			return fmt.Errorf("scan gap: %w", err)
+		}
+		stored := make(map[string]bool, len(storedList))
+		for _, t := range storedList {
+			stored[t] = true
+		}
+		if err := fn(externalID, stored); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // LastVerifiedAge returns seconds since the most recent per-target verify (FR-026's
 // last-successful-backup-age signal). ok=false when nothing has been verified yet.
 func (r *LedgerRepo) LastVerifiedAge(ctx context.Context) (ageSec float64, ok bool, err error) {

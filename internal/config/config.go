@@ -100,8 +100,9 @@ type Config struct {
 	PerObjectTimeoutSec int      `yaml:"perObjectTimeoutSec"`
 	StaleTTLSec         int      `yaml:"staleTTLSec"`
 	PollEverySec        int      `yaml:"pollEverySec"`
-	MaxAttempts         int      `yaml:"maxAttempts"`   // genuine-failure dead-letter threshold (FR-029)
-	MaxDeliveries       int      `yaml:"maxDeliveries"` // crash-loop dead-letter threshold (FR-029)
+	MaxAttempts         int      `yaml:"maxAttempts"`      // genuine-failure dead-letter threshold (FR-029)
+	MaxDeliveries       int      `yaml:"maxDeliveries"`    // crash-loop dead-letter threshold (FR-029)
+	ManifestEverySec    int      `yaml:"manifestEverySec"` // ledger-snapshot cadence to each target (FR-015)
 }
 
 // PerObjectTimeout is the per-object backup deadline.
@@ -114,6 +115,11 @@ func (c *Config) StaleTTL() time.Duration { return time.Duration(c.StaleTTLSec) 
 
 // PollEvery is the polling floor.
 func (c *Config) PollEvery() time.Duration { return time.Duration(c.PollEverySec) * time.Second }
+
+// ManifestEvery is the ledger-snapshot cadence.
+func (c *Config) ManifestEvery() time.Duration {
+	return time.Duration(c.ManifestEverySec) * time.Second
+}
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env
 // (FBS_* scalars/DB, FBS_TARGET_<NAME>_* per target), then applies defaults.
@@ -157,6 +163,7 @@ func (c *Config) applyEnv() error {
 	add(setInt(&c.PollEverySec, envPrefix+"POLLEVERYSEC"))
 	add(setInt(&c.MaxAttempts, envPrefix+"MAXATTEMPTS"))
 	add(setInt(&c.MaxDeliveries, envPrefix+"MAXDELIVERIES"))
+	add(setInt(&c.ManifestEverySec, envPrefix+"MANIFESTEVERYSEC"))
 	add(applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_"))
 	add(applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_"))
 	add(c.applyTargetEnv())
@@ -218,6 +225,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxDeliveries <= 0 {
 		c.MaxDeliveries = 50
+	}
+	if c.ManifestEverySec <= 0 {
+		c.ManifestEverySec = 24 * 60 * 60 // daily
 	}
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {
@@ -301,7 +311,7 @@ func (c *Config) validateLimits() error {
 	for _, f := range []struct {
 		name string
 		sec  int
-	}{{"perObjectTimeoutSec", c.PerObjectTimeoutSec}, {"staleTTLSec", c.StaleTTLSec}, {"pollEverySec", c.PollEverySec}} {
+	}{{"perObjectTimeoutSec", c.PerObjectTimeoutSec}, {"staleTTLSec", c.StaleTTLSec}, {"pollEverySec", c.PollEverySec}, {"manifestEverySec", c.ManifestEverySec}} {
 		if f.sec > maxSec {
 			return fmt.Errorf("%s (%d) exceeds the max %d", f.name, f.sec, maxSec)
 		}

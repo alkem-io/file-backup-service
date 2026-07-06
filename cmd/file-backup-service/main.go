@@ -153,13 +153,14 @@ func serve(cfgPath string) error {
 		Logger:           logger,
 	})
 
-	// RPO/lag gauges (FR-026): backlog depth + oldest-pending age from the outbox,
-	// last-successful-backup age from the ledger — the alerting spine. Stopped before
-	// the pools close (defer runs LIFO, ahead of the pool Close defers above).
-	var sampleWG sync.WaitGroup
-	sampleWG.Add(1)
-	go func() { defer sampleWG.Done(); sampleRPO(ctx, outbox, ledger, mx) }()
-	defer sampleWG.Wait()
+	// Background loops, stopped before the pools close (defer runs LIFO, ahead of the
+	// pool Close defers above): the RPO/lag gauges (FR-026) and the periodic ledger
+	// snapshot to each target (FR-015, standalone-restorability).
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
+	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, mx) }()
+	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger) }()
+	defer bgWG.Wait()
 
 	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
 	return cons.Run(ctx)
@@ -252,6 +253,27 @@ func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo
 		}
 		if ageSec, ok, err := ledger.LastVerifiedAge(sctx); err == nil && ok {
 			mx.SetLastSuccessAge(ageSec)
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),
+// starting immediately, until ctx is cancelled. Best-effort: a failed snapshot is
+// logged, not fatal (a target's manifest is a DR convenience, not the backup itself).
+func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, every time.Duration, logger *zap.Logger) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		// Generous bound for a full ledger dump; derived from ctx so shutdown aborts it.
+		mctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		if err := domain.WriteManifests(mctx, ledger, targets, domain.ManifestName(time.Now())); err != nil && ctx.Err() == nil {
+			logger.Warn("manifest snapshot", zap.Error(err))
 		}
 		cancel()
 		select {

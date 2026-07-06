@@ -74,4 +74,10 @@ type Ledger interface {
 	// migration fails loudly at startup and via readiness, not as a green-health
 	// stall where every RecordBackup errors "relation does not exist".
 	Probe(ctx context.Context) error
+	// EachObject streams every ledger object (for the manifest snapshot), invoking fn
+	// per row; if fn returns an error, iteration stops and returns it.
+	EachObject(ctx context.Context, fn func(ObjectMeta) error) error
+	// TargetGaps streams objects that are NOT stored on every configured target,
+	// with the set of target names that DO hold each — the reconcile work-list.
+	TargetGaps(ctx context.Context, allTargets []string, fn func(externalID string, stored map[string]bool) error) error
 }

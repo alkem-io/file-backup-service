@@ -56,6 +56,30 @@ func (f *fakeLedger) StoredTargets(context.Context, string) (map[string]bool, er
 	return map[string]bool{}, nil
 }
 func (f *fakeLedger) Probe(context.Context) error { return nil }
+func (f *fakeLedger) EachObject(_ context.Context, fn func(ObjectMeta) error) error {
+	for id := range f.objects {
+		if err := fn(ObjectMeta{ExternalID: id, Size: f.sizes[id]}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (f *fakeLedger) TargetGaps(_ context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
+	for id := range f.objects {
+		stored := map[string]bool{}
+		for _, t := range allTargets {
+			if f.states[id+"/"+t] == StateStored {
+				stored[t] = true
+			}
+		}
+		if len(stored) < len(allTargets) {
+			if err := fn(id, stored); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 
 // stubSink is a no-op Sink base: embed it and override only the method a fake needs,
 // so a new port method is one edit here, not one per fake.
@@ -92,6 +116,14 @@ func (m *memSink) Store(_ context.Context, h string, r io.Reader) (int64, error)
 }
 func (m *memSink) Fetch(_ context.Context, h string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(m.store[h])), nil
+}
+func (m *memSink) PutManifest(_ context.Context, name string, r io.Reader) error {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.store["_manifest/"+name] = b
+	return nil
 }
 
 func TestPipelineBackupOne(t *testing.T) {

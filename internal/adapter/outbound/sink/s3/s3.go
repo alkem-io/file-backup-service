@@ -112,17 +112,16 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 	return true, nil
 }
 
-// Store uploads bytes for hash (SSE applied; bucket default retention provides WORM).
-// It hands minio size=-1 (streamed to EOF) so the commit is gated on the upstream
-// VerifyReader hash check, never a known length. But a 0-byte object then completes a
-// multipart with an empty part, which Scaleway (and many S3 backends) reject
-// (EntityTooSmall); detect empty with a single-byte read (no per-object bufio buffer)
-// and use one empty PutObject instead, re-prepending the read byte via MultiReader.
-func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, error) {
+// putStream uploads r to key with SSE, size=-1 (streamed to EOF) so a commit is gated
+// on the caller's upstream verification, never a known length. But a 0-byte stream then
+// completes a multipart with an empty part, which Scaleway (and many S3 backends)
+// reject (EntityTooSmall); detect empty with a single-byte read (no per-object bufio
+// buffer) and use one empty PutObject, re-prepending the read byte via MultiReader.
+func (s *Sink) putStream(ctx context.Context, key string, r io.Reader) (int64, error) {
 	var one [1]byte
 	n, err := io.ReadFull(r, one[:]) // 1-byte buf: (1,nil) if a byte, (0,io.EOF) if empty
-	if errors.Is(err, io.EOF) {      // empty object (already hash-verified upstream)
-		if _, perr := s.client.PutObject(ctx, s.bucket, s.key(hash), bytes.NewReader(nil), 0, s.opts); perr != nil {
+	if errors.Is(err, io.EOF) {      // empty object
+		if _, perr := s.client.PutObject(ctx, s.bucket, key, bytes.NewReader(nil), 0, s.opts); perr != nil {
 			return 0, fmt.Errorf("put (empty): %w", perr)
 		}
 		return 0, nil
@@ -130,12 +129,16 @@ func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, erro
 	if err != nil {
 		return 0, fmt.Errorf("read: %w", err)
 	}
-	body := io.MultiReader(bytes.NewReader(one[:n]), r)
-	info, err := s.client.PutObject(ctx, s.bucket, s.key(hash), body, -1, s.opts)
+	info, err := s.client.PutObject(ctx, s.bucket, key, io.MultiReader(bytes.NewReader(one[:n]), r), -1, s.opts)
 	if err != nil {
 		return 0, fmt.Errorf("put: %w", err)
 	}
 	return info.Size, nil
+}
+
+// Store uploads bytes for hash (bucket default retention provides WORM).
+func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, error) {
+	return s.putStream(ctx, s.key(hash), r)
 }
 
 // Fetch streams the stored object.
@@ -147,11 +150,9 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 	return obj, nil
 }
 
-// PutManifest writes a ledger snapshot object under _manifest/.
+// PutManifest writes a ledger snapshot object under _manifest/ (empty-safe: an empty
+// ledger snapshot is a legitimate 0-byte object).
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
-	key := s.prefixed(fsutil.ManifestKey(name))
-	if _, err := s.client.PutObject(ctx, s.bucket, key, r, -1, s.opts); err != nil {
-		return fmt.Errorf("put manifest: %w", err)
-	}
-	return nil
+	_, err := s.putStream(ctx, s.prefixed(fsutil.ManifestKey(name)), r)
+	return err
 }
