@@ -332,11 +332,20 @@ func (c *Config) Validate() error {
 	return c.ValidateTargets()
 }
 
+// ValidateDR is the check the ledger-DB DR subcommands (reconcile/audit) need: the
+// numeric limits (so a huge perObjectTimeoutSec can't overflow to a negative Duration on
+// this path) PLUS the target set — but NOT fileServiceBase/outbox, so it still runs in
+// the degraded/DR environment. serve's full Validate is the superset.
+func (c *Config) ValidateDR() error {
+	if err := c.validateLimits(); err != nil {
+		return err
+	}
+	return c.ValidateTargets()
+}
+
 // ValidateTargets validates the target set — each target's fields plus no env-token
 // collisions (two names mapping to one FBS_TARGET_<TOKEN>_* would silently share
-// secrets). It is the whole check the DR subcommands (restore/verify/reconcile) need:
-// they never touch fileServiceBase or the outbox DB, so requiring the full serve config
-// would make them unusable in the degraded/DR environment they exist for.
+// secrets). Used by restore/verify (which need only a single sink built).
 func (c *Config) ValidateTargets() error {
 	if len(c.Targets) == 0 {
 		return errors.New("at least one target is required")
@@ -378,7 +387,11 @@ func (c *Config) validateLimits() error {
 	for _, f := range []struct {
 		name string
 		sec  int
-	}{{"perObjectTimeoutSec", c.PerObjectTimeoutSec}, {"staleTTLSec", c.StaleTTLSec}, {"pollEverySec", c.PollEverySec}, {"manifestEverySec", c.ManifestEverySec}} {
+	}{
+		{"perObjectTimeoutSec", c.PerObjectTimeoutSec}, {"staleTTLSec", c.StaleTTLSec},
+		{"pollEverySec", c.PollEverySec}, {"manifestEverySec", c.ManifestEverySec},
+		{"circuitCooldownSec", c.CircuitCooldownSec}, {"fanoutStallSec", c.FanoutStallSec},
+	} {
 		if f.sec > maxSec {
 			return fmt.Errorf("%s (%d) exceeds the max %d", f.name, f.sec, maxSec)
 		}
@@ -386,6 +399,14 @@ func (c *Config) validateLimits() error {
 	if c.StaleTTLSec <= c.PerObjectTimeoutSec {
 		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec (%d), else a running object is reaped",
 			c.StaleTTLSec, c.PerObjectTimeoutSec)
+	}
+	// The stall-drop MUST fire before the per-object timeout, or a hung target stalls the
+	// whole fan-out barrier until the shared timeout aborts every target in lockstep (the
+	// circuit never trips → the object Fails instead of Defers → the corpus dead-letters,
+	// the exact T017a failure mode). Enforce the ordering instead of leaving it to luck.
+	if c.FanoutStallSec >= c.PerObjectTimeoutSec {
+		return fmt.Errorf("fanoutStallSec (%d) must be < perObjectTimeoutSec (%d), else a hung target is never dropped before the object times out",
+			c.FanoutStallSec, c.PerObjectTimeoutSec)
 	}
 	// Only upper bounds here — applyDefaults already floors each of these <=0 to a
 	// positive default before Validate runs (as with Concurrency above), so a `< 1`

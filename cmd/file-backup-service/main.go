@@ -252,7 +252,7 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("load config: %w", err)
 	}
-	if err := cfg.ValidateTargets(); err != nil {
+	if err := cfg.ValidateDR(); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
 	pool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))

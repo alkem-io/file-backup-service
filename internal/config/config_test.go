@@ -126,7 +126,33 @@ func validConfig(targets ...Target) *Config {
 		MetricsPort:         4004,
 		MaxAttempts:         10,
 		MaxDeliveries:       50,
+		FanoutStallSec:      60,
+		CircuitCooldownSec:  60,
 		Targets:             targets,
+	}
+}
+
+func TestValidateRejectsStallNotBelowTimeout(t *testing.T) {
+	c := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
+	c.FanoutStallSec = c.PerObjectTimeoutSec // stall must fire BEFORE the per-object timeout
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected fanoutStallSec >= perObjectTimeoutSec to be rejected (stall-drop would never fire first)")
+	}
+}
+
+func TestValidateRejectsOverflowingCircuitKnobs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Config)
+	}{
+		{"fanoutStallSec", func(c *Config) { c.FanoutStallSec = 1 << 40 }},
+		{"circuitCooldownSec", func(c *Config) { c.CircuitCooldownSec = 1 << 40 }},
+	} {
+		c := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
+		tc.set(c)
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected an overflowing %s to be rejected (would wrap to a negative Duration)", tc.name)
+		}
 	}
 }
 
