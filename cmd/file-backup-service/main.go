@@ -242,29 +242,29 @@ func runVerify(args []string) error {
 // validates the targets (not the full serve config — these run in the DR state without
 // file-service / the outbox DB), opens + probes the ledger pool, and builds the sinks.
 // The caller MUST close the returned pool.
-func ledgerJob(ctx context.Context, cfgPath string) (*db.LedgerRepo, *db.Pool, []domain.Target, error) {
+func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerRepo, *db.Pool, []domain.Target, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("load config: %w", err)
 	}
 	if err := cfg.ValidateTargets(); err != nil {
-		return nil, nil, nil, fmt.Errorf("invalid config: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
 	pool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("ledger pool: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("ledger pool: %w", err)
 	}
 	ledger := db.NewLedgerRepo(pool)
 	if err := ledger.Probe(ctx); err != nil {
 		pool.Close()
-		return nil, nil, nil, fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
 	}
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		pool.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return ledger, pool, targets, nil
+	return cfg, ledger, pool, targets, nil
 }
 
 // runReconcile repairs under-replicated objects target-to-target (FR-025/T029): for
@@ -277,12 +277,12 @@ func runReconcile(args []string) error {
 	_ = fs.Parse(args)
 	ctx, stop := signalContext()
 	defer stop()
-	ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
+	cfg, ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-	st, err := domain.NewReconciler(ledger, targets).Run(ctx, *ratePerSec)
+	st, err := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
 	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d\n", st.Repaired, st.Skipped, st.Failed)
 	return err
 }
@@ -349,7 +349,7 @@ func runBackfill(args []string) error {
 		return perr
 	}
 
-	st, err := domain.NewBackfiller(files, domain.NewPipeline(fsClient, ledger, targets)).Run(ctx, *ratePerSec)
+	st, err := domain.NewBackfiller(files, domain.NewPipeline(fsClient, ledger, targets), cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d failed=%d\n", st.Backed, st.Failed)
 	return err
 }
@@ -364,7 +364,7 @@ func runAudit(args []string) error {
 	_ = fs.Parse(args)
 	ctx, stop := signalContext()
 	defer stop()
-	ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
+	_, ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}

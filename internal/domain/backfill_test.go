@@ -3,10 +3,36 @@ package domain
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
+	"time"
 )
 
 type fakeCorpus struct{ entries []OutboxEntry }
+
+// hangingSource blocks until its (per-object) ctx fires — models a fetch stalled after
+// headers / a wedged sink.
+type hangingSource struct{}
+
+func (hangingSource) FetchContent(ctx context.Context, _ OutboxEntry) (io.ReadCloser, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestBackfillPerObjectTimeout: a hung object must fail via the per-object timeout and
+// the pass must continue — not stall the whole single-threaded backfill indefinitely.
+func TestBackfillPerObjectTimeout(t *testing.T) {
+	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: "h1"}, {ExternalID: "h2"}}}
+	p := NewPipeline(hangingSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
+	// Run ctx is Background (un-cancelled) so ONLY the per-object timeout can end a hang.
+	st, err := NewBackfiller(corpus, p, 50*time.Millisecond).Run(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if st.Failed != 2 || st.Backed != 0 {
+		t.Fatalf("stats: %+v (want both objects failed via per-object timeout)", st)
+	}
+}
 
 func (c fakeCorpus) EachFile(_ context.Context, fn func(OutboxEntry) error) error {
 	for _, e := range c.entries {
@@ -30,7 +56,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
 	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: h}}}
 
-	st, err := NewBackfiller(corpus, p).Run(context.Background(), 0)
+	st, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
@@ -43,7 +69,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 
 	// Resumable: a second pass finds it already stored (dedup, no re-store) and still
 	// reports it backed.
-	st2, err := NewBackfiller(corpus, p).Run(context.Background(), 0)
+	st2, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
 	if err != nil || st2.Backed != 1 || st2.Failed != 0 {
 		t.Fatalf("resume: %+v err=%v (want backed=1 failed=0)", st2, err)
 	}

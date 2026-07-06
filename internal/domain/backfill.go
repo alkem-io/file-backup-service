@@ -56,13 +56,15 @@ type BackfillStats struct {
 // both resumable (re-run skips completed objects cheaply) and repeatable as a
 // completeness sweep. Rate-limited + ctx-cancellable; a poison object can't crash it.
 type Backfiller struct {
-	corpus CorpusEnumerator
-	p      *Pipeline
+	corpus     CorpusEnumerator
+	p          *Pipeline
+	perObjectT time.Duration // bounds one object's backup (a hung fetch/sink), like serve
 }
 
-// NewBackfiller binds a Backfiller to the corpus source and a source-backed pipeline.
-func NewBackfiller(corpus CorpusEnumerator, p *Pipeline) *Backfiller {
-	return &Backfiller{corpus: corpus, p: p}
+// NewBackfiller binds a Backfiller to the corpus source and a source-backed pipeline;
+// perObjectTimeout bounds one object so a hung fetch/sink can't stall the whole pass.
+func NewBackfiller(corpus CorpusEnumerator, p *Pipeline, perObjectTimeout time.Duration) *Backfiller {
+	return &Backfiller{corpus: corpus, p: p, perObjectT: perObjectTimeout}
 }
 
 // Run enumerates the corpus and backs up each object at up to ratePerSec (0 = unlimited),
@@ -85,6 +87,8 @@ func (b *Backfiller) Run(ctx context.Context, ratePerSec int) (BackfillStats, er
 // (e.g. a nil-slice panic on a shutdown-interrupted fetch) can't crash the whole pass.
 func (b *Backfiller) backupOne(ctx context.Context, e OutboxEntry, st *BackfillStats) {
 	defer recoverFailed(&st.Failed)
+	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
+	defer cancel()
 	if done, err := b.p.BackupOne(ctx, e); err == nil && done {
 		st.Backed++
 	} else {

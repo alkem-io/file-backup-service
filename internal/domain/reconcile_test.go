@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 )
 
 // TestReconcileRepairsGap: an object stored on A but missing on B is repaired by
@@ -24,7 +25,7 @@ func TestReconcileRepairsGap(t *testing.T) {
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(data))},
 		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
 
-	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}})
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}}, time.Minute)
 	st, err := rec.Run(ctx, 0)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -48,7 +49,7 @@ func TestReconcileSkipsWhenNoSource(t *testing.T) {
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "orphan", Size: 1},
 		[]TargetStatus{{Target: "a", State: StateFailed}, {Target: "b", State: StateFailed}})
 
-	rec := NewReconciler(led, []Target{{Sink: newMemSink("a")}, {Sink: newMemSink("b")}})
+	rec := NewReconciler(led, []Target{{Sink: newMemSink("a")}, {Sink: newMemSink("b")}}, time.Minute)
 	st, err := rec.Run(ctx, 0)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -85,7 +86,7 @@ func TestReconcileSurvivesCodecFlip(t *testing.T) {
 		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
 
 	// A's configured codec is now None (flipped) — the stored bytes are still zstd.
-	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}})
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}}, time.Minute)
 	st, err := rec.Run(ctx, 0)
 	if err != nil || st.Repaired != 1 {
 		t.Fatalf("reconcile after codec flip: stats=%+v err=%v", st, err)
@@ -118,7 +119,7 @@ func TestReconcileRawZstdLookalike(t *testing.T) {
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(frame))},
 		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
 
-	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}})
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}}, time.Minute)
 	st, err := rec.Run(ctx, 0)
 	if err != nil || st.Repaired != 1 {
 		t.Fatalf("reconcile raw-zstd-lookalike: stats=%+v err=%v", st, err)
@@ -152,7 +153,7 @@ func TestReconcileZstdSource(t *testing.T) {
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(data))},
 		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
 
-	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecZstd}, {Sink: b, Codec: CodecNone}})
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecZstd}, {Sink: b, Codec: CodecNone}}, time.Minute)
 	st, err := rec.Run(ctx, 0)
 	if err != nil || st.Repaired != 1 {
 		t.Fatalf("reconcile zstd: stats=%+v err=%v", st, err)

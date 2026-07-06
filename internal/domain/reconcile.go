@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 // Reconciler repairs under-replicated objects (FR-025/T029): for each object not
@@ -15,18 +16,20 @@ import (
 // recovery path that makes object-level dead-letter safe: a target that was down comes
 // back and reconcile fills its gaps.
 type Reconciler struct {
-	ledger  Ledger
-	targets []Target
-	byName  map[string]Target
+	ledger     Ledger
+	targets    []Target
+	byName     map[string]Target
+	perObjectT time.Duration // bounds one object's repair (a hung source/sink), like serve
 }
 
-// NewReconciler binds a Reconciler to the ledger and target set.
-func NewReconciler(led Ledger, targets []Target) *Reconciler {
+// NewReconciler binds a Reconciler to the ledger and target set; perObjectTimeout bounds
+// one object's repair so a hung fetch/sink can't stall the whole single-threaded pass.
+func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration) *Reconciler {
 	byName := make(map[string]Target, len(targets))
 	for _, t := range targets {
 		byName[t.Sink.Name()] = t
 	}
-	return &Reconciler{ledger: led, targets: targets, byName: byName}
+	return &Reconciler{ledger: led, targets: targets, byName: byName, perObjectT: perObjectTimeout}
 }
 
 // ReconcileStats reports one reconcile pass.
@@ -63,6 +66,8 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 // in one repair is contained (counted failed) so a poison object can't crash the pass.
 func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string, stored map[string]bool, st *ReconcileStats) {
 	defer recoverFailed(&st.Failed)
+	ctx, cancel := context.WithTimeout(ctx, rc.perObjectT) // a hung source/sink fails this object, not the pass
+	defer cancel()
 	entry := OutboxEntry{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
 	tried := false
 	for name := range stored {

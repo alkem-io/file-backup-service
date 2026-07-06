@@ -3,7 +3,6 @@ package domain
 import (
 	"context"
 	"fmt"
-	"sync"
 )
 
 // auditConcurrency bounds the parallel Exists probes per page (each is an independent
@@ -108,21 +107,44 @@ type existsResult struct {
 
 // existsPage probes Sink.Exists for every object in the page concurrently (bounded by
 // auditConcurrency), so a page of independent HEAD RTTs collapses to ~page/concurrency
-// wall-clock instead of a serial sum.
+// wall-clock instead of a serial sum. Both the concurrency-acquire AND the result
+// collection observe ctx, so a cancelled audit RETURNS promptly even when in-flight
+// probes are wedged on an uninterruptible os.Stat (a hung filesystem mount) — the stuck
+// goroutines are abandoned (their buffered send never blocks), not waited on, so the
+// audit can't hang. The caller re-checks ctx.Err() and surfaces the cancellation.
 func existsPage(ctx context.Context, sink Sink, page []ObjectMeta) []existsResult {
 	results := make([]existsResult, len(page))
+	for i := range results {
+		results[i].err = context.Canceled // default: unchecked (a cancelled/abandoned probe)
+	}
+	type done struct {
+		i int
+		r existsResult
+	}
+	ch := make(chan done, len(page)) // buffered: an abandoned probe's send never blocks
 	sem := make(chan struct{}, auditConcurrency)
-	var wg sync.WaitGroup
+	dispatched := 0
+dispatch:
 	for i := range page {
-		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break dispatch // stop dispatching; don't block the acquire when probes are wedged
+		}
+		dispatched++
 		go func(i int) {
-			defer wg.Done()
 			defer func() { <-sem }()
 			present, err := sink.Exists(ctx, page[i].ExternalID)
-			results[i] = existsResult{present: present, err: err}
+			ch <- done{i, existsResult{present: present, err: err}}
 		}(i)
 	}
-	wg.Wait()
+	for n := 0; n < dispatched; n++ {
+		select {
+		case d := <-ch:
+			results[d.i] = d.r
+		case <-ctx.Done():
+			return results // abandon wedged probes; caller sees ctx.Err() and returns
+		}
+	}
 	return results
 }
