@@ -231,7 +231,10 @@ func (p *Pipeline) classifyFanout(pending []Target, results []targetResult, abor
 		name := t.Sink.Name()
 		if results[i].err != nil {
 			allStored = false
-			if p.Circuit != nil && p.Circuit.Open(name) {
+			// Down (a PURE read), not Open: classifying results must not mutate the breaker
+			// — on the aborted path recordCircuit is skipped precisely to leave circuit
+			// state untouched, and Open() would steal the target's half-open probe here.
+			if p.Circuit != nil && p.Circuit.Down(name) {
 				continue
 			}
 			healthyFailed = true

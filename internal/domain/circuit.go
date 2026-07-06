@@ -73,6 +73,18 @@ func (cb *CircuitBreaker) Record(target string, ok bool) {
 	}
 }
 
+// Down is a PURE read: does target have an open circuit right now (including one whose
+// cooldown has elapsed but hasn't been confirmed recovered)? Unlike Open it has NO side
+// effect — it never reserves a half-open probe slot — so a result-CLASSIFICATION caller
+// (which must not mutate breaker state, e.g. on the aborted fan-out path) can ask "is
+// this failed target a down-target gap?" without stealing the target's recovery probe.
+func (cb *CircuitBreaker) Down(target string) bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	_, open := cb.openUntil[target]
+	return open
+}
+
 // OpenCount returns how many targets are currently tripped — the "targets down" gauge.
 // It counts every target with an open-circuit entry, INCLUDING one whose cooldown has
 // elapsed but hasn't been confirmed recovered by a successful probe yet: an entry is
