@@ -396,9 +396,15 @@ func (c *Config) validateLimits() error {
 			return fmt.Errorf("%s (%d) exceeds the max %d", f.name, f.sec, maxSec)
 		}
 	}
-	if c.StaleTTLSec <= c.PerObjectTimeoutSec {
-		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec (%d), else a running object is reaped",
-			c.StaleTTLSec, c.PerObjectTimeoutSec)
+	// staleTTL must exceed the per-object timeout PLUS the detached-bookkeeping window: an
+	// object can hit the full per-object timeout and then spend up to BookkeepingTimeout
+	// writing its MarkDone/Fail on a detached ctx while still status='in_progress'. If the
+	// reaper's TTL falls inside that window it requeues the completed object (deliveries++),
+	// creeping it toward the crash-loop dead-letter for a non-problem.
+	minStaleTTL := c.PerObjectTimeoutSec + int(domain.BookkeepingTimeout.Seconds())
+	if c.StaleTTLSec <= minStaleTTL {
+		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec + bookkeeping (%d), else the reaper can requeue a settling object",
+			c.StaleTTLSec, minStaleTTL)
 	}
 	// The stall-drop MUST fire before the per-object timeout, or a hung target stalls the
 	// whole fan-out barrier until the shared timeout aborts every target in lockstep (the

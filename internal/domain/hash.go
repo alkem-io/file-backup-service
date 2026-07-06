@@ -34,15 +34,20 @@ func sum(r io.Reader) (string, error) {
 // or wrong-hash data. Total is the plaintext byte count seen so far. This makes
 // integrity a property of the stream, with no whole-object buffering.
 type VerifyReader struct {
-	r     io.Reader
-	h     hash.Hash
-	want  string
-	Total int64
+	r      io.Reader
+	h      hash.Hash
+	want   string
+	maxLen int64 // 0 = unbounded; else fail mid-stream once Total exceeds it
+	Total  int64
 }
 
-// NewVerifyReader wraps r, verifying against want.
-func NewVerifyReader(r io.Reader, want string) *VerifyReader {
-	return &VerifyReader{r: r, h: newHash(), want: want}
+// NewVerifyReader wraps r, verifying against want and failing mid-stream if the source
+// exceeds maxLen bytes (0 = unbounded). The cap is what makes the BACKUP path enforce the
+// service's own restorability invariant: restore/verify/reconcile reject anything over
+// maxObjectBytes, so an over-cap object must fail HERE (nothing committed) rather than be
+// stored on every target and then be permanently unrestorable.
+func NewVerifyReader(r io.Reader, want string, maxLen int64) *VerifyReader {
+	return &VerifyReader{r: r, h: newHash(), want: want, maxLen: maxLen}
 }
 
 // Read implements io.Reader.
@@ -51,6 +56,9 @@ func (v *VerifyReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		_, _ = v.h.Write(p[:n])
 		v.Total += int64(n)
+	}
+	if v.maxLen > 0 && v.Total > v.maxLen {
+		return n, fmt.Errorf("integrity: object exceeds the %d-byte max (unrestorable if stored)", v.maxLen)
 	}
 	// Verify at ANY end-of-stream, not just a clean io.EOF: a truncated source (a
 	// mid-stream connection drop with a known Content-Length) surfaces as

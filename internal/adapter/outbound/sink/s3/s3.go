@@ -56,8 +56,8 @@ func New(cfg Config) (*Sink, error) {
 	// minio-go defaults to a ~528 MiB part (5 TiB / 10000 parts) and does make([]byte,
 	// part) PER upload — which OOMs the co-located RWO node at concurrency. 5 MiB is the
 	// S3 multipart minimum: live heap = concurrency x #targets x 5 MiB, and 5 MiB x 10,000
-	// parts = ~48 GiB, comfortably above the ~2 GiB real max object size (domain.MaxObjectBytes
-	// = 4 GiB). If MaxObjectBytes is ever raised past ~48 GiB, revisit this together.
+	// parts = ~48 GiB, comfortably above the ~2 GiB real max object size (the domain object cap
+	// = 4 GiB). If that cap is ever raised past ~48 GiB, revisit this together.
 	opts := minio.PutObjectOptions{PartSize: 5 << 20}
 	if cfg.SSE {
 		opts.ServerSideEncryption = encrypt.NewSSE()

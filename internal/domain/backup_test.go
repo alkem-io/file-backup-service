@@ -229,6 +229,29 @@ func TestPipelineFetchCancelledNoPanic(t *testing.T) {
 	}
 }
 
+// TestBackupRejectsOverCapObject: an object larger than the end-to-end cap must FAIL the
+// backup (nothing committed), not be stored on every target and then be unrestorable.
+func TestBackupRejectsOverCapObject(t *testing.T) {
+	old := maxObjectBytes
+	maxObjectBytes = 100
+	defer func() { maxObjectBytes = old }()
+
+	data := bytes.Repeat([]byte("x"), 500) // > the 100-byte cap
+	h, err := sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := newMemSink("t")
+	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
+	ok, deferred, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	if err == nil || ok || deferred {
+		t.Fatalf("an over-cap object must fail: ok=%v deferred=%v err=%v", ok, deferred, err)
+	}
+	if len(sink.store) != 0 {
+		t.Fatal("an over-cap object must NOT be committed to any target")
+	}
+}
+
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := newMemSink("t1")
 	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})

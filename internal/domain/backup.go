@@ -288,7 +288,7 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 		return nil, -1, err
 	}
 	defer func() { _ = rc.Close() }()
-	vr := NewVerifyReader(rc, e.ExternalID)
+	vr := NewVerifyReader(rc, e.ExternalID, maxObjectBytes) // cap so a stored object is always restorable
 
 	n := len(targets)
 	results := make([]targetResult, n)
@@ -504,6 +504,7 @@ type fanoutWriter struct {
 	pending []bool        // Write-only: which dispatched pumps haven't finished this chunk
 	done    chan int      // a pump signals its index after consuming (or erroring on) a chunk
 	stall   time.Duration // per-chunk drain deadline; 0 = unbounded (batch paths)
+	timer   *time.Timer   // ONE reused stall timer (Reset per chunk), not a fresh alloc per 1 MiB
 	pumpWg  sync.WaitGroup
 }
 
@@ -516,6 +517,10 @@ func newFanoutWriter(writers []*io.PipeWriter, drop func(int), stall time.Durati
 		pending: make([]bool, n),
 		done:    make(chan int, n), // buffered so a pump's signal never blocks (Write may be timing out)
 		stall:   stall,
+	}
+	if stall > 0 {
+		f.timer = time.NewTimer(stall)
+		f.timer.Stop() // created stopped; collect Resets it per chunk (Go 1.23+ Reset semantics)
 	}
 	for i := range writers {
 		f.pumps[i] = make(chan []byte)
@@ -555,10 +560,10 @@ func (f *fanoutWriter) Write(p []byte) (int, error) {
 // past f.stall (their reader is closed so their write unblocks with errStalled → dead).
 func (f *fanoutWriter) collect(dispatched int) {
 	var tick <-chan time.Time
-	if f.stall > 0 {
-		timer := time.NewTimer(f.stall)
-		defer timer.Stop()
-		tick = timer.C
+	if f.timer != nil {
+		f.timer.Reset(f.stall) // reuse the one timer instead of allocating per chunk
+		defer f.timer.Stop()
+		tick = f.timer.C
 	}
 	for got := 0; got < dispatched; {
 		select {

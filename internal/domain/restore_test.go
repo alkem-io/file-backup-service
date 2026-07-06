@@ -89,9 +89,9 @@ func TestRestoreRawOversizedZstdFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := maxRestoreBytes
-	maxRestoreBytes = int64(len(frame)) + 4 // >= frame (raw fallback fits), < 500 (decode over-caps)
-	defer func() { maxRestoreBytes = old }()
+	old := maxObjectBytes
+	maxObjectBytes = int64(len(frame)) + 4 // >= frame (raw fallback fits), < 500 (decode over-caps)
+	defer func() { maxObjectBytes = old }()
 
 	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{h: frame}}
 	dir := t.TempDir()

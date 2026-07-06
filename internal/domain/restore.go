@@ -13,20 +13,15 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
-// MaxObjectBytes bounds the decoded PLAINTEXT the restore/verify path accepts — a
-// decompression-bomb / oversized-blob guard. It is sized to REALITY: file-service's
-// file.size is INTEGER (int32, ~2 GiB max), so no object larger than ~2 GiB can exist;
-// 4 GiB is 2x that with headroom. Keeping the cap near the real max is what makes the
-// bomb bound tight (a bomb can't inflate 32x past any legit object) AND keeps the S3
-// sink's flat 5 MiB part size within the 10,000-part ceiling (4 GiB / 5 MiB ≈ 820 parts,
-// far under 10,000 — so no per-object part-size arithmetic is needed). If the file
-// schema ever widens past int32, raise this AND revisit the S3 part size together.
-const MaxObjectBytes int64 = 4 << 30 // 4 GiB
-
-// maxRestoreBytes bounds the decoded PLAINTEXT on BOTH the raw and zstd restore paths
-// (bomb / oversized-blob protection). It is MaxObjectBytes as a var only so tests can
-// lower it to exercise the over-cap paths.
-var maxRestoreBytes = MaxObjectBytes
+// maxObjectBytes is the ONE end-to-end object-size cap: the backup write path fails an
+// object over it (nothing committed), and restore/verify/reconcile reject a decoded
+// plaintext over it (decompression-bomb / oversized-blob guard) — so a stored object is
+// always restorable. Sized to REALITY: file-service's file.size is INTEGER (int32, ~2 GiB
+// max), so no object larger than ~2 GiB can exist; 4 GiB is 2x with headroom. Near the
+// real max keeps the bomb bound tight AND keeps the S3 sink's flat 5 MiB part size within
+// the 10,000-part ceiling (~820 parts). A var (not const) only so tests can lower it. If
+// the file schema ever widens past int32, raise this AND revisit the S3 part size.
+var maxObjectBytes int64 = 4 << 30 // 4 GiB
 
 // zstdMagic is the zstd frame magic (RFC 8878). A stored object is zstd iff it
 // begins with these bytes — so a 4-byte peek picks the codec without a probe write.
@@ -145,16 +140,16 @@ func rewindTruncate(f *os.File) error {
 
 // copyVerify streams src into dst, hashing via the shared object-hash primitive so
 // restore verifies by the exact same digest rule as backup (hash.go). It caps the copy at
-// maxRestoreBytes and returns overCap=true past it (the decompression-bomb / oversized-blob
+// maxObjectBytes and returns overCap=true past it (the decompression-bomb / oversized-blob
 // guard on BOTH the raw and zstd paths — every caller passes the same cap, so there is no
 // uncapped mode).
 func copyVerify(dst io.Writer, src io.Reader, want string) (overCap bool, err error) {
 	h := newHash()
-	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(src, maxRestoreBytes+1))
+	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(src, maxObjectBytes+1))
 	if err != nil {
 		return false, err
 	}
-	if n > maxRestoreBytes {
+	if n > maxObjectBytes {
 		return true, nil
 	}
 	if hexSum(h) != want {
@@ -164,7 +159,7 @@ func copyVerify(dst io.Writer, src io.Reader, want string) (overCap bool, err er
 }
 
 // decodeRaw copies r straight to dst and verifies it equals hash, bounded by
-// maxRestoreBytes — so a corrupt/tampered target that returns an oversized stream for
+// maxObjectBytes — so a corrupt/tampered target that returns an oversized stream for
 // a CodecNone object can't fill the restore disk before the hash check fails (the
 // plaintext cap applies to the raw path too, not only zstd).
 func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
@@ -173,7 +168,7 @@ func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
 	case err != nil && !errors.Is(err, errHashMismatch):
 		return fmt.Errorf("read: %w", err)
 	case overCap:
-		return fmt.Errorf("integrity: stored bytes for %s exceed the %d-byte restore cap", hash, maxRestoreBytes)
+		return fmt.Errorf("integrity: stored bytes for %s exceed the %d-byte restore cap", hash, maxObjectBytes)
 	case errors.Is(err, errHashMismatch):
 		return fmt.Errorf("integrity: stored bytes for %s are neither valid zstd nor the plaintext", hash)
 	}
@@ -197,7 +192,7 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	defer zr.Close()
 	// Cap the DECODED output (bomb protection); a tiny zstd frame can expand to PB.
 	// An over-cap decode returns errTryRaw so decodeStream falls back to decodeRaw —
-	// which is ITSELF bounded at maxRestoreBytes, so the fallback is inherently bomb-safe:
+	// which is ITSELF bounded at maxObjectBytes, so the fallback is inherently bomb-safe:
 	// a raw-stored object whose plaintext is a valid oversized zstd frame (e.g. a large
 	// .zst uploaded as-is) restores from its small raw bytes, while a genuine tampered
 	// zstd bomb fails both paths (the raw bytes don't hash). Never dropping the fallback
