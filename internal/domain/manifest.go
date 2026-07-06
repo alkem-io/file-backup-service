@@ -53,7 +53,7 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 	pr, pw := io.Pipe()
 	go func() {
 		enc := json.NewEncoder(pw) // JSONL: Encode appends a newline per record
-		err := led.EachStoredObject(ctx, sink.Name(), func(m ObjectMeta) error {
+		err := eachStoredObject(ctx, led, sink.Name(), func(m ObjectMeta) error {
 			var created *time.Time // nil (omitted) for a null/zero source date, not a bogus year-1
 			if !m.SourceCreatedDate.IsZero() {
 				created = &m.SourceCreatedDate
@@ -64,8 +64,33 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 	}()
 	err := sink.PutManifest(ctx, name, pr)
 	// Unblock the encoder goroutine if PutManifest returned before draining the pipe
-	// (an upload error / timeout) — otherwise it parks forever on pw.Write, pinning the
-	// ledger cursor's DB connection.
+	// (an upload error / timeout) — otherwise it parks forever on pw.Write.
 	_ = pr.CloseWithError(err)
 	return err
+}
+
+// storedPageSize is the keyset page size for the manifest + audit sweeps.
+const storedPageSize = 1000
+
+// eachStoredObject pages through every object stored on target (Ledger.StoredObjectsPage)
+// and invokes fn per object. Paging releases the ledger connection between pages, so a
+// slow fn — a manifest's pipe write blocked on a slow upload — doesn't pin a pool
+// connection for the whole sweep (the connection is held only for each fast page query).
+func eachStoredObject(ctx context.Context, led Ledger, target string, fn func(ObjectMeta) error) error {
+	after := ""
+	for {
+		page, err := led.StoredObjectsPage(ctx, target, after, storedPageSize)
+		if err != nil {
+			return err
+		}
+		for i := range page {
+			if err := fn(page[i]); err != nil {
+				return err
+			}
+		}
+		if len(page) < storedPageSize {
+			return nil // a short page is the last
+		}
+		after = page[len(page)-1].ExternalID
+	}
 }

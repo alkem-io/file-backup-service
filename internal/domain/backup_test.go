@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"testing"
 
@@ -63,16 +64,22 @@ func (f *fakeLedger) StoredTargets(_ context.Context, externalID string) (map[st
 	return out, nil
 }
 func (f *fakeLedger) Probe(context.Context) error { return nil }
-func (f *fakeLedger) EachStoredObject(_ context.Context, target string, fn func(ObjectMeta) error) error {
+func (f *fakeLedger) StoredObjectsPage(_ context.Context, target, after string, limit int) ([]ObjectMeta, error) {
+	ids := make([]string, 0, len(f.objects))
 	for id := range f.objects {
-		if f.states[id+"/"+target] != StateStored {
-			continue
-		}
-		if err := fn(ObjectMeta{ExternalID: id, Size: f.sizes[id]}); err != nil {
-			return err
+		if f.states[id+"/"+target] == StateStored && id > after {
+			ids = append(ids, id)
 		}
 	}
-	return nil
+	sort.Strings(ids)
+	out := make([]ObjectMeta, 0, limit)
+	for _, id := range ids {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, ObjectMeta{ExternalID: id, Size: f.sizes[id]})
+	}
+	return out, nil
 }
 func (f *fakeLedger) TargetGaps(_ context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
 	for id := range f.objects {

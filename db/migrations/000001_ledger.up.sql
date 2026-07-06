@@ -23,6 +23,8 @@ CREATE TABLE file_backup_target_status (
 CREATE INDEX file_backup_target_status_verified_idx
     ON file_backup_target_status ("verifiedAt" DESC);
 
--- Per-target manifest / audit stream the objects stored on one target.
-CREATE INDEX file_backup_target_status_target_state_idx
-    ON file_backup_target_status (target, state);
+-- Per-target manifest / audit keyset-page the objects stored on one target, ORDER BY
+-- "externalID" — this covers the WHERE (target, state) AND the index-ordered range scan
+-- (no sort, no full-cursor hold).
+CREATE INDEX file_backup_target_status_target_state_ext_idx
+    ON file_backup_target_status (target, state, "externalID");

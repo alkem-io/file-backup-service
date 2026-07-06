@@ -2,12 +2,13 @@ package domain
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"sync"
 )
 
-// errStopSample stops EachStoredObject early once a target's audit sample is reached.
-var errStopSample = errors.New("sample complete")
+// auditConcurrency bounds the parallel Exists probes per page (each is an independent
+// network RTT — e.g. an S3 StatObject HEAD — so a serial sweep is RTT-bound).
+const auditConcurrency = 16
 
 // TargetAudit is one target's audit outcome.
 type TargetAudit struct {
@@ -49,23 +50,66 @@ func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget in
 	rep := AuditReport{Targets: make([]TargetAudit, 0, len(targets))}
 	for _, t := range targets {
 		ta := TargetAudit{Target: t.Sink.Name()}
-		err := led.EachStoredObject(ctx, ta.Target, func(m ObjectMeta) error {
-			if samplePerTarget > 0 && ta.Checked >= samplePerTarget {
-				return errStopSample
+		after := ""
+		for ctx.Err() == nil {
+			limit := storedPageSize
+			if samplePerTarget > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
+				remaining := samplePerTarget - ta.Checked
+				if remaining <= 0 {
+					break
+				}
+				if remaining < limit {
+					limit = remaining
+				}
 			}
-			ta.Checked++
-			switch present, err := t.Sink.Exists(ctx, m.ExternalID); {
-			case err != nil:
-				ta.Errors++
-			case !present:
-				ta.Missing++
+			page, err := led.StoredObjectsPage(ctx, ta.Target, after, limit)
+			if err != nil {
+				return rep, fmt.Errorf("audit target %s: %w", ta.Target, err)
 			}
-			return ctx.Err()
-		})
-		if err != nil && !errors.Is(err, errStopSample) {
-			return rep, fmt.Errorf("audit target %s: %w", ta.Target, err)
+			if len(page) == 0 {
+				break
+			}
+			for _, e := range existsPage(ctx, t.Sink, page) {
+				ta.Checked++
+				switch {
+				case e.err != nil:
+					ta.Errors++
+				case !e.present:
+					ta.Missing++
+				}
+			}
+			after = page[len(page)-1].ExternalID
+			if len(page) < limit {
+				break // a short page is the last
+			}
 		}
 		rep.Targets = append(rep.Targets, ta)
 	}
 	return rep, nil
+}
+
+type existsResult struct {
+	present bool
+	err     error
+}
+
+// existsPage probes Sink.Exists for every object in the page concurrently (bounded by
+// auditConcurrency), so a page of independent HEAD RTTs collapses to ~page/concurrency
+// wall-clock instead of a serial sum.
+func existsPage(ctx context.Context, sink Sink, page []ObjectMeta) []existsResult {
+	results := make([]existsResult, len(page))
+	sem := make(chan struct{}, auditConcurrency)
+	var wg sync.WaitGroup
+	for i := range page {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			present, err := sink.Exists(ctx, page[i].ExternalID)
+			results[i] = existsResult{present: present, err: err}
+		}(i)
+	}
+	wg.Wait()
+	return results
 }

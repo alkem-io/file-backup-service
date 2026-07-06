@@ -63,36 +63,35 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	return nil
 }
 
-// EachStoredObject streams the objects currently stored ON target for that target's
-// manifest snapshot (FR-015), invoking fn per row. It joins target_status so a target's
-// manifest lists ONLY what the target holds — not the whole ledger — so a standalone
-// restore from an under-replicated target doesn't read a false inventory. Streaming
-// (not ReadAll) keeps memory bounded across millions of rows.
-func (r *LedgerRepo) EachStoredObject(ctx context.Context, target string, fn func(domain.ObjectMeta) error) error {
+// StoredObjectsPage returns up to limit objects stored ON target (FR-015 manifest /
+// FR-014 audit), keyset-paginated by externalID. The join lists ONLY what the target
+// holds (not the whole ledger), and the (target, state, "externalID") index makes the
+// WHERE + ORDER an index-ordered range scan — no full sort, and the connection is
+// released when the page returns (not held for the whole manifest upload / audit sweep).
+func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]domain.ObjectMeta, error) {
 	const q = `SELECT o."externalID", o.size, COALESCE(o."createdBy"::text,''), o."sourceCreatedDate"
 	FROM file_backup_object o
 	JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
-	WHERE ts.target = $1 AND ts.state = 'stored'
-	ORDER BY o."externalID"`
-	rows, err := r.p.Query(ctx, q, target)
+	WHERE ts.target = $1 AND ts.state = 'stored' AND o."externalID" > $2
+	ORDER BY o."externalID" LIMIT $3`
+	rows, err := r.p.Query(ctx, q, target, after, limit)
 	if err != nil {
-		return fmt.Errorf("stream stored objects: %w", err)
+		return nil, fmt.Errorf("stored objects page: %w", err)
 	}
 	defer rows.Close()
+	out := make([]domain.ObjectMeta, 0, limit)
 	for rows.Next() {
 		var m domain.ObjectMeta
 		var created pgtype.Timestamptz
 		if err := rows.Scan(&m.ExternalID, &m.Size, &m.CreatedBy, &created); err != nil {
-			return fmt.Errorf("scan object: %w", err)
+			return nil, fmt.Errorf("scan object: %w", err)
 		}
 		if created.Valid {
 			m.SourceCreatedDate = created.Time
 		}
-		if err := fn(m); err != nil {
-			return err
-		}
+		out = append(out, m)
 	}
-	return rows.Err()
+	return out, rows.Err()
 }
 
 // TargetGaps streams objects NOT stored on every configured target, with the set of

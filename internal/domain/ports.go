@@ -74,11 +74,14 @@ type Ledger interface {
 	// migration fails loudly at startup and via readiness, not as a green-health
 	// stall where every RecordBackup errors "relation does not exist".
 	Probe(ctx context.Context) error
-	// EachStoredObject streams the objects currently stored ON target (for that
-	// target's manifest snapshot — it must list only what the target actually holds,
-	// so a standalone restore from it doesn't read a false inventory), invoking fn per
-	// row; if fn returns an error, iteration stops and returns it.
-	EachStoredObject(ctx context.Context, target string, fn func(ObjectMeta) error) error
+	// StoredObjectsPage returns up to limit objects currently stored ON target (what the
+	// target actually holds — so a manifest/audit reads a true per-target inventory),
+	// keyset-paginated by externalID: after is the last externalID of the previous page
+	// ("" to start), results are ordered by externalID, and a short page (< limit) is the
+	// last. Paging — not a held streaming cursor — releases the DB connection between
+	// pages, so a slow consumer (audit's per-object Exists, a manifest's slow upload)
+	// can't pin a pool connection for the whole operation.
+	StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]ObjectMeta, error)
 	// TargetGaps streams objects that are NOT stored on every configured target,
 	// with the set of target names that DO hold each — the reconcile work-list.
 	TargetGaps(ctx context.Context, allTargets []string, fn func(externalID string, stored map[string]bool) error) error
