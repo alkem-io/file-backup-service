@@ -97,13 +97,16 @@ func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
 	}
 
 	results, verified, ferr := p.fanOut(ctx, e, pending)
-	// A SOURCE integrity error (corrupt bytes, fetch failure) records nothing — the
-	// object is bad and no target holds a valid copy (ctx.Err()==nil distinguishes it
-	// from an abort). A ctx-ABORT (per-object timeout / shutdown), by contrast, may
-	// have left some targets DURABLY stored, so fall through and record those (a target
-	// with err==nil passed its own ctx gate and committed) so a retry doesn't re-store.
+	// A SOURCE error records nothing — the object is bad or was never fetched. That is
+	// either (a) nil results: the fetch itself failed BEFORE any per-target result
+	// (including a ctx-cancelled fetch, where ctx.Err()!=nil — so this must NOT rely on
+	// ctx.Err() alone, or the status loop below indexes a nil slice and panics), or (b)
+	// a source integrity error with ctx still live. A ctx-ABORT (per-object timeout /
+	// shutdown) that produced partial per-target results falls through to record the
+	// targets that DURABLY stored (err==nil = passed their own ctx gate), so a retry
+	// doesn't re-store them.
 	aborted := ferr != nil
-	if aborted && ctx.Err() == nil {
+	if aborted && (results == nil || ctx.Err() == nil) {
 		return false, ferr
 	}
 
@@ -223,10 +226,10 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 				reader = zr
 			}
 			er := &eofReader{r: reader}
-			stored, serr := storeWithCtx(ctx, t.Sink, e.ExternalID, er)
-			results[i] = targetResult{stored: stored, err: serr, sawEOF: er.sawEOF}
+			res := storeWithCtx(ctx, t.Sink, e.ExternalID, er)
+			results[i] = res
 			// Unblock the dispatcher if Store bailed before draining the pipe.
-			_ = pr.CloseWithError(serr)
+			_ = pr.CloseWithError(res.err)
 		}(i, t, pr)
 	}
 
@@ -292,7 +295,7 @@ func (p *Pipeline) fanOut(ctx context.Context, e OutboxEntry, targets []Target) 
 // pipes AFTER VerifyReader checks the hash; a sink that finalized on a known
 // byte-count (e.g. minio single-PUT) would commit before verification, which is why
 // Store takes no length.
-func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int64, error) {
+func storeWithCtx(ctx context.Context, sink Sink, hash string, er *eofReader) targetResult {
 	ch := make(chan targetResult, 1) // buffered so an abandoned goroutine never blocks
 	go func() {
 		defer func() {
@@ -300,14 +303,17 @@ func storeWithCtx(ctx context.Context, sink Sink, hash string, r io.Reader) (int
 				ch <- targetResult{err: panicErr("sink "+sink.Name(), rec)}
 			}
 		}()
-		sn, serr := sink.Store(ctx, hash, r)
-		ch <- targetResult{stored: sn, err: serr}
+		sn, serr := sink.Store(ctx, hash, er)
+		// Read er.sawEOF HERE, on the goroutine that owns er — sending it via the channel
+		// gives the fanOut reader a happens-before. On the ctx.Done path below we return
+		// without touching er, so the abandoned goroutine's sawEOF write never races.
+		ch <- targetResult{stored: sn, err: serr, sawEOF: er.sawEOF}
 	}()
 	select {
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return targetResult{err: ctx.Err()}
 	case res := <-ch:
-		return res.stored, res.err
+		return res
 	}
 }
 

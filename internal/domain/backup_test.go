@@ -201,6 +201,27 @@ func TestPipelineTruncatedSourceNotCommitted(t *testing.T) {
 	}
 }
 
+// ctxErrSource models a fetch aborted by ctx cancellation (SIGTERM/timeout in the
+// dial/headers window) — FetchContent returns before any bytes.
+type ctxErrSource struct{}
+
+func (ctxErrSource) FetchContent(context.Context, string) (io.ReadCloser, error) {
+	return nil, context.Canceled
+}
+
+// TestPipelineFetchCancelledNoPanic: a fetch that fails because ctx was cancelled
+// (nil results, ctx.Err()!=nil) must return the error, not panic on a nil results slice.
+func TestPipelineFetchCancelledNoPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sink := newMemSink("t")
+	p := NewPipeline(ctxErrSource{}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
+	ok, err := p.BackupOne(ctx, OutboxEntry{FileID: "f", ExternalID: "abc"})
+	if err == nil || ok {
+		t.Fatal("a ctx-cancelled fetch must return an error, not succeed (and must not panic)")
+	}
+}
+
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := newMemSink("t1")
 	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})
