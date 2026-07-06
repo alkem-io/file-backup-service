@@ -181,13 +181,20 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 
 	objCtx, cancel := context.WithTimeout(ctx, c.d.PerObjectTimeout)
 	defer cancel()
-	ok, err := c.d.Pipeline.BackupOne(objCtx, e)
+	ok, deferred, err := c.d.Pipeline.BackupOne(objCtx, e)
 
 	// Bookkeeping MUST survive per-object-timeout and shutdown cancellation, or the
 	// row is stranded in_progress. Detach from the cancelled ctx with a fresh deadline.
 	bctx, bcancel := domain.DetachedBookkeepingCtx(ctx)
 	defer bcancel()
+	c.settle(ctx, objCtx, bctx, e, ok, deferred, err)
+}
 
+// settle records the outbox outcome of one backup attempt. shutdown (parent ctx
+// cancelled) Releases without an attempt; a vanished source Skips; a deferred object
+// (only gap is a down/circuit-open target) is re-queued without an attempt (T017a); a
+// genuine failure Fails (attempt).
+func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntry, ok, deferred bool, err error) {
 	switch {
 	case ok && err == nil:
 		if derr := c.d.Outbox.MarkDone(bctx, e.ID); derr != nil {
@@ -211,6 +218,14 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 		c.d.Logger.Info("source gone, skipping", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID))
 		if serr := c.d.Outbox.Skip(bctx, e.ID); serr != nil {
 			c.d.Logger.Error("skip vanished source", zap.Int64("id", e.ID), zap.Error(serr))
+		}
+	case deferred:
+		// The object stored on every REACHABLE target; its only gap is a persistently-down
+		// (circuit-open) target — NOT a failure of THIS object. Defer it (backoff,
+		// re-claimable, NO attempt) so a single-target outage doesn't march the corpus to
+		// dead-letter; reconcile refills the gap when the target returns (T017a).
+		if derr := c.d.Outbox.Defer(bctx, e.ID); derr != nil {
+			c.d.Logger.Error("defer down-target object", zap.Int64("id", e.ID), zap.Error(derr))
 		}
 	case err != nil:
 		// A per-object timeout (objCtx deadline hit while the parent is still live)

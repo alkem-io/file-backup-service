@@ -156,6 +156,10 @@ func serve(cfgPath string) error {
 
 	pipeline := domain.NewPipeline(fsClient, ledger, targets)
 	pipeline.Metrics = mx
+	// Per-target circuit breaker (T017a): a persistently-down/hung target trips out of the
+	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered.
+	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
+	pipeline.Circuit = breaker
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
 		Pipeline:         pipeline,
@@ -175,7 +179,7 @@ func serve(cfgPath string) error {
 	// snapshot to each target (FR-015, standalone-restorability).
 	var bgWG sync.WaitGroup
 	bgWG.Add(3)
-	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, targets, mx) }()
+	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, targets, breaker, mx) }()
 	go func() { defer bgWG.Done(); sampleCoverage(ctx, ledger, targets, mx) }()
 	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger) }()
 	defer bgWG.Wait()
@@ -437,9 +441,10 @@ func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(con
 // sampleRPO refreshes the backlog/lag/last-success gauges (FR-026). A failed pass
 // increments the sample-error counter (alert on rate>0) so a frozen, stale-green gauge
 // is itself detectable, rather than silently holding its last value.
-func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target, mx *metrics.Metrics) {
+func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target, breaker *domain.CircuitBreaker, mx *metrics.Metrics) {
 	names := domain.TargetNames(targets)
 	everyTick(ctx, 15*time.Second, 5*time.Second, func(fctx context.Context) {
+		mx.SetCircuitOpen(breaker.OpenCount()) // in-memory, always sampleable
 		failed := false
 		if pending, ageSec, err := outbox.BacklogStats(fctx); err == nil {
 			mx.SetBacklog(pending, ageSec)

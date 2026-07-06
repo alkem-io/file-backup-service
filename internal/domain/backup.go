@@ -64,6 +64,9 @@ type Pipeline struct {
 	Targets []Target
 	// Metrics receives observations (Nop if unset).
 	Metrics Metrics
+	// Circuit trips a persistently-down target out of the fan-out so an object whose only
+	// gap is that target is deferred, not dead-lettered (T017a). Nil (batch paths) disables it.
+	Circuit *CircuitBreaker
 }
 
 // NewPipeline constructs a Pipeline.
@@ -90,31 +93,31 @@ func TargetNames(targets []Target) []string {
 // credentials. Returns true only when EVERY target is stored (symmetric
 // done-gate); a flaky target leaves the object not-done for retry while never
 // blocking the healthy targets.
-func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (bool, error) {
+// done is true only when EVERY target is stored (the symmetric done-gate). deferred is
+// true when the object couldn't complete ONLY because a target's circuit is open (a
+// persistently-down target): the caller re-queues it WITHOUT an attempt (T017a), so a
+// single-target outage doesn't march the corpus to dead-letter — reconcile refills the
+// gap when the target returns.
+func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (done, deferred bool, err error) {
 	return p.backupFrom(ctx, p.Source, e)
 }
 
 // backupFrom is BackupOne parameterized on the source, so reconcile can supply a
 // target-backed source per call without mutating shared Pipeline state.
-func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (bool, error) {
+func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (done, deferred bool, err error) {
 	// Dedup is per content-hash, NOT per outbox row: a fresh row (attempts=0) can
 	// reference an already-stored externalID (duplicate content, or a backfill/
 	// reconcile re-enqueue), so the StoredTargets read must run unconditionally —
 	// skipping it on a "fresh" row would re-PUT duplicates to every target incl. WORM.
 	stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
 	if err != nil {
-		return false, fmt.Errorf("ledger read: %w", err)
+		return false, false, fmt.Errorf("ledger read: %w", err)
 	}
-	pending := make([]Target, 0, len(p.Targets))
-	for _, t := range p.Targets {
-		if stored[t.Sink.Name()] {
-			p.Metrics.ObjectDedup(t.Sink.Name())
-			continue
-		}
-		pending = append(pending, t)
-	}
+	pending, skippedOpen := p.pendingTargets(stored)
 	if len(pending) == 0 {
-		return true, nil // every target already has it
+		// Nothing to fan out: fully done unless a down target was skipped, in which case
+		// the object is DEFERRED (re-claimable, NO attempt) until that target recovers.
+		return !skippedOpen, skippedOpen, nil
 	}
 
 	results, verified, ferr := p.fanOut(ctx, src, e, pending)
@@ -128,7 +131,15 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (b
 	// doesn't re-store them.
 	aborted := ferr != nil
 	if aborted && (results == nil || ctx.Err() == nil) {
-		return false, ferr
+		return false, false, ferr
+	}
+
+	// Fold per-target results into the circuit breaker — EXCEPT on a shutdown cancel (not
+	// the target's fault). A per-object-TIMEOUT (DeadlineExceeded) IS folded, so a HUNG
+	// target that keeps timing out trips its circuit open and later objects SKIP it
+	// (bounding a hung target's blast radius — the runtime half of FR-012 isolation).
+	if !aborted || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		p.recordCircuit(pending, results)
 	}
 
 	// Ledger bookkeeping MUST survive a per-object timeout that can fire just as the
@@ -146,23 +157,7 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (b
 		objSize = verified
 	}
 
-	statuses := make([]TargetStatus, 0, len(pending))
-	allStored := true
-	for i, t := range pending {
-		name := t.Sink.Name()
-		if results[i].err != nil {
-			allStored = false
-			// On an abort, a not-yet-stored target is simply omitted (retried) rather
-			// than recorded failed / counted — the per-object-timeout metric covers it.
-			if !aborted {
-				p.Metrics.ObjectFailed(name)
-				statuses = append(statuses, TargetStatus{Target: name, State: StateFailed})
-			}
-			continue
-		}
-		p.Metrics.ObjectStored(name, results[i].stored)
-		statuses = append(statuses, TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored})
-	}
+	statuses, healthyFailed, allStored := p.classifyFanout(pending, results, aborted)
 	// Object row + all statuses in one atomic write (FK parent first, inside the CTE).
 	// SizeVerified gates the size UPDATE so an all-fail retry (unverified e.Size, which
 	// is 0 when the outbox breadcrumb is unpopulated) can't downgrade an earlier
@@ -172,13 +167,79 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (b
 			ExternalID: e.ExternalID, Size: objSize, SizeVerified: verified >= 0,
 			CreatedBy: e.CreatedBy, SourceCreatedDate: e.CreatedDate,
 		}, statuses); err != nil {
-			return false, fmt.Errorf("ledger record: %w", err)
+			return false, false, fmt.Errorf("ledger record: %w", err)
 		}
 	}
-	if aborted {
-		return false, ferr // partial progress recorded; surface the abort for retry/release
+	// A reachable target genuinely failed → Fail (attempt). On a per-object TIMEOUT that
+	// target is wedging → surface ferr so the consumer's timeout metric fires.
+	if healthyFailed {
+		if aborted {
+			return false, false, ferr
+		}
+		return false, false, nil // consumer's default (!ok) Fails it
 	}
-	return allStored, nil
+	// No reachable target failed. done iff every target is stored; otherwise the ONLY gaps
+	// are down/timed-out targets → DEFERRED (retry later, NO attempt; reconcile refills).
+	done = allStored && !skippedOpen && !aborted
+	return done, !done, nil
+}
+
+// pendingTargets returns the targets that still need the object — not already stored
+// (dedup) and not circuit-OPEN — plus whether a circuit-open (down) target was skipped
+// (a down target isn't fanned to: it would stall; reconcile refills its gap).
+func (p *Pipeline) pendingTargets(stored map[string]bool) (pending []Target, skippedOpen bool) {
+	pending = make([]Target, 0, len(p.Targets))
+	for _, t := range p.Targets {
+		name := t.Sink.Name()
+		if stored[name] {
+			p.Metrics.ObjectDedup(name)
+			continue
+		}
+		if p.Circuit != nil && p.Circuit.Open(name) {
+			skippedOpen = true
+			continue
+		}
+		pending = append(pending, t)
+	}
+	return pending, skippedOpen
+}
+
+// recordCircuit folds each fanned target's Store result into the circuit breaker.
+func (p *Pipeline) recordCircuit(pending []Target, results []targetResult) {
+	if p.Circuit == nil {
+		return
+	}
+	for i, t := range pending {
+		p.Circuit.Record(t.Sink.Name(), results[i].err == nil)
+	}
+}
+
+// classifyFanout turns per-target results into ledger statuses + outcome flags. A DOWN
+// target's failure (circuit-open, incl. one just tripped) is a TEMPORARY gap — not
+// recorded failed and not counted against the object (it defers; reconcile refills). A
+// REACHABLE target's failure is genuine (recorded + Failed). On abort a failed target's
+// status is omitted (its state is unknown), but healthyFailed still reflects it.
+func (p *Pipeline) classifyFanout(pending []Target, results []targetResult, aborted bool) (statuses []TargetStatus, healthyFailed, allStored bool) {
+	statuses = make([]TargetStatus, 0, len(pending))
+	allStored = true
+	for i, t := range pending {
+		name := t.Sink.Name()
+		if results[i].err != nil {
+			allStored = false
+			if p.Circuit != nil && p.Circuit.Open(name) {
+				continue
+			}
+			healthyFailed = true
+			if !aborted {
+				p.Metrics.ObjectFailed(name)
+				statuses = append(statuses, TargetStatus{Target: name, State: StateFailed})
+			}
+			continue
+		}
+		p.Metrics.ObjectStored(name, results[i].stored)
+		statuses = append(statuses, TargetStatus{Target: name, State: StateStored, StoredBytes: results[i].stored})
+	}
+	return statuses, healthyFailed, allStored
 }
 
 type targetResult struct {

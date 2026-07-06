@@ -113,9 +113,11 @@ type Config struct {
 	PerObjectTimeoutSec int      `yaml:"perObjectTimeoutSec"`
 	StaleTTLSec         int      `yaml:"staleTTLSec"`
 	PollEverySec        int      `yaml:"pollEverySec"`
-	MaxAttempts         int      `yaml:"maxAttempts"`      // genuine-failure dead-letter threshold (FR-029)
-	MaxDeliveries       int      `yaml:"maxDeliveries"`    // crash-loop dead-letter threshold (FR-029)
-	ManifestEverySec    int      `yaml:"manifestEverySec"` // ledger-snapshot cadence to each target (FR-015)
+	MaxAttempts         int      `yaml:"maxAttempts"`        // genuine-failure dead-letter threshold (FR-029)
+	MaxDeliveries       int      `yaml:"maxDeliveries"`      // crash-loop dead-letter threshold (FR-029)
+	ManifestEverySec    int      `yaml:"manifestEverySec"`   // ledger-snapshot cadence to each target (FR-015)
+	CircuitThreshold    int      `yaml:"circuitThreshold"`   // consecutive per-target failures that trip its circuit open (T017a)
+	CircuitCooldownSec  int      `yaml:"circuitCooldownSec"` // how long a tripped target's circuit stays open before a probe half-opens it
 	// ScratchDir is where reconcile stages a decoded object before re-fanning it out.
 	// Empty = the OS temp dir; point it at a SIZED volume (not a small memory-backed
 	// emptyDir/tmpfs) so a large-object repair on the recovery host can't fill /tmp.
@@ -136,6 +138,11 @@ func (c *Config) PollEvery() time.Duration { return time.Duration(c.PollEverySec
 // ManifestEvery is the ledger-snapshot cadence.
 func (c *Config) ManifestEvery() time.Duration {
 	return time.Duration(c.ManifestEverySec) * time.Second
+}
+
+// CircuitCooldown is how long a tripped target's circuit stays open before a probe.
+func (c *Config) CircuitCooldown() time.Duration {
+	return time.Duration(c.CircuitCooldownSec) * time.Second
 }
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env
@@ -182,6 +189,8 @@ func (c *Config) applyEnv() error {
 	add(setInt(&c.MaxAttempts, envPrefix+"MAXATTEMPTS"))
 	add(setInt(&c.MaxDeliveries, envPrefix+"MAXDELIVERIES"))
 	add(setInt(&c.ManifestEverySec, envPrefix+"MANIFESTEVERYSEC"))
+	add(setInt(&c.CircuitThreshold, envPrefix+"CIRCUITTHRESHOLD"))
+	add(setInt(&c.CircuitCooldownSec, envPrefix+"CIRCUITCOOLDOWNSEC"))
 	add(applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_"))
 	add(applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_"))
 	add(c.applyTargetEnv())
@@ -246,6 +255,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ManifestEverySec <= 0 {
 		c.ManifestEverySec = 24 * 60 * 60 // daily
+	}
+	if c.CircuitThreshold <= 0 {
+		c.CircuitThreshold = 5 // trip a target's circuit after 5 consecutive failures
+	}
+	if c.CircuitCooldownSec <= 0 {
+		c.CircuitCooldownSec = 60 // re-probe a down target once a minute
 	}
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {

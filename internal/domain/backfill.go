@@ -89,7 +89,7 @@ func (b *Backfiller) backupOne(ctx context.Context, e OutboxEntry, st *BackfillS
 	defer recoverFailed(&st.Failed)
 	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
 	defer cancel()
-	if done, err := b.p.BackupOne(ctx, e); err == nil && done {
+	if done, _, err := b.p.BackupOne(ctx, e); err == nil && done {
 		st.Backed++
 	} else {
 		st.Failed++

@@ -78,7 +78,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 			continue // stale status for a removed target
 		}
 		tried = true
-		done, err := p.backupFrom(ctx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry)
+		done, _, err := p.backupFrom(ctx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry)
 		if err == nil {
 			// The source fetched + verified cleanly. Either fully repaired (done), or a
 			// DESTINATION target failed (!done) — and rotating to another source can't fix

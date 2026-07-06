@@ -153,7 +153,7 @@ func TestPipelineBackupOne(t *testing.T) {
 	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
 
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil || !ok {
 		t.Fatalf("backup: ok=%v err=%v", ok, err)
 	}
@@ -199,7 +199,7 @@ func TestPipelineTruncatedSourceNotCommitted(t *testing.T) {
 	}
 	sink := newMemSink("t")
 	p := NewPipeline(truncatedSource{full[:3000]}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err == nil || ok {
 		t.Fatal("a truncated source (io.ErrUnexpectedEOF) must fail, not be recorded as a verified backup")
 	}
@@ -223,7 +223,7 @@ func TestPipelineFetchCancelledNoPanic(t *testing.T) {
 	cancel()
 	sink := newMemSink("t")
 	p := NewPipeline(ctxErrSource{}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
-	ok, err := p.BackupOne(ctx, OutboxEntry{ExternalID: "abc"})
+	ok, _, err := p.BackupOne(ctx, OutboxEntry{ExternalID: "abc"})
 	if err == nil || ok {
 		t.Fatal("a ctx-cancelled fetch must return an error, not succeed (and must not panic)")
 	}
@@ -232,7 +232,7 @@ func TestPipelineFetchCancelledNoPanic(t *testing.T) {
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := newMemSink("t1")
 	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: "deadbeef"})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: "deadbeef"})
 	if err == nil {
 		t.Fatal("expected the source integrity error to be surfaced, not hidden as a target failure")
 	}
@@ -269,7 +269,7 @@ func TestPipelineSingleFetchFanOut(t *testing.T) {
 		{Sink: a, Codec: CodecNone},
 		{Sink: b, Codec: CodecNone},
 	})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil || !ok {
 		t.Fatalf("backup: ok=%v err=%v", ok, err)
 	}
@@ -291,7 +291,7 @@ func TestPipelineZstdTarget(t *testing.T) {
 	}
 	sink := newMemSink("z")
 	p := NewPipeline(fakeSource{data}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecZstd}})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil || !ok {
 		t.Fatalf("backup: ok=%v err=%v", ok, err)
 	}
@@ -321,7 +321,7 @@ func TestPipelineLargeObjectMultiChunk(t *testing.T) {
 	b := newMemSink("b")
 	p := NewPipeline(fakeSource{data}, newFakeLedger(),
 		[]Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecZstd}})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h, Size: int64(len(data))})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h, Size: int64(len(data))})
 	if err != nil || !ok {
 		t.Fatalf("large multi-chunk fan-out: ok=%v err=%v", ok, err)
 	}
@@ -355,7 +355,7 @@ func TestPipelineNonConsumingSinkFails(t *testing.T) {
 		{Sink: &nonConsumingSink{stubSink{name: "bad"}}, Codec: CodecNone},
 		{Sink: good, Codec: CodecNone},
 	})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestPipelineNonConsumingZstdSinkFails(t *testing.T) {
 	p := NewPipeline(fakeSource{data}, led, []Target{
 		{Sink: &nonConsumingSink{stubSink{name: "bad-zstd"}}, Codec: CodecZstd},
 	})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestPipelineAllTargetsFailRecorded(t *testing.T) {
 	}
 	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{stubSink{name: "down"}}, Codec: CodecNone}})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil {
 		t.Fatalf("an all-targets-down failure must NOT be reported as a source error: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestPipelineAllTargetsFailRecordsOutboxSize(t *testing.T) {
 	}
 	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: &failSink{stubSink{name: "down"}}, Codec: CodecNone}})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h, Size: int64(len(data))})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h, Size: int64(len(data))})
 	if err != nil || ok {
 		t.Fatalf("all-targets-fail: ok=%v err=%v", ok, err)
 	}
@@ -450,7 +450,7 @@ func (goneSource) FetchContent(context.Context, OutboxEntry) (io.ReadCloser, err
 func TestPipelineSourceGonePropagates(t *testing.T) {
 	p := NewPipeline(goneSource{}, newFakeLedger(),
 		[]Target{{Sink: newMemSink("t"), Codec: CodecNone}})
-	_, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: "abc"})
+	_, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: "abc"})
 	if !errors.Is(err, ErrSourceGone) {
 		t.Fatalf("expected ErrSourceGone to propagate, got %v", err)
 	}
@@ -476,7 +476,7 @@ func TestPipelineTargetIsolation(t *testing.T) {
 		{Sink: &failSink{stubSink{name: "bad"}}, Codec: CodecNone},
 		{Sink: good, Codec: CodecNone},
 	})
-	ok, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	ok, _, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}

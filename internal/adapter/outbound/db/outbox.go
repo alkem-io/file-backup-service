@@ -78,6 +78,18 @@ func (r *OutboxRepo) MarkDone(ctx context.Context, id int64) error {
 	return r.transition(ctx, id, "mark done", `status='done'`)
 }
 
+// Defer re-queues a claim WITHOUT counting an attempt, invisible for a short backoff —
+// used when an object stored on every REACHABLE target and its only gap is a
+// circuit-open (persistently-down) target (T017a). A single-target outage must not march
+// the object's shared attempts toward dead-letter; the object re-checks after the
+// backoff, cheaply re-deferring (a dedup read + circuit check, no fan-out) while the
+// target stays down, and completes once it recovers. Guarded by status='in_progress'
+// (a lost claim is a no-op).
+func (r *OutboxRepo) Defer(ctx context.Context, id int64) error {
+	return r.transition(ctx, id, "defer",
+		`status='pending', "claimedAt"=NULL, "visibleAt"=now() + interval '30 seconds'`)
+}
+
 // Fail increments attempts and re-queues the entry, or dead-letters it once the
 // attempt limit is reached. attempts counts genuine FAILURES (incremented here),
 // never claims or reaps — so a slow object that is reaped/reclaimed is not

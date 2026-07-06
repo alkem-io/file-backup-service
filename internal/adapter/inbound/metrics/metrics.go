@@ -29,6 +29,7 @@ type Metrics struct {
 	lastSuccessAge   prometheus.Gauge
 	underReplicated  prometheus.Gauge // objects not yet stored on every target (coverage)
 	neverVerified    prometheus.Gauge // configured targets that have never verified anything
+	circuitOpen      prometheus.Gauge // targets with an open circuit (tripped out, being deferred)
 	sampleErrors     prometheus.Counter
 	byTarget         sync.Map // target name -> *targetCounters (resolved once, per target)
 }
@@ -79,6 +80,10 @@ func New() *Metrics {
 			Name: "filebackup_targets_never_verified",
 			Help: "Configured targets that have never verified a single object — catches a target (e.g. a misconfigured immutable off-site copy) that received nothing since inception, which last_success_age can't see.",
 		}),
+		circuitOpen: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_targets_circuit_open",
+			Help: "Targets whose circuit is currently OPEN (tripped out of the fan-out after repeated failures); objects needing them are deferred (re-claimable), not dead-lettered (T017a).",
+		}),
 		sampleErrors: f.NewCounter(prometheus.CounterOpts{
 			Name: "filebackup_metrics_sample_errors_total",
 			Help: "Failed RPO/coverage sampling passes — alert on rate>0 so a frozen (stale-green) gauge is itself detectable.",
@@ -97,6 +102,9 @@ func (m *Metrics) SetLastSuccessAge(ageSec float64) { m.lastSuccessAge.Set(ageSe
 
 // SetNeverVerified records how many configured targets have never verified anything.
 func (m *Metrics) SetNeverVerified(n int) { m.neverVerified.Set(float64(n)) }
+
+// SetCircuitOpen records how many targets currently have an open circuit (tripped out).
+func (m *Metrics) SetCircuitOpen(n int) { m.circuitOpen.Set(float64(n)) }
 
 // SetUnderReplicated records the count of objects not stored on every target.
 func (m *Metrics) SetUnderReplicated(n int) { m.underReplicated.Set(float64(n)) }

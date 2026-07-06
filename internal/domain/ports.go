@@ -26,6 +26,10 @@ type Outbox interface {
 	Claim(ctx context.Context, n int) ([]OutboxEntry, error)
 	// MarkDone marks an entry done once every configured target confirms (symmetric).
 	MarkDone(ctx context.Context, id int64) error
+	// Defer re-queues an entry with a short backoff WITHOUT counting an attempt — used
+	// when the object's only gap is a persistently-down (circuit-open) target (T017a),
+	// so a single-target outage doesn't march it toward dead-letter.
+	Defer(ctx context.Context, id int64) error
 	// Fail records a failure — re-queues, or dead-letters past the attempt limit.
 	// Returns true when the entry was moved to dead-letter.
 	Fail(ctx context.Context, id int64, reason string) (bool, error)
