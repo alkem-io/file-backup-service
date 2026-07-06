@@ -39,9 +39,7 @@ func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) err
 		if err := rows.Scan(&e.FileID, &e.ExternalID, &e.CreatedBy, &createdDate, &e.Size); err != nil {
 			return fmt.Errorf("scan file: %w", err)
 		}
-		if createdDate.Valid {
-			e.CreatedDate = createdDate.Time
-		}
+		e.CreatedDate = nullTime(createdDate)
 		if err := fn(e); err != nil {
 			return err
 		}

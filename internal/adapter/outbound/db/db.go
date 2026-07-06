@@ -5,9 +5,20 @@ package db
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// nullTime maps a scanned nullable TIMESTAMPTZ to a time.Time (zero when SQL NULL) — one
+// owner for the pgtype→domain breadcrumb mapping shared by the ledger + corpus readers.
+func nullTime(t pgtype.Timestamptz) time.Time {
+	if t.Valid {
+		return t.Time
+	}
+	return time.Time{}
+}
 
 // Pool is a thin pgxpool.Pool wrapper, so this package sets the pool's explicit
 // MaxConns in one place.

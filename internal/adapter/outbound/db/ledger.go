@@ -91,9 +91,7 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 		if err := rows.Scan(&m.ExternalID, &m.Size, &m.CreatedBy, &created); err != nil {
 			return nil, fmt.Errorf("scan object: %w", err)
 		}
-		if created.Valid {
-			m.SourceCreatedDate = created.Time
-		}
+		m.SourceCreatedDate = nullTime(created)
 		out = append(out, m)
 	}
 	return out, rows.Err()

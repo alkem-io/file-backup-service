@@ -27,6 +27,14 @@ func newPacer(ratePerSec int) (wait func(context.Context) error, stop func()) {
 	}, t.Stop
 }
 
+// recoverFailed converts a panic in a per-item sweep step (reconcile repair / backfill
+// backup) into a counted failure, so one poison object can't crash the whole pass.
+func recoverFailed(failed *int) {
+	if r := recover(); r != nil { //nolint:revive // recover works here — recoverFailed is invoked directly via `defer recoverFailed(...)`
+		*failed++
+	}
+}
+
 // CorpusEnumerator streams the authoritative file corpus — the source of truth for what
 // SHOULD be backed up (the file-service `file` table). Backfill uses it to find + fill
 // the pre-existing objects the outbox never carried (those created before the service).
@@ -76,11 +84,7 @@ func (b *Backfiller) Run(ctx context.Context, ratePerSec int) (BackfillStats, er
 // backupOne backs up one corpus entry, contained by a recover so a single poison object
 // (e.g. a nil-slice panic on a shutdown-interrupted fetch) can't crash the whole pass.
 func (b *Backfiller) backupOne(ctx context.Context, e OutboxEntry, st *BackfillStats) {
-	defer func() {
-		if r := recover(); r != nil {
-			st.Failed++
-		}
-	}()
+	defer recoverFailed(&st.Failed)
 	if done, err := b.p.BackupOne(ctx, e); err == nil && done {
 		st.Backed++
 	} else {

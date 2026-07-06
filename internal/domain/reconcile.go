@@ -68,11 +68,7 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 // dedups the source + re-fans-out to the missing targets + records the ledger. A panic
 // in one repair is contained (counted failed) so a poison object can't crash the pass.
 func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string, stored map[string]bool, st *ReconcileStats) {
-	defer func() {
-		if r := recover(); r != nil {
-			st.Failed++
-		}
-	}()
+	defer recoverFailed(&st.Failed)
 	entry := OutboxEntry{FileID: externalID, ExternalID: externalID}
 	tried := false
 	for name := range stored {
