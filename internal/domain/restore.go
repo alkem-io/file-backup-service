@@ -18,9 +18,9 @@ import (
 // decompression bomb, or an oversized raw blob from a compromised target) so it can't
 // fill the DR host disk before the hash check fails. It is the effective supported
 // object size: an object whose plaintext exceeds it is unrestorable even if it backed
-// up (a zstd target can compress a >64 GiB plaintext under the ~48 GiB S3 part
-// ceiling), so raise it deliberately if the corpus ever needs larger objects.
-const maxRestoreBytes int64 = 64 << 30 // 64 GiB
+// up, so raise it deliberately if the corpus ever needs larger objects. A var (not a
+// const) only so tests can lower it to exercise the over-cap paths.
+var maxRestoreBytes int64 = 64 << 30 // 64 GiB
 
 // zstdMagic is the zstd frame magic (RFC 8878). A stored object is zstd iff it
 // begins with these bytes — so a 4-byte peek picks the codec without a probe write.
@@ -29,11 +29,6 @@ var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 // errTryRaw signals that a zstd-magic object did not decode+hash as zstd, so the
 // stored bytes must be the plaintext (which happens to start with the zstd magic).
 var errTryRaw = errors.New("not zstd after all")
-
-// errBomb marks a zstd stream whose decoded size exceeds the cap — a decompression
-// bomb. Unlike errTryRaw it is NOT retried as raw (that would re-fetch + re-scan for a
-// hostile input); decodeStream surfaces it as a hard failure.
-var errBomb = errors.New("decompression bomb: decoded size exceeds cap")
 
 // errHashMismatch means the decoded content did not hash to the requested key.
 var errHashMismatch = errors.New("hash mismatch")
@@ -100,11 +95,10 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 		if derr == nil {
 			return nil
 		}
-		if !errors.Is(derr, errTryRaw) {
-			return derr // decompression bomb / hard error — do not fall back
-		}
-		// zstd magic but it did not decode+hash as zstd: the plaintext itself starts
-		// with the zstd magic (an incompressible upload stored raw). Re-read as raw.
+		// decodeZstd returns only nil or errTryRaw, so any non-nil error means fall back
+		// to the (bounded, bomb-safe) raw read: the plaintext started with the zstd magic
+		// but did not decode+hash as zstd — an incompressible upload stored raw, or a
+		// raw object whose bytes happen to be an oversized zstd frame. Re-read as raw.
 		if reset != nil {
 			if e := reset(); e != nil {
 				return e
@@ -189,15 +183,14 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	}
 	defer zr.Close()
 	// Cap the DECODED output (bomb protection); a tiny zstd frame can expand to PB.
-	overCap, verr := copyVerify(dst, zr, hash, maxRestoreBytes)
-	switch {
-	case overCap:
-		// The decoded plaintext exceeds the cap — a bomb, not a raw object that merely
-		// starts with the zstd magic (that case is a hash MISMATCH below, which does
-		// fall back). Don't waste a raw re-read on a bomb.
-		return errBomb
-	case verr != nil:
-		return errTryRaw // not zstd, or the decoded plaintext doesn't hash — try raw
+	// An over-cap decode returns errTryRaw so decodeStream falls back to decodeRaw —
+	// which is ITSELF bounded at maxRestoreBytes, so the fallback is inherently bomb-safe:
+	// a raw-stored object whose plaintext is a valid oversized zstd frame (e.g. a large
+	// .zst uploaded as-is) restores from its small raw bytes, while a genuine tampered
+	// zstd bomb fails both paths (the raw bytes don't hash). Never dropping the fallback
+	// costs at most one extra bounded read on hostile input, in exchange for no data loss.
+	if overCap, verr := copyVerify(dst, zr, hash, maxRestoreBytes); overCap || verr != nil {
+		return errTryRaw
 	}
 	return nil
 }

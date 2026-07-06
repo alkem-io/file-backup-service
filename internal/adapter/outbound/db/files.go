@@ -23,8 +23,11 @@ func NewFileRepo(p *Pool) *FileRepo { return &FileRepo{p: p} }
 // excluded — mid-upload staging the producer also never enqueues (data-model §1).
 // Streaming (not ReadAll) keeps memory bounded across the whole corpus.
 func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) error) error {
-	const q = `SELECT id, "externalID", COALESCE("createdBy"::text,''), "createdDate", size
-	FROM file WHERE "temporaryLocation" = FALSE ORDER BY id`
+	// id::text — pgx v5 can't scan a binary-format uuid into a Go string (the outbox
+	// Claim casts "fileId"::text for the same reason). temporaryLocation IS NOT TRUE
+	// (not "= FALSE") so a NULL never silently drops a real object from the sweep.
+	const q = `SELECT id::text, "externalID", COALESCE("createdBy"::text,''), "createdDate", size
+	FROM file WHERE "temporaryLocation" IS NOT TRUE ORDER BY id`
 	rows, err := r.p.Query(ctx, q)
 	if err != nil {
 		return fmt.Errorf("stream files: %w", err)

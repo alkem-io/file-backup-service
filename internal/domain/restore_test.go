@@ -74,6 +74,36 @@ func TestRestoreRawStartingWithZstdMagic(t *testing.T) {
 	}
 }
 
+// TestRestoreRawOversizedZstdFrame guards the errBomb regression: a raw-stored object
+// whose bytes are a VALID zstd frame that decodes PAST the cap must still restore by
+// falling back to the (bounded, bomb-safe) raw read — not be rejected as a bomb. The
+// cap is set between the frame's raw size and its decoded size so decodeZstd over-caps
+// while decodeRaw fits.
+func TestRestoreRawOversizedZstdFrame(t *testing.T) {
+	plaintext := bytes.Repeat([]byte("x"), 500)
+	frame, err := io.ReadAll(ZstdReader(bytes.NewReader(plaintext))) // small frame, decodes to 500
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := Sum(bytes.NewReader(frame)) // stored RAW: the FRAME bytes hash to h
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := maxRestoreBytes
+	maxRestoreBytes = int64(len(frame)) + 4 // >= frame (raw fallback fits), < 500 (decode over-caps)
+	defer func() { maxRestoreBytes = old }()
+
+	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{h: frame}}
+	dir := t.TempDir()
+	if err := RestoreObject(context.Background(), sink, h, dir); err != nil {
+		t.Fatalf("restore raw oversized-zstd-frame: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, h)) //nolint:gosec // test temp path
+	if err != nil || !bytes.Equal(got, frame) {
+		t.Fatalf("restored bytes mismatch: %v", err)
+	}
+}
+
 func TestRestoreCorruptFails(t *testing.T) {
 	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{"deadbeef": []byte("garbage not zstd")}}
 	dir := t.TempDir()
