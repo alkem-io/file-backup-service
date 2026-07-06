@@ -329,14 +329,17 @@ func (c *Config) validateLimits() error {
 		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec (%d), else a running object is reaped",
 			c.StaleTTLSec, c.PerObjectTimeoutSec)
 	}
-	if c.MetricsPort < 1 || c.MetricsPort > 65535 {
-		return fmt.Errorf("metricsPort (%d) out of range 1-65535", c.MetricsPort)
+	// Only upper bounds here — applyDefaults already floors each of these <=0 to a
+	// positive default before Validate runs (as with Concurrency above), so a `< 1`
+	// check would be dead and misleadingly imply 0 is rejected when it becomes the default.
+	if c.MetricsPort > 65535 {
+		return fmt.Errorf("metricsPort (%d) exceeds 65535", c.MetricsPort)
 	}
-	if c.MaxAttempts < 1 || c.MaxAttempts > 1000 {
-		return fmt.Errorf("maxAttempts (%d) out of range 1-1000", c.MaxAttempts)
+	if c.MaxAttempts > 1000 {
+		return fmt.Errorf("maxAttempts (%d) exceeds 1000", c.MaxAttempts)
 	}
-	if c.MaxDeliveries < 1 || c.MaxDeliveries > 1000 {
-		return fmt.Errorf("maxDeliveries (%d) out of range 1-1000", c.MaxDeliveries)
+	if c.MaxDeliveries > 1000 {
+		return fmt.Errorf("maxDeliveries (%d) exceeds 1000", c.MaxDeliveries)
 	}
 	return nil
 }

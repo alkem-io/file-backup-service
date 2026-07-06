@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -27,13 +26,6 @@ func PreflightKey() string {
 	var b [6]byte
 	_, _ = rand.Read(b[:]) //nolint:errcheck // rand.Read never fails; the value only needs to be unique-ish
 	return path.Join(preflightPrefix, fmt.Sprintf("%d-%s", time.Now().UTC().UnixNano(), hex.EncodeToString(b[:])))
-}
-
-// IsReserved reports whether a stored key is a service-internal object (a manifest
-// snapshot or a preflight probe) that object enumeration — reconcile / audit — must
-// skip rather than treat as a backed-up object.
-func IsReserved(key string) bool {
-	return strings.HasPrefix(key, manifestPrefix+"/") || strings.HasPrefix(key, preflightPrefix+"/")
 }
 
 // ShardKey returns the two-level hex-sharded key for a content hash —

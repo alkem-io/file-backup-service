@@ -28,15 +28,6 @@ func Sum(r io.Reader) (string, error) {
 	return hexSum(h), nil
 }
 
-// Verify reports whether r hashes to want.
-func Verify(want string, r io.Reader) (bool, error) {
-	got, err := Sum(r)
-	if err != nil {
-		return false, err
-	}
-	return got == want, nil
-}
-
 // VerifyReader streams bytes through while hashing them; at end-of-stream it
 // returns an error if the accumulated SHA3-256 does not match want — so a
 // downstream writer (a Sink) sees the error mid-stream and never commits corrupt

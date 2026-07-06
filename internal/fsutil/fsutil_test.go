@@ -1,6 +1,9 @@
 package fsutil
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPreflightKeyUniqueAndReserved(t *testing.T) {
 	a, b := PreflightKey(), PreflightKey()
@@ -8,24 +11,21 @@ func TestPreflightKeyUniqueAndReserved(t *testing.T) {
 		t.Fatalf("PreflightKey must be unique per call, got %q twice", a)
 	}
 	for _, k := range []string{a, b} {
-		if !IsReserved(k) {
-			t.Fatalf("PreflightKey %q must be a reserved key", k)
+		if !strings.HasPrefix(k, preflightPrefix+"/") {
+			t.Fatalf("PreflightKey %q must be under the reserved %q prefix", k, preflightPrefix)
 		}
 	}
 }
 
-func TestIsReserved(t *testing.T) {
-	cases := map[string]bool{
-		ManifestKey("2026-07-06.jsonl"): true,
-		"_manifest/x.jsonl":             true,
-		"_preflight/123-abcd":           true,
-		ShardKey("abcdef0123456789"):    false, // a normal sharded object
-		"ab/cd/abcdef0123456789":        false,
-		"_manifestlike/not-really":      false, // prefix must be a full path segment
+func TestManifestKey(t *testing.T) {
+	got := ManifestKey("2026-07-06.jsonl")
+	if got != manifestPrefix+"/2026-07-06.jsonl" {
+		t.Fatalf("ManifestKey = %q", got)
 	}
-	for key, want := range cases {
-		if got := IsReserved(key); got != want {
-			t.Errorf("IsReserved(%q) = %v, want %v", key, got, want)
-		}
+}
+
+func TestShardKey(t *testing.T) {
+	if got := ShardKey("abcdef0123456789"); got != "ab/cd/abcdef0123456789" {
+		t.Fatalf("ShardKey = %q", got)
 	}
 }
