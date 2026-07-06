@@ -437,15 +437,24 @@ func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(con
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		fctx, cancel := context.WithTimeout(ctx, timeout)
-		fn(fctx)
-		cancel()
+		runTick(ctx, timeout, fn)
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
 	}
+}
+
+// runTick runs one bounded tick with a recover, so a pgx/driver panic in a sampler or the
+// manifest loop degrades that one pass (the caller's sample-error counter) instead of
+// crashing the serve process — these background goroutines are on the other side of a
+// boundary no request/pipeline recover reaches.
+func runTick(ctx context.Context, timeout time.Duration, fn func(context.Context)) {
+	fctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	defer func() { _ = recover() }() // the pass is best-effort; a panic must not take down serve
+	fn(fctx)
 }
 
 // sampleRPO refreshes the backlog/lag/last-success gauges (FR-026). A failed pass

@@ -108,26 +108,43 @@ func (c *Consumer) poll(ctx context.Context, wake chan<- struct{}) {
 // of one worker draining it solo.
 func (c *Consumer) worker(ctx context.Context, wake chan struct{}) {
 	for ctx.Err() == nil {
-		entries, err := c.d.Outbox.Claim(ctx, 1)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return // graceful shutdown cancelled the in-flight claim — not an error
+		if !c.claimStep(ctx, wake) { // false → outbox empty, wait for a NOTIFY or the poll floor
+			select {
+			case <-ctx.Done():
+				return
+			case <-wake:
 			}
-			c.d.Logger.Error("claim outbox", zap.Error(err))
-			backoff(ctx) // don't hot-loop a broken DB
-			continue
-		}
-		if len(entries) == 1 {
-			signal(wake) // cascade the drain: wake a sibling to grab the next row
-			c.process(ctx, entries[0])
-			continue // immediately try for the next
-		}
-		select { // outbox empty — wait for a NOTIFY or the shared poll floor
-		case <-ctx.Done():
-			return
-		case <-wake:
 		}
 	}
+}
+
+// claimStep claims and processes one row, returning true if it did work (retry immediately)
+// or false if the outbox was empty (wait). A panic (e.g. a pgx Scan of a drifted/renamed
+// foreign-outbox column) is recovered into a logged error + backoff so it can't crash the
+// worker goroutine — process() recovers the pipeline, but Claim itself is outside it.
+func (c *Consumer) claimStep(ctx context.Context, wake chan struct{}) (worked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.d.Logger.Error("panic in claim", zap.Any("panic", r), zap.Stack("stack"))
+			backoff(ctx)
+			worked = true // retry after backoff rather than block on wake
+		}
+	}()
+	entries, err := c.d.Outbox.Claim(ctx, 1)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return true // graceful shutdown cancelled the claim — the ctx.Err() loop guard exits
+		}
+		c.d.Logger.Error("claim outbox", zap.Error(err))
+		backoff(ctx) // don't hot-loop a broken DB
+		return true
+	}
+	if len(entries) == 1 {
+		signal(wake) // cascade the drain: wake a sibling to grab the next row
+		c.process(ctx, entries[0])
+		return true
+	}
+	return false // outbox empty
 }
 
 // signal does a non-blocking send — a coalescing wakeup.
@@ -285,7 +302,17 @@ func (c *Consumer) reap(ctx context.Context) {
 	if interval < time.Minute {
 		interval = time.Minute
 	}
-	sweep() // startup sweep
+	// A panic in the reaper (a pgx Scan on a drifted foreign-outbox column) must degrade to
+	// a logged error, not crash the worker — the reap goroutine is outside process()'s recover.
+	guardedSweep := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.d.Logger.Error("panic in reaper", zap.Any("panic", r), zap.Stack("stack"))
+			}
+		}()
+		sweep()
+	}
+	guardedSweep() // startup sweep
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -293,7 +320,7 @@ func (c *Consumer) reap(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			sweep()
+			guardedSweep()
 		}
 	}
 }

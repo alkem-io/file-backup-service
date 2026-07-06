@@ -183,6 +183,15 @@ dispatch:
 		dispatched++
 		go func(i int) {
 			defer func() { <-sem }()
+			// Recover a sink.Exists panic (a driver nil-deref / malformed response) into an
+			// error result — else the missing `ch` send hangs the collect loop, and an
+			// unrecovered panic in this child goroutine crashes the whole audit process
+			// (every other sink-call site guards the same way).
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- done{i, existsResult{err: PanicErr("sink Exists", r)}}
+				}
+			}()
 			present, err := sink.Exists(ctx, page[i].ExternalID)
 			ch <- done{i, existsResult{present: present, err: err}}
 		}(i)
