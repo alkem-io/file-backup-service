@@ -21,8 +21,6 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/adapter/inbound/metrics"
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db"
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/fileservice"
-	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/sink/filesystem"
-	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/sink/s3"
 	"github.com/alkem-io/file-backup-service/internal/config"
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
@@ -489,7 +487,7 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 	}
 	for _, t := range cfg.Targets {
 		if t.Name == name {
-			return buildSink(t)
+			return config.BuildSink(t)
 		}
 	}
 	return nil, fmt.Errorf("target %q not found in config", name)
@@ -660,7 +658,7 @@ func preflightTargets(ctx context.Context, logger *zap.Logger, targets []domain.
 func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 	targets := make([]domain.Target, 0, len(cfgs))
 	for _, t := range cfgs {
-		sink, err := buildSink(t)
+		sink, err := config.BuildSink(t)
 		if err != nil {
 			return nil, err
 		}
@@ -671,20 +669,6 @@ func buildTargets(cfgs []config.Target) ([]domain.Target, error) {
 		targets = append(targets, domain.Target{Sink: sink, Codec: codec, Worm: t.Worm})
 	}
 	return targets, nil
-}
-
-func buildSink(t config.Target) (domain.Sink, error) {
-	switch t.Type {
-	case config.TargetTypeFilesystem:
-		return filesystem.New(t.Name, t.Path), nil
-	case config.TargetTypeS3:
-		return s3.New(s3.Config{
-			Name: t.Name, Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket, Prefix: t.Prefix,
-			AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,
-		})
-	default:
-		return nil, fmt.Errorf("target %q: unknown type %q", t.Name, t.Type)
-	}
 }
 
 func startHTTP(port int, deps httpapi.Deps, logger *zap.Logger) (*http.Server, error) {

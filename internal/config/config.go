@@ -20,6 +20,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/sink/filesystem"
+	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/sink/s3"
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
@@ -463,17 +465,12 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 		return fmt.Errorf("targets %q and %q collide on env-var namespace FBS_TARGET_%s_*", prev, t.Name, tok)
 	}
 	seen[tok] = t.Name
-	switch t.Type {
-	case TargetTypeFilesystem:
-		if t.Path == "" {
-			return fmt.Errorf("target %q: filesystem requires path", t.Name)
-		}
-	case TargetTypeS3:
-		if err := validateS3Target(t); err != nil {
-			return err
-		}
-	default:
+	f, ok := targetFactories[t.Type]
+	if !ok {
 		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
+	}
+	if err := f.validate(t); err != nil {
+		return err
 	}
 	if _, err := domain.ParseCodec(t.Compression); err != nil {
 		return fmt.Errorf("target %q: %w", t.Name, err)
@@ -501,4 +498,48 @@ func validateS3Target(t Target) error {
 			"set insecure=true only for local dev", t.Name)
 	}
 	return nil
+}
+
+// targetFactory owns ONE target type's validation + sink construction in a single place, so
+// adding a type — or a new required field on an existing one — is one self-contained
+// registration rather than an edit to two separate switches (a per-type validate here and a
+// per-type build in the cmd wiring) that have no compiler link and can silently drift out of
+// sync. Trade-off: the config package imports the sink adapters (and transitively minio) so
+// the build half can live with the validate half — accepted to make "add a type = one entry".
+type targetFactory struct {
+	validate func(Target) error
+	build    func(Target) (domain.Sink, error)
+}
+
+var targetFactories = map[string]targetFactory{
+	TargetTypeFilesystem: {validateFilesystemTarget, buildFilesystemSink},
+	TargetTypeS3:         {validateS3Target, buildS3Sink},
+}
+
+// BuildSink constructs the sink for an (already-validated) target — the single dispatch point
+// the cmd wiring calls, so type→constructor lives with type→validation in the registry above.
+func BuildSink(t Target) (domain.Sink, error) {
+	f, ok := targetFactories[t.Type]
+	if !ok {
+		return nil, fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
+	}
+	return f.build(t)
+}
+
+func validateFilesystemTarget(t Target) error {
+	if t.Path == "" {
+		return fmt.Errorf("target %q: filesystem requires path", t.Name)
+	}
+	return nil
+}
+
+func buildFilesystemSink(t Target) (domain.Sink, error) {
+	return filesystem.New(t.Name, t.Path), nil
+}
+
+func buildS3Sink(t Target) (domain.Sink, error) {
+	return s3.New(s3.Config{
+		Name: t.Name, Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket, Prefix: t.Prefix,
+		AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,
+	})
 }

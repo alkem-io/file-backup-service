@@ -201,3 +201,21 @@ func TestValidateRejectsBadDBPort(t *testing.T) {
 		t.Fatal("expected a negative DB port to be rejected at Validate, not deferred to DSN parse")
 	}
 }
+
+// TestBuildSinkRegistry confirms the targetFactory registry dispatches each type to its
+// builder and rejects an unknown type — the single source of type→construct + type→validate.
+func TestBuildSinkRegistry(t *testing.T) {
+	fs, err := BuildSink(Target{Name: "fs", Type: "filesystem", Path: "/tmp/x"})
+	if err != nil || fs == nil {
+		t.Fatalf("filesystem: sink=%v err=%v", fs, err)
+	}
+	// s3.New constructs the minio client (no network until a request), so a well-formed
+	// target builds a sink without connecting.
+	s3sink, err := BuildSink(Target{Name: "s3", Type: "s3", Endpoint: "s3.example.com", Region: "r", Bucket: "b", AccessKey: "AK", SecretKey: "SK", UseSSL: true, SSE: true})
+	if err != nil || s3sink == nil {
+		t.Fatalf("s3: sink=%v err=%v", s3sink, err)
+	}
+	if _, err := BuildSink(Target{Name: "x", Type: "nope"}); err == nil {
+		t.Fatal("unknown target type must error")
+	}
+}
