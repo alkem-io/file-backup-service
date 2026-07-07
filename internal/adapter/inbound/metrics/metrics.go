@@ -71,7 +71,7 @@ func New() *Metrics {
 		}),
 		oldestPendingAge: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_oldest_pending_age_seconds",
-			Help: "Age of the oldest pending outbox entry — the backup lag / RPO signal.",
+			Help: "Age of the oldest pending outbox entry — the backup lag / RPO signal. EXCLUDES T017a-deferred objects (blocked only on a circuit-open target — they can't be backed up faster), so a TOTAL outage where the ONLY target(s) are down does NOT show here: that case surfaces in filebackup_targets_circuit_open>0 (and filebackup_last_success_age climbing). Alert on this gauge for lag AND on targets_circuit_open for a target-down outage.",
 		}),
 		lastSuccessAge: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_last_success_age_seconds",

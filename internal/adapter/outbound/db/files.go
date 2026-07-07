@@ -45,8 +45,18 @@ func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) err
 func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([]domain.OutboxEntry, error) {
 	// Native uuid: id → FileID, createdBy → CreatedBy (pgx scans both directly). The `file`
 	// PK on id serves the id > $1 ORDER BY id keyset.
-	const q = `SELECT id, "externalID", "createdBy", "createdDate", size
-	FROM file WHERE "temporaryLocation" IS NOT TRUE AND id > $1 ORDER BY id LIMIT $2`
+	//
+	// Defend against the FOREIGN, server-owned column NULLs exactly as the sibling outbox
+	// Claim does (COALESCE(size,0)): a NULL size would fail Scan into int64 and abort the
+	// WHOLE enumeration at that row — and since KeysetLoop can't advance its cursor past a
+	// failed page, backfill would re-hit the same row and die on every re-run, permanently
+	// stalling the sweep past the first bad row. Also skip a NULL/empty externalID: a file
+	// with no content hash yet (not-yet-stored) has no backup key, so it isn't backfillable —
+	// exclude it (it enters via the outbox once file-service stores it) rather than error the
+	// sweep or fabricate an empty-key object.
+	const q = `SELECT id, "externalID", "createdBy", "createdDate", COALESCE(size,0)
+	FROM file WHERE "temporaryLocation" IS NOT TRUE AND "externalID" IS NOT NULL AND "externalID" <> ''
+	  AND id > $1 ORDER BY id LIMIT $2`
 	rows, err := r.p.Query(ctx, q, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("files page: %w", err)

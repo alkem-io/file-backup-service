@@ -469,20 +469,36 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 			return fmt.Errorf("target %q: filesystem requires path", t.Name)
 		}
 	case TargetTypeS3:
-		if t.Endpoint == "" || t.Bucket == "" || t.Region == "" {
-			// region is mandatory: PutObject-only creds can't auto-discover it and SigV4
-			// signs it — an empty region fails every request with SignatureDoesNotMatch.
-			return fmt.Errorf("target %q: s3 requires endpoint, bucket, and region", t.Name)
-		}
-		if !t.Insecure && (!t.UseSSL || !t.SSE) {
-			return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+
-				"set insecure=true only for local dev", t.Name)
+		if err := validateS3Target(t); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
 	}
 	if _, err := domain.ParseCodec(t.Compression); err != nil {
 		return fmt.Errorf("target %q: %w", t.Name, err)
+	}
+	return nil
+}
+
+// validateS3Target checks the s3-specific required fields (split out of validateTarget to
+// keep its cyclomatic complexity in budget).
+func validateS3Target(t Target) error {
+	if t.Endpoint == "" || t.Bucket == "" || t.Region == "" {
+		// region is mandatory: PutObject-only creds can't auto-discover it and SigV4 signs it —
+		// an empty region fails every request with SignatureDoesNotMatch.
+		return fmt.Errorf("target %q: s3 requires endpoint, bucket, and region", t.Name)
+	}
+	if t.AccessKey == "" || t.SecretKey == "" {
+		// The s3 sink signs with STATIC credentials (credentials.NewStaticV4) — there is no
+		// IAM/instance-profile fallback — so empty keys sign requests ANONYMOUSLY and every
+		// PutObject 403s. Fail loud at config time (like every other s3 field) instead of a
+		// degraded-target startup or an opaque 403 at preflight / restore fetch time.
+		return fmt.Errorf("target %q: s3 requires accessKey and secretKey (inject via FBS_TARGET_%s_ACCESSKEY / _SECRETKEY)", t.Name, envToken(t.Name))
+	}
+	if !t.Insecure && (!t.UseSSL || !t.SSE) {
+		return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+
+			"set insecure=true only for local dev", t.Name)
 	}
 	return nil
 }

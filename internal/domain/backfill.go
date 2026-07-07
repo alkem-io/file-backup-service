@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -46,8 +47,9 @@ type CorpusEnumerator interface {
 
 // BackfillStats summarizes a backfill pass.
 type BackfillStats struct {
-	Backed int // fully stored on every target after this pass (incl. already-present)
-	Failed int // a target failed, the source was gone, or the pass was cancelled
+	Backed  int // fully stored on every target after this pass (incl. already-present)
+	Skipped int // source object gone (deleted before backfill) — benign terminal, not a failure
+	Failed  int // a target genuinely failed, or the pass was cancelled
 }
 
 // Backfiller backs up the pre-existing corpus (US2/T022): it enumerates every file and
@@ -89,9 +91,17 @@ func (b *Backfiller) backupOne(ctx context.Context, e OutboxEntry, st *BackfillS
 	defer recoverFailed(&st.Failed)
 	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
 	defer cancel()
-	if done, _, err := b.p.BackupOne(ctx, e); err == nil && done {
+	done, _, err := b.p.BackupOne(ctx, e)
+	switch {
+	case err == nil && done:
 		st.Backed++
-	} else {
+	case errors.Is(err, ErrSourceGone):
+		// Source deleted before backfill ran (file-service 404/410) — a benign terminal
+		// condition, NOT a failure: the object needn't be backed up. Mirror the serve
+		// consumer's Skip so a corpus with routine deletions doesn't fail the pass (and
+		// doesn't bury genuine target failures in an undifferentiated Failed count).
+		st.Skipped++
+	default:
 		st.Failed++
 	}
 }

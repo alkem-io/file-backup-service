@@ -3,6 +3,11 @@
 BINARY := file-backup-service
 GO := go
 GOFLAGS := -race
+# Pin the sqlc CLI version: sqlc stamps its own version into every generated file's header,
+# so an unpinned `sqlc` on PATH at a different version produces spurious drift-check failures
+# on the comment lines alone. `go run <pkg>@<ver>` pins it deterministically without adding
+# sqlc's (large) dependency tree to go.mod/go.sum.
+SQLC := $(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0
 
 build:
 	mkdir -p bin/
@@ -22,7 +27,7 @@ generate:
 	$(GO) generate ./...
 
 sqlc-generate:
-	sqlc -f db/sqlc.yaml generate
+	$(SQLC) -f db/sqlc.yaml generate
 
 openapi:
 	apispec --dir . --output openapi.yaml --config apispec.yaml --skip-cgo

@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -157,9 +158,27 @@ func TestValidateRejectsOverflowingCircuitKnobs(t *testing.T) {
 }
 
 func TestValidateRejectsInsecureS3(t *testing.T) {
-	c := validConfig(Target{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r"}) // no useSSL/sse
-	if err := c.Validate(); err == nil {
+	// Creds present (so it fails on the TLS+SSE requirement, not the creds check) but no useSSL/sse.
+	c := validConfig(Target{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r", AccessKey: "AK", SecretKey: "SK"})
+	err := c.Validate()
+	if err == nil {
 		t.Fatal("expected the s3 TLS+SSE requirement to reject this config")
+	}
+	if !strings.Contains(err.Error(), "useSSL and sse") {
+		t.Fatalf("expected the TLS+SSE error, got: %v", err)
+	}
+}
+
+func TestValidateRejectsS3WithoutCredentials(t *testing.T) {
+	// The s3 sink signs with static creds only — empty keys sign anonymously and 403, so
+	// missing accessKey/secretKey must fail loud at config time, not at runtime.
+	c := validConfig(Target{Name: "s3", Type: "s3", Endpoint: "e", Bucket: "b", Region: "r", UseSSL: true, SSE: true})
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected an s3 target with no accessKey/secretKey to be rejected")
+	}
+	if !strings.Contains(err.Error(), "accessKey and secretKey") {
+		t.Fatalf("expected the missing-credentials error, got: %v", err)
 	}
 }
 

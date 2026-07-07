@@ -332,10 +332,14 @@ func runReconcile(args []string) error {
 	if err != nil {
 		return err // sweep error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
 	}
-	// A COMPLETED pass that left objects unrepaired must exit nonzero so a cron/CI backstop
-	// alerts — a silent exit 0 on an all-failed reconcile hides persistent under-replication.
-	if st.Failed > 0 {
-		return fmt.Errorf("reconcile left %d object(s) unrepaired (still under-replicated)", st.Failed)
+	// A COMPLETED pass that could NOT fully protect every object must exit nonzero so a cron/CI
+	// backstop alerts. Both buckets count: Failed = a target was down (retryable next pass);
+	// Skipped = the object lives on NO current target at all (near-total loss — only a
+	// primary-store backfill can restore it), which is MORE severe, not less, so it must not
+	// slip through as a clean exit 0.
+	if st.Failed > 0 || st.Skipped > 0 {
+		return fmt.Errorf("reconcile could not fully protect %d object(s): %d unrepaired (target down), %d on NO target (need a primary-store backfill)",
+			st.Failed+st.Skipped, st.Failed, st.Skipped)
 	}
 	return nil
 }
@@ -400,12 +404,13 @@ func runBackfill(args []string) error {
 	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
 	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
-	fmt.Printf("backfill: backed=%d failed=%d\n", st.Backed, st.Failed)
+	fmt.Printf("backfill: backed=%d skipped=%d failed=%d\n", st.Backed, st.Skipped, st.Failed)
 	if err != nil {
 		return err // sweep/DB error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
 	}
-	// A COMPLETED pass that couldn't fully back up every object exits nonzero so an operator
-	// scripting `backfill && next-step` doesn't proceed as if the corpus were fully protected.
+	// A COMPLETED pass with GENUINE failures exits nonzero so an operator scripting
+	// `backfill && next-step` doesn't proceed as if the corpus were fully protected. Skipped
+	// (source deleted before backfill) is benign and does NOT fail the pass.
 	if st.Failed > 0 {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
@@ -456,6 +461,8 @@ func runAudit(args []string) error {
 		switch {
 		case t.UnexpectedlyUnverifiable():
 			status = "  [UNVERIFIABLE — every Exists denied but target is NOT worm: read credential/endpoint broken?]"
+		case t.Errors > 0 && !t.Worm:
+			status = "  [PARTIAL — some Exists probes errored (throttled/intermittent); sample not fully verified]"
 		case t.Unverifiable():
 			status = "  [unverifiable — worm target, read-denying by design; no coverage expected]"
 		}

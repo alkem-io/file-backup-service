@@ -124,6 +124,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 	}
 	if !tried {
 		st.Skipped++ // no configured target holds it — needs a backfill from the primary store
+		rc.reportErr(externalID, fmt.Errorf("on NO current target — needs a primary-store backfill (not reconcilable)"))
 		return
 	}
 	st.Failed++ // every source failed to fetch

@@ -160,6 +160,13 @@ func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSe
 	//     age to hours.
 	// A row counts iff: fresh (visibleAt NULL) OR a genuinely-retrying failure that is due
 	// (visibleAt <= now() AND attempts > 0).
+	//
+	// CAVEAT (all-targets-down / single-target deployment): when EVERY pending target is
+	// circuit-open, a claimed object stores nowhere and is deferred (attempts=0), so this
+	// gauge excludes it and reads clean even though nothing is being backed up. That is by
+	// design — the object is blocked on a down target, not lagging on throughput — and the
+	// outage is surfaced by filebackup_targets_circuit_open>0 + last_success_age climbing, the
+	// signals that DO fire when a target is down. See the oldest_pending_age metric help.
 	const q = `SELECT count(*),
 	  COALESCE(EXTRACT(EPOCH FROM now() - min("createdDate")), 0)
 	FROM file_backup_outbox

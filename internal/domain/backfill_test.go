@@ -74,3 +74,19 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 		t.Fatalf("resume: %+v err=%v (want backed=1 failed=0)", st2, err)
 	}
 }
+
+// TestBackfillSkipsSourceGone: a deleted-before-backfill object is a benign Skip, NOT a
+// Failure — so a corpus with routine deletions doesn't fail the pass (mirrors the consumer).
+// goneSource (backup_test.go) returns a WRAPPED ErrSourceGone, so this also confirms the
+// backfill switch matches via errors.Is, not ==.
+func TestBackfillSkipsSourceGone(t *testing.T) {
+	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: "gone1"}, {ExternalID: "gone2"}}}
+	p := NewPipeline(goneSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
+	st, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if st.Skipped != 2 || st.Failed != 0 || st.Backed != 0 {
+		t.Fatalf("stats: %+v (want both objects skipped as source-gone, zero failed)", st)
+	}
+}

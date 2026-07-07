@@ -53,14 +53,19 @@ func (r AuditReport) FailErr() error {
 	if m := r.Missing(); m > 0 {
 		return fmt.Errorf("%d ledger-stored objects are missing from their target", m)
 	}
-	var unexpected []string
+	var unverified []string
 	for _, t := range r.Targets {
-		if t.UnexpectedlyUnverifiable() {
-			unexpected = append(unexpected, t.Target)
+		// A non-WORM target with ANY errored probe could not fully verify its sample — a
+		// broken/throttled read path. This catches the PARTIAL case (0 < Errors < Checked, e.g.
+		// intermittent 503s) too, not just the all-errored UnexpectedlyUnverifiable case: half
+		// the sample silently unverified must NOT read as a clean pass (FR-014). A WORM target's
+		// errors are expected (read-denying by design) and never fail the audit.
+		if t.Errors > 0 && !t.Worm {
+			unverified = append(unverified, t.Target)
 		}
 	}
-	if len(unexpected) > 0 {
-		return fmt.Errorf("targets unverifiable (read path broken, not worm): %v", unexpected)
+	if len(unverified) > 0 {
+		return fmt.Errorf("targets with unverifiable objects (read path broken/throttled, not worm): %v", unverified)
 	}
 	return nil
 }

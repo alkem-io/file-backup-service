@@ -133,3 +133,23 @@ type existsErrSink struct{ stubSink }
 func (existsErrSink) Exists(context.Context, string) (bool, error) {
 	return false, errors.New("AccessDenied")
 }
+
+// TestFailErrFlagsPartialUnverifiable: a non-WORM target with SOME (not all) errored probes
+// must fail the audit — half the sample silently unverified is not a clean pass (FR-014).
+func TestFailErrFlagsPartialUnverifiable(t *testing.T) {
+	// Partial errors on a non-worm target → fail.
+	rep := AuditReport{Targets: []TargetAudit{{Target: "t", Checked: 10, Missing: 0, Errors: 4, Worm: false}}}
+	if err := rep.FailErr(); err == nil {
+		t.Fatal("a non-worm target with partial probe errors must fail the audit")
+	}
+	// The same error profile on a WORM target is expected → pass.
+	worm := AuditReport{Targets: []TargetAudit{{Target: "w", Checked: 10, Missing: 0, Errors: 10, Worm: true}}}
+	if err := worm.FailErr(); err != nil {
+		t.Fatalf("a worm target's read-denied probes must not fail the audit: %v", err)
+	}
+	// Clean pass (no errors, no missing) → nil.
+	clean := AuditReport{Targets: []TargetAudit{{Target: "t", Checked: 10, Missing: 0, Errors: 0}}}
+	if err := clean.FailErr(); err != nil {
+		t.Fatalf("a clean audit must pass: %v", err)
+	}
+}

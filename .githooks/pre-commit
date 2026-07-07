@@ -10,16 +10,15 @@ echo "$STAGED" | grep -q "db/queries/\|db/migrations/" && NEED_SQLC=true || true
 echo "$STAGED" | grep -q "internal/adapter/inbound/http/" && NEED_OPENAPI=true || true
 
 if [ "$NEED_SQLC" = true ]; then
-  if command -v sqlc >/dev/null 2>&1; then
-    echo "  Regenerating sqlc..."
-    sqlc -f db/sqlc.yaml generate
-    git diff --exit-code internal/adapter/outbound/db/queries/ || {
-      echo "ERROR: sqlc generated code is stale. Run 'make sqlc-generate' and stage the changes."
-      exit 1
-    }
-  else
-    echo "  WARN: sqlc not installed, skipping generated-code check"
-  fi
+  # Use the version-pinned sqlc (make sqlc-generate -> go run ...@vX) so the drift check is
+  # deterministic regardless of any `sqlc` on PATH — sqlc stamps its version into each header,
+  # so a mismatched CLI would flag spurious drift on the comment lines alone.
+  echo "  Regenerating sqlc (pinned)..."
+  make sqlc-generate
+  git diff --exit-code internal/adapter/outbound/db/queries/ || {
+    echo "ERROR: sqlc generated code is stale. Run 'make sqlc-generate' and stage the changes."
+    exit 1
+  }
 fi
 
 if [ "$NEED_OPENAPI" = true ]; then
