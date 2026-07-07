@@ -27,46 +27,40 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
-// command pairs a subcommand's runner with its SIGTERM policy. cleanDrain=true maps a clean
-// shutdown (context.Canceled) to exit 0 — a long-running worker/DR op that drains on SIGTERM
-// isn't a failure. cleanDrain=false means an interrupted run exits nonzero: audit MUST be
-// false (an aborted integrity check is INCOMPLETE, not "passed"); restore/verify/migrate are
-// short and have no drain semantics. Declaring the policy once per command — rather than
-// wrapping some switch arms and not others — is what stops the drill stub (and any future
-// command) from silently getting the exit-code contract wrong.
-type command struct {
-	run        func(args []string) error
-	cleanDrain bool
-}
-
-var commands = map[string]command{
-	"serve":     {func(a []string) error { return serve(configFlag("serve", a)) }, true},
-	"migrate":   {func(a []string) error { return runMigrate(configFlag("migrate", a)) }, false},
-	"restore":   {runRestore, false},
-	"verify":    {runVerify, false},
-	"reconcile": {runReconcile, true},
-	"audit":     {runAudit, false}, // NOT clean-drain: an interrupted audit must exit nonzero
-	"backfill":  {runBackfill, true},
-}
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
-	name := os.Args[1]
-	if name == "drill" {
-		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", name)
+	args := os.Args[2:]
+	// A DIRECT call per arm (not a func-value dispatch table) so the apispec generator can
+	// statically trace main -> serve -> NewRouter and keep /live,/health,/metrics in
+	// openapi.yaml. onShutdownOK wraps the long-running drain commands (serve/reconcile/
+	// backfill) so a clean SIGTERM is exit 0; audit deliberately does NOT (see its arm).
+	var err error
+	switch os.Args[1] {
+	case "serve":
+		err = onShutdownOK(serve(configFlag("serve", args)))
+	case "migrate":
+		err = runMigrate(configFlag("migrate", args))
+	case "restore":
+		err = runRestore(args)
+	case "verify":
+		err = runVerify(args)
+	case "reconcile":
+		err = onShutdownOK(runReconcile(args))
+	case "audit":
+		// NO onShutdownOK — an interrupted audit is an INCOMPLETE integrity check and must
+		// exit nonzero, so a cron doesn't read an aborted verification as passed.
+		err = runAudit(args)
+	case "backfill":
+		err = onShutdownOK(runBackfill(args))
+	case "drill":
+		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
 		os.Exit(1)
-	}
-	cmd, ok := commands[name]
-	if !ok {
+	default:
 		usage()
 		os.Exit(2)
-	}
-	err := cmd.run(os.Args[2:])
-	if cmd.cleanDrain {
-		err = onShutdownOK(err)
 	}
 	if err != nil {
 		fatal(err)
@@ -75,7 +69,7 @@ func main() {
 
 // onShutdownOK maps a clean-shutdown context.Canceled to a success exit — a SIGTERM to a
 // long-running subcommand is an orderly drain, not a crash, so k8s/systemd/cron don't read
-// it as a failure. Applied by main per the commands table's cleanDrain flag (audit opts out).
+// it as a failure. The one owner of this policy; audit deliberately opts out (see the switch).
 func onShutdownOK(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return nil
