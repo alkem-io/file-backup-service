@@ -39,9 +39,7 @@ type CircuitBreaker struct {
 // within its last 2*threshold observed outcomes, held open for cooldown (after which one
 // probe half-opens it).
 func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
-	if threshold < 1 {
-		threshold = 1
-	}
+	threshold = max(threshold, 1)
 	return &CircuitBreaker{
 		threshold: threshold,
 		window:    2 * threshold,

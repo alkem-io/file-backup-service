@@ -56,12 +56,9 @@ func (s *Sink) Preflight(ctx context.Context) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil { //nolint:gosec // backup store readable by the restore uid
 		return fmt.Errorf("filesystem preflight %q: mkdir %s: %w", s.name, s.root, err)
 	}
-	f, name, err := fsutil.CreateTemp(s.root, ".preflight")
-	if err != nil {
+	if err := fsutil.ProbeWritable(s.root); err != nil {
 		return fmt.Errorf("filesystem preflight %q: %s not writable: %w", s.name, s.root, err)
 	}
-	_ = f.Close()
-	_ = os.Remove(name)
 	return nil
 }
 

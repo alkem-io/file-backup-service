@@ -491,15 +491,16 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e BackupItem, targets
 	return results, vr.Total, nil
 }
 
-// runAbandonable runs fn in its OWN goroutine and returns its result, but honors ctx even when
+// RunAbandonable runs fn in its OWN goroutine and returns its result, but honors ctx even when
 // fn cannot (a filesystem call blocked in a hung fsync/write on a wedged mount — a regular-file
 // syscall Go can't interrupt): on ctx cancellation it returns onCancel() and ABANDONS the
 // goroutine (bounded, one per wedged op), so the caller unblocks rather than pinning forever.
 // The result channel is BUFFERED (cap 1) so the abandoned goroutine never blocks on its send. A
 // panic in fn is recovered HERE (a recover only catches its own goroutine — the caller's recover
-// can't reach across this boundary) and mapped via onPanic. The single owner of this
-// abandon + buffered-chan + recover primitive, shared by storeWithCtx and callWithCtx.
-func runAbandonable[T any](ctx context.Context, fn func() T, onCancel func() T, onPanic func(recovered any) T) T {
+// can't reach across this boundary) and mapped via onPanic. The single owner of this abandon +
+// buffered-chan + recover primitive, shared by storeWithCtx, callWithCtx, and the CLI's
+// startup-check gate (runChecks) — exported so package main reuses it rather than a 4th copy.
+func RunAbandonable[T any](ctx context.Context, fn func() T, onCancel func() T, onPanic func(recovered any) T) T {
 	ch := make(chan T, 1)
 	go func() {
 		defer func() {
@@ -520,9 +521,9 @@ func runAbandonable[T any](ctx context.Context, fn func() T, onCancel func() T, 
 // callWithCtx runs fn honoring ctx even when fn cannot (a hung fsync/write on a wedged mount Go
 // can't interrupt): on cancellation it returns ctx.Err() and abandons the goroutine; a panic in
 // fn becomes an error so a panicking sink op fails its target instead of crashing the process.
-// The manifest writer's abandonment path. See runAbandonable.
+// The manifest writer's abandonment path. See RunAbandonable.
 func callWithCtx(ctx context.Context, fn func() error) error {
-	return runAbandonable(ctx, fn,
+	return RunAbandonable(ctx, fn,
 		func() error { return ctx.Err() },
 		func(r any) error { return PanicErr("sink op", r) })
 }
@@ -539,7 +540,7 @@ func callWithCtx(ctx context.Context, fn func() error) error {
 // dispatcher closing the pipes AFTER VerifyReader checks the hash, so Store takes no length (a
 // known-length finalize, e.g. minio single-PUT, would commit before verification).
 func storeWithCtx(ctx context.Context, sink Sink, hash string, er *eofReader) targetResult {
-	return runAbandonable(ctx,
+	return RunAbandonable(ctx,
 		func() targetResult {
 			sn, serr := sink.Store(ctx, hash, er)
 			return targetResult{stored: sn, err: serr, sawEOF: er.sawEOF}

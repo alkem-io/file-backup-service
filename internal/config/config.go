@@ -373,13 +373,7 @@ func (c *Config) ValidateTargets() error {
 // which rejects Concurrency>1024 — so this clamp is a belt-and-suspenders guard that makes
 // the int32 conversion provably non-overflowing at the call site regardless of validation.
 func (c *Config) PoolSize(headroom int) int32 {
-	n := c.Concurrency
-	if n < 1 {
-		n = 1
-	}
-	if n > 1024 {
-		n = 1024
-	}
+	n := min(max(c.Concurrency, 1), 1024)
 	return int32(n + headroom) //nolint:gosec // n clamped to <=1024, so n+headroom fits int32
 }
 

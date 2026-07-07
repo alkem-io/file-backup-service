@@ -71,6 +71,21 @@ func CreateTemp(dir, prefix string) (*os.File, string, error) {
 	return f, f.Name(), nil
 }
 
+// ProbeWritable verifies dir is writable by creating then removing a throwaway ".partial"
+// temp — the write-probe shared by the filesystem sink's Preflight and the reconcile
+// scratch-dir check, so both use ONE policy and the same sweepable temp naming (a probe that
+// leaks after a crash is caught by the same orphan sweep as any other .partial). dir="" uses
+// the OS temp dir.
+func ProbeWritable(dir string) error {
+	f, name, err := CreateTemp(dir, preflightPrefix)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
+}
+
 // CommitWrite is the durable-write spine shared by the filesystem sink and the DR
 // restore path, so the temp/fsync/ctx-gate/commit policy can't drift between backup
 // and restore. It: MkdirAll(dir,0755) -> temp -> fill(temp) -> fsync -> close ->

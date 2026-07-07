@@ -159,9 +159,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 			if remaining <= 0 {
 				break
 			}
-			if remaining < limit {
-				limit = remaining
-			}
+			limit = min(limit, remaining)
 		}
 		page, err := led.StoredObjectsPage(ctx, ta.Target, after, limit)
 		if err != nil {

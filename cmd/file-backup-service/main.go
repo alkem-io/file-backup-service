@@ -23,6 +23,7 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/fileservice"
 	"github.com/alkem-io/file-backup-service/internal/config"
 	"github.com/alkem-io/file-backup-service/internal/domain"
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 func main() {
@@ -461,13 +462,9 @@ func preflightScratch(dir string, logger *zap.Logger) error {
 		logger.Warn("scratchDir unset: staging decoded objects under the OS temp dir — set scratchDir to a disk-backed volume sized for the largest object, else a tmpfs /tmp can OOM the pod",
 			zap.String("osTempDir", os.TempDir()))
 	}
-	f, err := os.CreateTemp(dir, "reconcile-preflight-*")
-	if err != nil {
+	if err := fsutil.ProbeWritable(dir); err != nil {
 		return fmt.Errorf("scratchDir not writable (set scratchDir to a writable, disk-backed path): %w", err)
 	}
-	name := f.Name()
-	_ = f.Close()
-	_ = os.Remove(name)
 	return nil
 }
 
@@ -567,28 +564,22 @@ func runChecks(ctx context.Context, checks []startCheck) []error {
 			// Run each check in its OWN goroutine and ABANDON it on ctx (the startup deadline):
 			// a check that ignores its ctx — filesystem.Preflight's os.MkdirAll on a wedged
 			// mount is an uninterruptible syscall — would otherwise hang serve FOREVER at
-			// startup with green /health (which probes the DBs, not the targets). Abandoning
-			// makes it fail loud at the deadline instead. The done channel is buffered so the
-			// abandoned goroutine never blocks on its send; it's bounded (one per hung target)
-			// and the process exits once startupGate reports the error.
-			done := make(chan error, 1)
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						done <- domain.PanicErr(c.name, r)
+			// startup with green /health (which probes the DBs, not the targets). domain's
+			// RunAbandonable is the single owner of that abandon + buffered-chan + recover
+			// primitive (also used by the pipeline's storeWithCtx/callWithCtx), so this reuses it
+			// rather than re-implementing the load-bearing cap-1 buffer that lets an abandoned
+			// goroutine complete its send without leaking.
+			return domain.RunAbandonable(ctx,
+				func() error {
+					if err := c.fn(ctx); err != nil {
+						return fmt.Errorf("%s: %w", c.name, err)
 					}
-				}()
-				done <- c.fn(ctx)
-			}()
-			select {
-			case err := <-done:
-				if err != nil {
-					return fmt.Errorf("%s: %w", c.name, err)
-				}
-				return nil
-			case <-ctx.Done():
-				return fmt.Errorf("%s: startup deadline exceeded (hung target/dependency?): %w", c.name, ctx.Err())
-			}
+					return nil
+				},
+				func() error {
+					return fmt.Errorf("%s: startup deadline exceeded (hung target/dependency?): %w", c.name, ctx.Err())
+				},
+				func(r any) error { return domain.PanicErr(c.name, r) })
 		})
 }
 

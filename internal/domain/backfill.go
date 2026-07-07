@@ -55,9 +55,7 @@ func bump(mu *sync.Mutex, counter *int) {
 // enumerate is the sweep source (backfill's EachFile / reconcile's TargetGaps); a yield/enumerate
 // error stops the sweep. The one owner of the bounded-paced worker-pool scaffold.
 func runBoundedPaced[T any](ctx context.Context, concurrency, ratePerSec int, enumerate func(yield func(T) error) error, work func(T)) error {
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency = max(concurrency, 1)
 	wait, stop := newPacer(ratePerSec)
 	defer stop()
 	sem := make(chan struct{}, concurrency)

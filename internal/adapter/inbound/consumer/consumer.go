@@ -306,10 +306,7 @@ func (c *Consumer) fail(ctx context.Context, id int64, reason string) {
 // then on an interval SHORTER than StaleTTL so a stuck row is caught within
 // ~StaleTTL rather than up to 2×.
 func (c *Consumer) reap(ctx context.Context) {
-	interval := c.d.StaleTTL / 4
-	if interval < time.Minute {
-		interval = time.Minute
-	}
+	interval := max(c.d.StaleTTL/4, time.Minute)
 	// domain.TickLoop owns the ticker + startup sweep + panic recover; DBTimeout bounds each
 	// sweep so a wedged Alkemio DB can't park the reaper indefinitely (shutdown still aborts it
 	// via the parent ctx). A panic (a pgx Scan on a drifted foreign-outbox column), a returned
