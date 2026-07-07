@@ -129,6 +129,7 @@ func validConfig(targets ...Target) *Config {
 		MaxDeliveries:       50,
 		FanoutStallSec:      60,
 		CircuitCooldownSec:  60,
+		DBTimeoutSec:        30,
 		Targets:             targets,
 	}
 }
@@ -138,6 +139,14 @@ func TestValidateRejectsStallNotBelowTimeout(t *testing.T) {
 	c.FanoutStallSec = c.PerObjectTimeoutSec // stall must fire BEFORE the per-object timeout
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected fanoutStallSec >= perObjectTimeoutSec to be rejected (stall-drop would never fire first)")
+	}
+}
+
+func TestValidateRejectsDBTimeoutBelowBookkeeping(t *testing.T) {
+	c := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
+	c.DBTimeoutSec = 5 // below the 15s detached-bookkeeping budget
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected dbTimeoutSec < bookkeeping timeout to be rejected (statement_timeout would abort a bookkeeping write early and strand the row)")
 	}
 }
 

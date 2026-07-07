@@ -420,6 +420,17 @@ func (c *Config) validateLimits() error {
 		return fmt.Errorf("circuitThreshold (%d) must be < maxAttempts (%d), else an object dead-letters before its target's circuit trips (defeating T017a defer-not-dead-letter)",
 			c.CircuitThreshold, c.MaxAttempts)
 	}
+	// dbTimeout is the pool's server-side statement_timeout, so it must not fire BEFORE the
+	// detached-bookkeeping budget (BookkeepingTimeout): a MarkDone/Fail/RecordBackup that runs
+	// AFTER a per-object timeout/shutdown gets a fresh BookkeepingTimeout ctx, but it still
+	// executes on a pooled connection whose statement_timeout would abort it early if dbTimeout
+	// were smaller — stranding the row in_progress until the reaper requeues it (deliveries++
+	// toward the crash-loop dead-letter for a non-problem). The default (30s) clears the 15s
+	// budget; guard an operator override that doesn't.
+	if minDB := int(domain.BookkeepingTimeout.Seconds()); c.DBTimeoutSec < minDB {
+		return fmt.Errorf("dbTimeoutSec (%d) must be >= bookkeeping timeout (%ds), else the pool's statement_timeout aborts a detached bookkeeping write before its budget and strands the row",
+			c.DBTimeoutSec, minDB)
+	}
 	// The stall-drop MUST fire before the per-object timeout, or a hung target stalls the
 	// whole fan-out barrier until the shared timeout aborts every target in lockstep (the
 	// circuit never trips → the object Fails instead of Defers → the corpus dead-letters,

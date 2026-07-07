@@ -242,8 +242,15 @@ func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(
 	// Bound the DR op like every other path (serve/backfill/reconcile all cap one object with
 	// perObjectTimeout): a black-holing sink — one that accepts the connection but never
 	// returns bytes — must fail the operator's command on the deadline, not hang it forever
-	// (only SIGINT would otherwise stop it). perObjectTimeout is applyDefaults-floored positive.
-	ctx, cancel := context.WithTimeout(ctx, cfg.PerObjectTimeout())
+	// (only SIGINT would otherwise stop it).
+	timeout := cfg.PerObjectTimeout()
+	if timeout <= 0 {
+		// sinkFor validates only the targets, NOT the numeric limits (validateLimits' maxSec cap
+		// is a serve/DR-pool concern), so an absurd perObjectTimeoutSec could overflow to a
+		// non-positive Duration here. Fall back to the default rather than an instant-deadline op.
+		timeout = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return op(ctx, sink, *hash)
 }
