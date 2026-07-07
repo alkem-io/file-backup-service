@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -32,6 +33,7 @@ func (f fakeSource) FetchContent(context.Context, BackupItem) (io.ReadCloser, er
 // fakeLedger enforces the real FK invariant: a target status can only be written
 // after the object row exists (file_backup_target_status REFERENCES file_backup_object).
 type fakeLedger struct {
+	mu       sync.Mutex // concurrent backfill/reconcile workers share one ledger, like the real pgx pool
 	objects  map[string]bool
 	sizes    map[string]int64  // externalID -> recorded object size
 	states   map[string]string // externalID+"/"+target -> last state
@@ -46,6 +48,8 @@ func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []Ta
 	// The real CTE writes the object (FK parent) before the statuses atomically;
 	// the fake records both together. Mirror the size no-downgrade rule: a first
 	// insert sets it, a later write only overwrites when the size is verified.
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	_, existed := f.objects[m.ExternalID]
 	f.objects[m.ExternalID] = true
 	if !existed || m.SizeVerified {
@@ -65,6 +69,8 @@ func (f *fakeLedger) RecordBackup(_ context.Context, m ObjectMeta, statuses []Ta
 	return nil
 }
 func (f *fakeLedger) StoredTargets(_ context.Context, externalID string) (map[string]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := map[string]bool{}
 	for k, v := range f.states {
 		if v == StateStored && strings.HasPrefix(k, externalID+"/") {
@@ -75,6 +81,8 @@ func (f *fakeLedger) StoredTargets(_ context.Context, externalID string) (map[st
 }
 func (f *fakeLedger) Probe(context.Context) error { return nil }
 func (f *fakeLedger) StoredObjectsPage(_ context.Context, target, after string, limit int) ([]ObjectMeta, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	ids := make([]string, 0, len(f.objects))
 	for id := range f.objects {
 		if f.states[id+"/"+target] == StateStored && id > after {
@@ -92,6 +100,17 @@ func (f *fakeLedger) StoredObjectsPage(_ context.Context, target, after string, 
 	return out, nil
 }
 func (f *fakeLedger) TargetGaps(_ context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
+	// Snapshot the gaps under the lock, then invoke fn WITHOUT holding it: fn dispatches
+	// concurrent repair workers that call RecordBackup (which locks), and when the worker
+	// semaphore is full, yield blocks until a worker finishes — a worker that would itself
+	// deadlock waiting on a lock still held here. Mirrors the real driver: the gap cursor is
+	// a separate connection from the workers' writes.
+	type gap struct {
+		id     string
+		stored map[string]bool
+	}
+	f.mu.Lock()
+	var gaps []gap
 	for id := range f.objects {
 		stored := map[string]bool{}
 		for _, t := range allTargets {
@@ -100,9 +119,13 @@ func (f *fakeLedger) TargetGaps(_ context.Context, allTargets []string, fn func(
 			}
 		}
 		if len(stored) < len(allTargets) {
-			if err := fn(id, stored); err != nil {
-				return err
-			}
+			gaps = append(gaps, gap{id, stored})
+		}
+	}
+	f.mu.Unlock()
+	for _, g := range gaps {
+		if err := fn(g.id, g.stored); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -123,6 +146,7 @@ func (stubSink) Preflight(context.Context) error                      { return n
 
 type memSink struct {
 	stubSink
+	mu    sync.Mutex // concurrent backfill/reconcile workers fan out to one target, like the real stateless sink
 	store map[string][]byte
 }
 
@@ -130,6 +154,8 @@ func newMemSink(name string) *memSink {
 	return &memSink{stubSink: stubSink{name: name}, store: map[string][]byte{}}
 }
 func (m *memSink) Exists(_ context.Context, h string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	_, ok := m.store[h]
 	return ok, nil
 }
@@ -138,18 +164,25 @@ func (m *memSink) Store(_ context.Context, h string, r io.Reader) (int64, error)
 	if err != nil {
 		return 0, err
 	}
+	m.mu.Lock()
 	m.store[h] = b
+	m.mu.Unlock()
 	return int64(len(b)), nil
 }
 func (m *memSink) Fetch(_ context.Context, h string) (io.ReadCloser, error) {
-	return io.NopCloser(bytes.NewReader(m.store[h])), nil
+	m.mu.Lock()
+	b := m.store[h]
+	m.mu.Unlock()
+	return io.NopCloser(bytes.NewReader(b)), nil
 }
 func (m *memSink) PutManifest(_ context.Context, name string, r io.Reader) error {
 	b, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
+	m.mu.Lock()
 	m.store["_manifest/"+name] = b
+	m.mu.Unlock()
 	return nil
 }
 

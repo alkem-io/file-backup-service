@@ -340,7 +340,7 @@ func runReconcile(args []string) error {
 	// (not left to wedge every repair for the full perObjectTimeout) and circuit-tripped after
 	// repeated failures so the pass stops hammering it.
 	breaker := cfg.NewCircuitBreaker()
-	rec := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout(), cfg.ScratchDir, cfg.FanoutStall(), breaker).
+	rec := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout(), cfg.ScratchDir, cfg.FanoutStall(), breaker, cfg.Concurrency).
 		OnError(func(id string, e error) {
 			logger.Warn("reconcile repair failed", zap.String("externalID", id), zap.Error(e))
 		})
@@ -420,7 +420,7 @@ func runBackfill(args []string) error {
 	// black-holing target wedge every object for the full perObjectTimeout, invisibly.
 	breaker := cfg.NewCircuitBreaker()
 	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
-	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
+	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d failed=%d\n", st.Backed, st.Skipped, st.Failed)
 	if err != nil {
 		return err // sweep/DB error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)

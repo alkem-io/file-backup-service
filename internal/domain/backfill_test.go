@@ -25,7 +25,7 @@ func TestBackfillPerObjectTimeout(t *testing.T) {
 	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: "h1"}, {ExternalID: "h2"}}}
 	p := NewPipeline(hangingSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
 	// Run ctx is Background (un-cancelled) so ONLY the per-object timeout can end a hang.
-	st, err := NewBackfiller(corpus, p, 50*time.Millisecond).Run(context.Background(), 0)
+	st, err := NewBackfiller(corpus, p, 50*time.Millisecond, 4).Run(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
 	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: h}}}
 
-	st, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
+	st, err := NewBackfiller(corpus, p, time.Minute, 4).Run(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 
 	// Resumable: a second pass finds it already stored (dedup, no re-store) and still
 	// reports it backed.
-	st2, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
+	st2, err := NewBackfiller(corpus, p, time.Minute, 4).Run(context.Background(), 0)
 	if err != nil || st2.Backed != 1 || st2.Failed != 0 {
 		t.Fatalf("resume: %+v err=%v (want backed=1 failed=0)", st2, err)
 	}
@@ -82,7 +82,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 func TestBackfillSkipsSourceGone(t *testing.T) {
 	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: "gone1"}, {ExternalID: "gone2"}}}
 	p := NewPipeline(goneSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
-	st, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
+	st, err := NewBackfiller(corpus, p, time.Minute, 4).Run(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
