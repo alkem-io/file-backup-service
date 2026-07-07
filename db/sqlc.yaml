@@ -10,3 +10,11 @@ sql:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_empty_slices: true
+        overrides:
+          # The ledger createdBy is a nullable uuid breadcrumb; map it to the same
+          # uuid.NullUUID the domain (ObjectMeta.CreatedBy) uses, so no adapter-boundary
+          # conversion is needed. Only the sqlc-generated ledger queries are affected
+          # (the foreign outbox/file tables are hand-written pgx, per the §IV waiver).
+          - db_type: "uuid"
+            nullable: true
+            go_type: "github.com/google/uuid.NullUUID"

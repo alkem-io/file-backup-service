@@ -5,6 +5,7 @@
 package queries
 
 import (
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -12,7 +13,7 @@ type FileBackupObject struct {
 	ExternalID        string             `json:"externalID"`
 	Size              int64              `json:"size"`
 	FirstSeenAt       pgtype.Timestamptz `json:"firstSeenAt"`
-	CreatedBy         pgtype.UUID        `json:"createdBy"`
+	CreatedBy         uuid.NullUUID      `json:"createdBy"`
 	SourceCreatedDate pgtype.Timestamptz `json:"sourceCreatedDate"`
 }
 
