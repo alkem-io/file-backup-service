@@ -281,8 +281,8 @@ dispatch:
 			// (unverifiable) result instead. (A filesystem os.Stat on a wedged mount ignores ctx,
 			// as everywhere; the abandoned goroutine's send is absorbed by the buffered ch.)
 			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
+			defer cancel() // deferred (not inline): a recovered sink.Exists panic must not skip it and leak the timer
 			present, err := sink.Exists(pctx, page[i].ExternalID)
-			cancel()
 			ch <- done{i, existsResult{present: present, err: err}}
 		}(i)
 	}

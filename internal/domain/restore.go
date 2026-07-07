@@ -23,6 +23,14 @@ import (
 // the file schema ever widens past int32, raise this AND revisit the S3 part size.
 var maxObjectBytes int64 = 4 << 30 // 4 GiB
 
+// maxCompressedBytes bounds the COMPRESSED input a zstd decode will read before giving up
+// — the skippable-frame-amplification guard (see decodeZstd). It sits safely above zstd's
+// worst-case expansion of a maxObjectBytes plaintext (ZSTD_compressBound ≈ size + size/256):
+// the >>6 (~1.6%) margin plus a 1 MiB floor (so a tiny test-lowered maxObjectBytes still has
+// headroom) is well above 1/256, so a legit incompressible object stored as zstd is never
+// truncated. A function, not a const, because tests lower maxObjectBytes.
+func maxCompressedBytes() int64 { return maxObjectBytes + maxObjectBytes>>6 + (1 << 20) }
+
 // zstdMagic is the zstd frame magic (RFC 8878). A stored object is zstd iff it
 // begins with these bytes — so a 4-byte peek picks the codec without a probe write.
 var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
@@ -213,11 +221,17 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	// EOF is not an error — a raw object that merely begins with the zstd magic reads to EOF and
 	// its decode/hash mismatch, in verr, correctly drives the raw fallback.)
 	tr := &errTrackingReader{r: r}
-	// Bomb protection is the DECODED-output cap (copyVerify below); do NOT also cap the
-	// COMPRESSED input — an incompressible near-cap object stores as raw zstd blocks
-	// slightly LARGER than its plaintext, and an input cap would truncate its frame and
-	// make it (falsely) unrestorable.
-	zr, err := getZstdDecoder(tr)
+	// Two caps guard the decode. The DECODED-output cap (copyVerify below) stops a classic
+	// zstd bomb (a tiny frame expanding to PB). But zstd SKIPPABLE frames yield NO decoded
+	// output, so an object padded with them slips under the output cap while forcing an
+	// unbounded COMPRESSED read — so ALSO cap the input, sized safely ABOVE zstd's worst-case
+	// expansion of a maxObjectBytes plaintext (ZSTD_compressBound ≈ size + size/256). A legit
+	// incompressible object stored as zstd is slightly larger than its plaintext but far below
+	// this bound, so it is never truncated (a too-tight cap would re-hash a truncated frame and
+	// falsely fail restore); only a tampered/padded object hits the cap, and it bounds that
+	// read instead of letting it run unbounded on the (now also deadline-bounded) DR path.
+	capped := io.LimitReader(tr, maxCompressedBytes())
+	zr, err := getZstdDecoder(capped)
 	if err != nil {
 		if tr.err != nil && !errors.Is(tr.err, io.EOF) {
 			return fmt.Errorf("zstd source read: %w", tr.err) // the header read itself failed — I/O, not "not zstd"
