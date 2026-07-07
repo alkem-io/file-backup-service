@@ -46,11 +46,7 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// not crash serve: these goroutines are spawned per readiness scrape and chi's Recoverer
 	// only wraps the request goroutine, not its children. A recovered panic leaves details[i]
 	// unwritten (""), which the post-loop maps to "unusable".
-	idxs := make([]int, len(checks))
-	for i := range idxs {
-		idxs[i] = i
-	}
-	errs := domain.RunParallel(idxs,
+	errs := domain.RunParallelIdx(len(checks),
 		func(i int) string { return "probe " + checks[i].name },
 		func(i int) error { details[i] = probeDetail(req, checks[i].p); return nil })
 	for i := range details {

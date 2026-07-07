@@ -105,11 +105,11 @@ func serve(cfgPath string) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
-	logger, err := zap.NewProduction()
+	logger, syncLog, err := newLogger()
 	if err != nil {
-		return fmt.Errorf("init logger: %w", err)
+		return err
 	}
-	defer func() { _ = logger.Sync() }()
+	defer syncLog()
 	ctx, stop := signalContext()
 	defer stop()
 
@@ -160,7 +160,7 @@ func serve(cfgPath string) error {
 	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered. serve goes
 	// through WithIsolation (stall-drop + circuit) like backfill/reconcile, so the isolation
 	// wiring has ONE owner and serve can't silently miss a field a future isolation knob adds.
-	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
+	breaker := cfg.NewCircuitBreaker()
 	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
@@ -204,6 +204,16 @@ func serve(cfgPath string) error {
 // serve loop or a stalled DR op honors the operator's stop signal.
 func signalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
+
+// newLogger builds the production zap logger + the sync closure the caller defers — the one
+// owner of the logger-init block shared by serve/reconcile/backfill.
+func newLogger() (*zap.Logger, func(), error) {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return nil, nil, fmt.Errorf("init logger: %w", err)
+	}
+	return logger, func() { _ = logger.Sync() }, nil
 }
 
 // sourceOp is the shared scaffold for the DR subcommands: parse --config/--hash/--from
@@ -316,11 +326,11 @@ func runReconcile(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	logger, err := zap.NewProduction()
+	logger, syncLog, err := newLogger()
 	if err != nil {
-		return fmt.Errorf("logger: %w", err)
+		return err
 	}
-	defer func() { _ = logger.Sync() }()
+	defer syncLog()
 	// A decoded object is staged to scratchDir (up to the object-size cap) before re-fan-out;
 	// a missing/read-only path must fail LOUD at startup, not per-object mid-repair.
 	if err := preflightScratch(cfg.ScratchDir, logger); err != nil {
@@ -329,7 +339,7 @@ func runReconcile(args []string) error {
 	// Same hung-target isolation as serve: a black-holing destination target is stall-dropped
 	// (not left to wedge every repair for the full perObjectTimeout) and circuit-tripped after
 	// repeated failures so the pass stops hammering it.
-	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
+	breaker := cfg.NewCircuitBreaker()
 	rec := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout(), cfg.ScratchDir, cfg.FanoutStall(), breaker).
 		OnError(func(id string, e error) {
 			logger.Warn("reconcile repair failed", zap.String("externalID", id), zap.Error(e))
@@ -389,11 +399,11 @@ func runBackfill(args []string) error {
 		return err
 	}
 
-	logger, err := zap.NewProduction()
+	logger, syncLog, err := newLogger()
 	if err != nil {
-		return fmt.Errorf("logger: %w", err)
+		return err
 	}
-	defer func() { _ = logger.Sync() }()
+	defer syncLog()
 
 	// Required infrastructure for backfill: the source (file-service), the ledger, and the
 	// `file` corpus. NOT the outbox (backfill reads `file`, not the queue). Same startup
@@ -408,7 +418,7 @@ func runBackfill(args []string) error {
 
 	// Same hung-target isolation as serve (stall-drop + circuit) — a bare pipeline would let a
 	// black-holing target wedge every object for the full perObjectTimeout, invisibly.
-	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
+	breaker := cfg.NewCircuitBreaker()
 	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d failed=%d\n", st.Backed, st.Skipped, st.Failed)

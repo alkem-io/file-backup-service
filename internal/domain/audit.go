@@ -7,11 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 )
 
 // auditConcurrency bounds the parallel Exists probes per page (each is an independent
 // network RTT — e.g. an S3 StatObject HEAD — so a serial sweep is RTT-bound).
 const auditConcurrency = 16
+
+// auditProbeTimeout bounds one Exists probe so a black-holing backend can't stall the whole
+// integrity check (audit runs under signalContext, which has no deadline of its own).
+const auditProbeTimeout = 30 * time.Second
 
 // TargetAudit is one target's audit outcome.
 type TargetAudit struct {
@@ -127,11 +132,7 @@ func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePer
 	// RunParallel (not a bare WaitGroup) so a panic in one target's auditTarget — e.g. a pgx
 	// scan on a drifted ledger column — becomes that target's error instead of crashing the
 	// audit process; every other concurrent sweep here is recover-guarded, this must be too.
-	idxs := make([]int, len(targets))
-	for i := range idxs {
-		idxs[i] = i
-	}
-	errs := RunParallel(idxs,
+	errs := RunParallelIdx(len(targets),
 		func(i int) string { return "audit " + targets[i].Sink.Name() },
 		func(i int) error {
 			var err error
@@ -274,7 +275,14 @@ dispatch:
 					ch <- done{i, existsResult{err: PanicErr("sink Exists", r)}}
 				}
 			}()
-			present, err := sink.Exists(ctx, page[i].ExternalID)
+			// Bound each probe: audit runs under signalContext (no deadline of its own), so a
+			// black-holing Exists — an S3 StatObject on a wedged endpoint — would otherwise block
+			// the integrity check until an operator kills it. The timeout surfaces it as an Errors
+			// (unverifiable) result instead. (A filesystem os.Stat on a wedged mount ignores ctx,
+			// as everywhere; the abandoned goroutine's send is absorbed by the buffered ch.)
+			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
+			present, err := sink.Exists(pctx, page[i].ExternalID)
+			cancel()
 			ch <- done{i, existsResult{present: present, err: err}}
 		}(i)
 	}

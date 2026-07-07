@@ -150,21 +150,27 @@ type decodingSource struct {
 // It keys on e.ExternalID (the content hash — the target is content-addressed), NOT
 // e.FileID, so reconcile no longer fakes a FileID.
 func (d decodingSource) FetchContent(ctx context.Context, e BackupItem) (io.ReadCloser, error) {
-	externalID := e.ExternalID
 	tmp, err := os.CreateTemp(d.scratchDir, "reconcile-*.plain") // "" = OS temp dir
 	if err != nil {
 		return nil, fmt.Errorf("reconcile temp: %w", err)
 	}
-	if err := decodeStream(ctx, d.src, externalID, tmp, func() error { return rewindTruncate(tmp) }); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
+	// One cleanup site (a committed-flag defer, like fsutil.CommitWrite) instead of a
+	// close+remove copy on every early-return path: the temp is dropped unless it's handed to
+	// tempReadCloser, which then owns removing it on Close.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if err := decodeStream(ctx, d.src, e.ExternalID, tmp, func() error { return rewindTruncate(tmp) }); err != nil {
 		return nil, err
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
 		return nil, fmt.Errorf("reconcile temp rewind: %w", err)
 	}
+	committed = true
 	return &tempReadCloser{f: tmp}, nil
 }
 

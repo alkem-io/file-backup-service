@@ -115,6 +115,18 @@ func RunParallel[T any](items []T, label func(T) string, run func(T) error) []er
 	return errs
 }
 
+// RunParallelIdx runs run(i) for i in [0,n) concurrently, each recover-guarded, returning the
+// per-index errors — the common case where run writes its result INTO a slice by index (so it
+// needs the index, not an item). A thin wrapper that materializes the index range so callers
+// (audit's per-target sweep, health's per-dependency probe) don't hand-roll `[]int{0..n-1}`.
+func RunParallelIdx(n int, label func(int) string, run func(int) error) []error {
+	idxs := make([]int, n)
+	for i := range idxs {
+		idxs[i] = i
+	}
+	return RunParallel(idxs, label, run)
+}
+
 // TargetNames returns the sink names of targets — the allTargets argument the ledger's
 // gap/coverage/RPO queries take. One owner so the reconcile work-list and the gauges
 // compute over the same name set.

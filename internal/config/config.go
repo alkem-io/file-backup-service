@@ -148,6 +148,12 @@ func (c *Config) CircuitCooldown() time.Duration {
 	return time.Duration(c.CircuitCooldownSec) * time.Second
 }
 
+// NewCircuitBreaker builds the per-target circuit breaker from config (threshold + cooldown) —
+// one owner so serve/reconcile/backfill wire it identically.
+func (c *Config) NewCircuitBreaker() *domain.CircuitBreaker {
+	return domain.NewCircuitBreaker(c.CircuitThreshold, c.CircuitCooldown())
+}
+
 // FanoutStall is the per-chunk drain deadline before a non-consuming target is dropped.
 func (c *Config) FanoutStall() time.Duration {
 	return time.Duration(c.FanoutStallSec) * time.Second
