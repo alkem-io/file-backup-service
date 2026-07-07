@@ -59,13 +59,15 @@ ORDER BY o."externalID" LIMIT sqlc.arg(page_limit);
 -- Objects NOT stored on every configured target = total objects MINUS fully-replicated
 -- objects. The total is an EXACT count (a coverage backstop must not under-report), bounded
 -- by the coarse sample cadence.
-SELECT
+-- ::bigint on the result so sqlc emits int64 (count(*) is bigint); a bare subtraction was
+-- inferred as int32, which would ERROR the scan past 2^31 objects rather than return the count.
+SELECT (
   (SELECT count(*) FROM file_backup_object)
   - (SELECT count(*) FROM (
       SELECT "externalID" FROM file_backup_target_status
       WHERE state = 'stored' AND target = ANY(sqlc.arg(targets)::text[])
       GROUP BY "externalID" HAVING count(*) >= sqlc.arg(target_count)::int
-    ) fully) AS gaps;
+    ) fully))::bigint AS gaps;
 
 -- name: LastVerifiedAge :one
 -- The RPO signal over the CONFIGURED targets: never_verified = count of targets that have

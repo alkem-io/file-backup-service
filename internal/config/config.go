@@ -217,7 +217,7 @@ func applyDBEnv(d *DBConfig, p string) error {
 // path by which per-target secrets (ACCESSKEY/SECRETKEY) are injected from k8s
 // secrets, and any structural field can be overridden.
 func (c *Config) applyTargetEnv() error {
-	errs := make([]error, 0, 3*len(c.Targets))
+	errs := make([]error, 0, 4*len(c.Targets)) // 4 setBool calls per target (useSSL/sse/insecure/worm)
 	for i := range c.Targets {
 		p := envPrefix + "TARGET_" + envToken(c.Targets[i].Name) + "_"
 		setStr(&c.Targets[i].Endpoint, p+"ENDPOINT")

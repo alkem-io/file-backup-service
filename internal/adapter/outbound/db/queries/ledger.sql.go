@@ -13,13 +13,13 @@ import (
 )
 
 const coverageGaps = `-- name: CoverageGaps :one
-SELECT
+SELECT (
   (SELECT count(*) FROM file_backup_object)
   - (SELECT count(*) FROM (
       SELECT "externalID" FROM file_backup_target_status
       WHERE state = 'stored' AND target = ANY($1::text[])
       GROUP BY "externalID" HAVING count(*) >= $2::int
-    ) fully) AS gaps
+    ) fully))::bigint AS gaps
 `
 
 type CoverageGapsParams struct {
@@ -30,9 +30,11 @@ type CoverageGapsParams struct {
 // Objects NOT stored on every configured target = total objects MINUS fully-replicated
 // objects. The total is an EXACT count (a coverage backstop must not under-report), bounded
 // by the coarse sample cadence.
-func (q *Queries) CoverageGaps(ctx context.Context, arg CoverageGapsParams) (int32, error) {
+// ::bigint on the result so sqlc emits int64 (count(*) is bigint); a bare subtraction was
+// inferred as int32, which would ERROR the scan past 2^31 objects rather than return the count.
+func (q *Queries) CoverageGaps(ctx context.Context, arg CoverageGapsParams) (int64, error) {
 	row := q.db.QueryRow(ctx, coverageGaps, arg.Targets, arg.TargetCount)
-	var gaps int32
+	var gaps int64
 	err := row.Scan(&gaps)
 	return gaps, err
 }
