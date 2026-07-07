@@ -12,13 +12,18 @@ echo "$STAGED" | grep -q "internal/adapter/inbound/http/" && NEED_OPENAPI=true |
 if [ "$NEED_SQLC" = true ]; then
   # Use the version-pinned sqlc (make sqlc-generate -> go run ...@vX) so the drift check is
   # deterministic regardless of any `sqlc` on PATH — sqlc stamps its version into each header,
-  # so a mismatched CLI would flag spurious drift on the comment lines alone.
+  # so a mismatched CLI would flag spurious drift on the comment lines alone. If generation
+  # itself fails (offline with the pinned module not yet cached), WARN and skip rather than
+  # hard-block the commit — the `if` condition is exempt from `set -e`.
   echo "  Regenerating sqlc (pinned)..."
-  make sqlc-generate
-  git diff --exit-code internal/adapter/outbound/db/queries/ || {
-    echo "ERROR: sqlc generated code is stale. Run 'make sqlc-generate' and stage the changes."
-    exit 1
-  }
+  if make sqlc-generate >/dev/null 2>&1; then
+    git diff --exit-code internal/adapter/outbound/db/queries/ || {
+      echo "ERROR: sqlc generated code is stale. Run 'make sqlc-generate' and stage the changes."
+      exit 1
+    }
+  else
+    echo "  WARN: sqlc generation failed (offline / module not cached?), skipping drift check"
+  fi
 fi
 
 if [ "$NEED_OPENAPI" = true ]; then

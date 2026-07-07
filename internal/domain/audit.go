@@ -60,6 +60,12 @@ func (r AuditReport) FailErr() error {
 		// intermittent 503s) too, not just the all-errored UnexpectedlyUnverifiable case: half
 		// the sample silently unverified must NOT read as a clean pass (FR-014). A WORM target's
 		// errors are expected (read-denying by design) and never fail the audit.
+		//
+		// FAIL-CLOSED by design: an integrity check that couldn't verify part of its sample is
+		// not a clean pass — an errored probe is "presence UNKNOWN", which for a loss detector
+		// is a signal, not a non-event. The cost is that a single transient backend error fails
+		// the run (re-run clears it); that recall-over-precision trade is deliberate for a
+		// data-loss check. errors=N is printed per target so the operator sees the magnitude.
 		if t.Errors > 0 && !t.Worm {
 			unverified = append(unverified, t.Target)
 		}
