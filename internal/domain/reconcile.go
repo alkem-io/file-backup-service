@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -105,7 +106,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 	entry := BackupItem{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
 	tried := false
 	var lastErr error // the last source's fetch/decode cause, surfaced if every source fails
-	for name := range stored {
+	for _, name := range rc.orderSources(stored) {
 		src, ok := rc.byName[name]
 		if !ok {
 			continue // stale status for a removed target
@@ -140,6 +141,29 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 	}
 	bump(mu, &st.Failed) // every source failed to fetch
 	rc.reportErr(externalID, fmt.Errorf("every source failed to fetch/decode: %w", lastErr))
+}
+
+// orderSources returns the holder names from stored, circuit-HEALTHY targets first and
+// circuit-down ones last (as a fallback), so a repair reads from a known-good holder before
+// one whose circuit the destination fan-out already tripped. Without this, Go's random map
+// iteration can pick a black-holing holder as the SOURCE — whose decode read has no
+// stall-drop — and burn the whole perObjectTimeout, then FAIL a repairable object instead
+// of rotating to a healthy holder (the outage is exactly when reconcile runs). Uses the
+// circuit's pure Down() read (no half-open-probe side effect, unlike Open) and sorts each
+// bucket so the order is deterministic, not map-random.
+func (rc *Reconciler) orderSources(stored map[string]bool) []string {
+	healthy := make([]string, 0, len(stored))
+	down := make([]string, 0, len(stored))
+	for name := range stored {
+		if rc.circuit != nil && rc.circuit.Down(name) {
+			down = append(down, name)
+		} else {
+			healthy = append(healthy, name)
+		}
+	}
+	sort.Strings(healthy)
+	sort.Strings(down)
+	return append(healthy, down...)
 }
 
 // decodingSource adapts a backup target into a pipeline Source: it decodes the stored

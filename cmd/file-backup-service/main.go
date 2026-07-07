@@ -232,12 +232,18 @@ func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(
 	if *hash == "" || *from == "" {
 		return fmt.Errorf("%s requires --hash and --from", name)
 	}
-	sink, err := sinkFor(*cfgPath, *from)
+	sink, cfg, err := sinkFor(*cfgPath, *from)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signalContext()
 	defer stop()
+	// Bound the DR op like every other path (serve/backfill/reconcile all cap one object with
+	// perObjectTimeout): a black-holing sink — one that accepts the connection but never
+	// returns bytes — must fail the operator's command on the deadline, not hang it forever
+	// (only SIGINT would otherwise stop it). perObjectTimeout is applyDefaults-floored positive.
+	ctx, cancel := context.WithTimeout(ctx, cfg.PerObjectTimeout())
+	defer cancel()
 	return op(ctx, sink, *hash)
 }
 
@@ -337,6 +343,13 @@ func runReconcile(args []string) error {
 	if err := preflightScratch(cfg.ScratchDir, logger); err != nil {
 		return err
 	}
+	// Preflight the targets too — the SAME gate serve/backfill run (ledgerJob already probed
+	// the ledger, so no required checks here). A wholly-misconfigured/unreachable target must
+	// fail LOUD at startup (degraded, or fatal if NONE usable), not be discovered per-object
+	// mid-pass after burning source I/O and tripping its circuit.
+	if err := startupGate(ctx, logger, nil, targets); err != nil {
+		return err
+	}
 	// Same hung-target isolation as serve: a black-holing destination target is stall-dropped
 	// (not left to wedge every repair for the full perObjectTimeout) and circuit-tripped after
 	// repeated failures so the pass stops hammering it.
@@ -422,13 +435,15 @@ func runBackfill(args []string) error {
 	breaker := cfg.NewCircuitBreaker()
 	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
-	fmt.Printf("backfill: backed=%d skipped=%d failed=%d\n", st.Backed, st.Skipped, st.Failed)
+	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed)
 	if err != nil {
 		return err // sweep/DB error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
 	}
 	// A COMPLETED pass with GENUINE failures exits nonzero so an operator scripting
 	// `backfill && next-step` doesn't proceed as if the corpus were fully protected. Skipped
-	// (source deleted before backfill) is benign and does NOT fail the pass.
+	// (source deleted before backfill) and Deferred (stored on every reachable target; only a
+	// circuit-open target's gap remains, which reconcile refills — T017a) are both benign and
+	// do NOT fail the pass.
 	if st.Failed > 0 {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
@@ -497,20 +512,21 @@ func runAudit(args []string) error {
 // with a clear config error — including an env-token collision that would silently
 // build the sink with a sibling target's injected secret — instead of a raw minio/os
 // error or a wrong-store restore.
-func sinkFor(cfgPath, name string) (domain.Sink, error) {
+func sinkFor(cfgPath, name string) (domain.Sink, *config.Config, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, fmt.Errorf("load config: %w", err)
 	}
 	if err := cfg.ValidateTargets(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
+		return nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
 	for _, t := range cfg.Targets {
 		if t.Name == name {
-			return config.BuildSink(t)
+			sink, berr := config.BuildSink(t)
+			return sink, cfg, berr
 		}
 	}
-	return nil, fmt.Errorf("target %q not found in config", name)
+	return nil, nil, fmt.Errorf("target %q not found in config", name)
 }
 
 // manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),

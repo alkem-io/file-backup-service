@@ -34,6 +34,35 @@ func TestBackfillPerObjectTimeout(t *testing.T) {
 	}
 }
 
+// TestBackfillDefersCircuitOpenTarget: an object whose ONLY gap is a circuit-open
+// (persistently-down) target is a DEFER (stored on every reachable target, ledger-recorded,
+// reconcile refills the gap) — NOT a Failed. Folding it into Failed made a single-target
+// outage exit the whole backfill nonzero for a fully-recoverable state. (V6)
+func TestBackfillDefersCircuitOpenTarget(t *testing.T) {
+	data := []byte("object whose only target is down")
+	h, err := sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	breaker := NewCircuitBreaker(1, time.Minute)
+	breaker.Record("t", false) // trip the sole target's circuit (threshold 1)
+	sink := newMemSink("t")
+	p := NewPipeline(fakeSource{data}, newFakeLedger(),
+		[]Target{{Sink: sink, Codec: CodecNone}}).WithIsolation(0, breaker)
+	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: h}}}
+
+	st, err := NewBackfiller(corpus, p, time.Minute, 4).Run(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if st.Deferred != 1 || st.Failed != 0 || st.Backed != 0 {
+		t.Fatalf("stats: %+v (want deferred=1, not failed — a circuit-open target is a defer)", st)
+	}
+	if len(sink.store) != 0 {
+		t.Fatal("nothing should be fanned out to a circuit-open target")
+	}
+}
+
 func (c fakeCorpus) EachFile(_ context.Context, fn func(BackupItem) error) error {
 	for _, e := range c.entries {
 		if err := fn(e); err != nil {

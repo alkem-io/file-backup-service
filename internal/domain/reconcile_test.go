@@ -4,9 +4,28 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"slices"
 	"testing"
 	"time"
 )
+
+// TestReconcileOrdersHealthySourcesFirst: repair must try circuit-HEALTHY holders as the
+// source before circuit-down ones, so a black-holing holder (whose decode read has no
+// stall-drop) isn't picked first and made to burn the whole perObjectTimeout, failing a
+// repairable object instead of rotating to a healthy holder. Each bucket is sorted so the
+// order is deterministic, not Go map-random. (V10)
+func TestReconcileOrdersHealthySourcesFirst(t *testing.T) {
+	breaker := NewCircuitBreaker(1, time.Minute)
+	breaker.Record("down1", false) // trip two holders' circuits
+	breaker.Record("down2", false)
+	rc := NewReconciler(newFakeLedger(), nil, time.Minute, "", 0, breaker, 1)
+	stored := map[string]bool{"healthyB": true, "down1": true, "healthyA": true, "down2": true}
+	got := rc.orderSources(stored)
+	want := []string{"healthyA", "healthyB", "down1", "down2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("orderSources = %v, want %v (healthy-first, then down; each sorted)", got, want)
+	}
+}
 
 // TestReconcileRepairsGap: an object stored on A but missing on B is repaired by
 // fetching from A and storing to B, and the source A is NOT re-stored (dedup).

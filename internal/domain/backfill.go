@@ -94,9 +94,10 @@ type CorpusEnumerator interface {
 
 // BackfillStats summarizes a backfill pass.
 type BackfillStats struct {
-	Backed  int // fully stored on every target after this pass (incl. already-present)
-	Skipped int // source object gone (deleted before backfill) — benign terminal, not a failure
-	Failed  int // a target genuinely failed, or the pass was cancelled
+	Backed   int // fully stored on every target after this pass (incl. already-present)
+	Skipped  int // source object gone (deleted before backfill) — benign terminal, not a failure
+	Deferred int // stored on every REACHABLE target; only gap is a circuit-open target (T017a) — not a failure
+	Failed   int // a target genuinely failed, or the pass was cancelled
 }
 
 // Backfiller backs up the pre-existing corpus (US2/T022): it enumerates every file and
@@ -138,12 +139,20 @@ func (b *Backfiller) backupOne(ctx context.Context, e BackupItem, st *BackfillSt
 	defer recoverFailed(mu, &st.Failed)
 	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
 	defer cancel()
-	done, _, err := b.p.BackupOne(ctx, e)
+	done, deferred, err := b.p.BackupOne(ctx, e)
 	mu.Lock()
 	defer mu.Unlock()
 	switch {
 	case err == nil && done:
 		st.Backed++
+	case err == nil && deferred:
+		// Stored on every REACHABLE target + ledger-recorded; the only gap is a circuit-open
+		// (persistently-down) target — NOT a failure of THIS object. Count it deferred, mirroring
+		// serve's Defer (T017a) and reconcile: a single-target outage during a pass must not fail
+		// the whole backfill for objects that are safe on every reachable target (reconcile refills
+		// the gap when the target returns). Dropping this distinction (folding it into Failed) made
+		// backfill exit nonzero for a fully-recoverable, non-problem state.
+		st.Deferred++
 	case errors.Is(err, ErrSourceGone):
 		// Source deleted before backfill ran (file-service 404/410) — a benign terminal
 		// condition, NOT a failure: the object needn't be backed up. Mirror the serve
