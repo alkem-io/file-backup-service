@@ -3,9 +3,11 @@ package domain
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -112,5 +114,49 @@ func TestRestoreCorruptFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "deadbeef")); err == nil {
 		t.Fatal("corrupt object must not be written to dest")
+	}
+}
+
+// ioErrSink serves prefix bytes then a transient I/O error — modelling an S3 reset/timeout
+// mid-stream. prefix must begin with the zstd magic so decodeStream takes the zstd path.
+type ioErrSink struct {
+	stubSink
+	prefix []byte
+	err    error
+}
+
+func (s *ioErrSink) Fetch(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(io.MultiReader(bytes.NewReader(s.prefix), errReader{s.err})), nil
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// TestRestorePropagatesSourceIOError: a genuinely zstd-stored object whose SOURCE read fails
+// mid-stream (S3 reset/timeout) must surface a RETRYABLE I/O error, NOT the false 'neither
+// valid zstd nor the plaintext' corruption verdict the raw fallback would otherwise produce.
+func TestRestorePropagatesSourceIOError(t *testing.T) {
+	data := bytes.Repeat([]byte("restore me zstd "), 200)
+	h, _ := sum(bytes.NewReader(data))
+	compressed, err := io.ReadAll(ZstdReader(bytes.NewReader(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compressed) < 16 {
+		t.Skip("compressed object too small to fail mid-stream")
+	}
+	boom := errors.New("connection reset by peer")
+	// Serve the first half (incl. the zstd magic) then fail — a real source I/O fault.
+	sink := &ioErrSink{stubSink: stubSink{name: "s"}, prefix: compressed[:len(compressed)/2], err: boom}
+	rerr := RestoreObject(context.Background(), sink, h, t.TempDir())
+	if rerr == nil {
+		t.Fatal("expected the mid-stream source I/O error to surface")
+	}
+	if !errors.Is(rerr, boom) {
+		t.Fatalf("must propagate the retryable source I/O error: %v", rerr)
+	}
+	if strings.Contains(rerr.Error(), "neither valid zstd nor the plaintext") {
+		t.Fatalf("a transient I/O error must NOT be reported as permanent corruption: %v", rerr)
 	}
 }

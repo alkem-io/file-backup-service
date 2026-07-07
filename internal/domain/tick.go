@@ -44,13 +44,19 @@ func runOneTick(ctx context.Context, timeout time.Duration, fn func(context.Cont
 	}
 	// A panic unwinds fn BEFORE it can return an error, so recover routes it to the SAME
 	// onError sink (isPanic=true) — else a pass that panics every tick would take down the
-	// process (or, for a sampler, freeze its gauge stale-green with zero signal).
+	// process (or, for a sampler, freeze its gauge stale-green with zero signal). A panic is
+	// ALWAYS reported (even during shutdown — a panic on the way out is still a bug).
 	defer func() {
 		if r := recover(); r != nil && onError != nil {
 			onError(r, true)
 		}
 	}()
-	if err := fn(fctx); err != nil && onError != nil {
+	// A pass whose error is just the parent ctx being cancelled (graceful shutdown) is NOT a
+	// failure — the DB read was aborted by the drain, not by a real fault. Suppress it HERE so
+	// every caller gets uniform shutdown behavior and no caller (e.g. the samplers) fires a
+	// spurious failure signal on every drain. A per-tick TIMEOUT (fctx cancelled, parent ctx
+	// still live) is a real failure and still reports.
+	if err := fn(fctx); err != nil && onError != nil && ctx.Err() == nil {
 		onError(err, false)
 	}
 }

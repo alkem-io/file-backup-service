@@ -85,17 +85,30 @@ func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, res
 	// ctxReader so a large decode from a filesystem source (os.File.Read ignores ctx)
 	// honors SIGINT/SIGTERM mid-read, not only at the CommitWrite gate afterward.
 	br := bufio.NewReaderSize(ctxReader{ctx, rc}, 8<<10)
-	magic, _ := br.Peek(4) // short object → short magic, simply won't match
+	// A real I/O error at the magic peek (S3 reset / timeout after a partial read) must NOT be
+	// silently treated as "short object → not zstd" — that would misclassify a zstd object as
+	// raw and re-hash its compressed bytes into a false corruption verdict. io.EOF here is the
+	// legitimate short-object case (a <4-byte plaintext); anything else is a source read fault.
+	magic, perr := br.Peek(4)
+	if perr != nil && !errors.Is(perr, io.EOF) {
+		_ = rc.Close()
+		return fmt.Errorf("peek magic: %w", perr)
+	}
 	if bytes.Equal(magic, zstdMagic) {
 		derr := decodeZstd(br, hash, dst)
 		_ = rc.Close()
 		if derr == nil {
 			return nil
 		}
-		// decodeZstd returns only nil or errTryRaw, so any non-nil error means fall back
-		// to the (bounded, bomb-safe) raw read: the plaintext started with the zstd magic
-		// but did not decode+hash as zstd — an incompressible upload stored raw, or a
-		// raw object whose bytes happen to be an oversized zstd frame. Re-read as raw.
+		// Only errTryRaw means "fall back": the bytes began with the zstd magic but did not
+		// decode+hash as zstd (an incompressible upload stored raw, or a raw object whose bytes
+		// happen to be an oversized zstd frame) — re-read as the (bounded, bomb-safe) raw plaintext.
+		// A NON-errTryRaw error is a real SOURCE I/O failure (S3 reset/timeout); propagate it as
+		// RETRYABLE rather than re-hashing the compressed bytes as raw, which would falsely report
+		// a perfectly good object as permanent corruption.
+		if !errors.Is(derr, errTryRaw) {
+			return derr
+		}
 		if reset != nil {
 			if e := reset(); e != nil {
 				return e
@@ -181,12 +194,24 @@ func decodeRaw(r io.Reader, hash string, dst io.Writer) error {
 // is what keeps a raw-stored object that is ITSELF a valid zstd bomb restorable from
 // its small raw bytes. Only when BOTH interpretations fail is it genuinely corrupt.
 func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
+	// Track the SOURCE reader's own errors separately from zstd-decode / hash failures: a
+	// failed source read (S3 connection reset, ResponseHeaderTimeout, a 5xx, a temp-file write
+	// error) is a RETRYABLE I/O error, NOT "these bytes aren't zstd." Falling back to raw on it
+	// would re-hash the COMPRESSED bytes and falsely report a perfectly good object as permanent
+	// corruption — failing a DR restore and raising a false audit-corruption alert. Only a CLEAN
+	// source read that then fails to decode+hash as zstd is a genuine "try raw" signal. (A clean
+	// EOF is not an error — a raw object that merely begins with the zstd magic reads to EOF and
+	// its decode/hash mismatch, in verr, correctly drives the raw fallback.)
+	tr := &errTrackingReader{r: r}
 	// Bomb protection is the DECODED-output cap (copyVerify below); do NOT also cap the
 	// COMPRESSED input — an incompressible near-cap object stores as raw zstd blocks
 	// slightly LARGER than its plaintext, and an input cap would truncate its frame and
 	// make it (falsely) unrestorable.
-	zr, err := newZstdDecoder(r)
+	zr, err := newZstdDecoder(tr)
 	if err != nil {
+		if tr.err != nil && !errors.Is(tr.err, io.EOF) {
+			return fmt.Errorf("zstd source read: %w", tr.err) // the header read itself failed — I/O, not "not zstd"
+		}
 		return errTryRaw
 	}
 	defer zr.Close()
@@ -197,8 +222,28 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	// .zst uploaded as-is) restores from its small raw bytes, while a genuine tampered
 	// zstd bomb fails both paths (the raw bytes don't hash). Never dropping the fallback
 	// costs at most one extra bounded read on hostile input, in exchange for no data loss.
-	if overCap, verr := copyVerify(dst, zr, hash); overCap || verr != nil {
+	overCap, verr := copyVerify(dst, zr, hash)
+	if tr.err != nil && !errors.Is(tr.err, io.EOF) {
+		return fmt.Errorf("zstd source read: %w", tr.err) // retryable source I/O — do NOT fall back to raw
+	}
+	if overCap || verr != nil {
 		return errTryRaw
 	}
 	return nil
+}
+
+// errTrackingReader records the last non-nil error the underlying reader itself returned, so a
+// caller can tell a SOURCE I/O error (retryable) apart from a downstream decode/hash failure —
+// the decoder's own format errors surface through the Copy return, not here.
+type errTrackingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errTrackingReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
 }

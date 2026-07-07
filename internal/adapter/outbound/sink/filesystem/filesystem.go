@@ -36,7 +36,13 @@ func (s *Sink) pathFor(hash string) string { return s.osPath(fsutil.ShardKey(has
 // Preflight verifies the root exists and is writable, so a missing mount / wrong
 // path / read-only volume fails loudly at startup instead of dead-lettering every
 // object.
-func (s *Sink) Preflight(_ context.Context) error {
+func (s *Sink) Preflight(ctx context.Context) error {
+	// Honor ctx like the s3/fileservice preflights (an os.MkdirAll on a wedged mount can't be
+	// interrupted mid-syscall, but the startup runner abandons a hung Preflight on the deadline;
+	// checking ctx first avoids even starting one after a cancel).
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(s.root, 0o755); err != nil { //nolint:gosec // backup store readable by the restore uid
 		return fmt.Errorf("filesystem preflight %q: mkdir %s: %w", s.name, s.root, err)
 	}

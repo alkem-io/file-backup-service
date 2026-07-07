@@ -49,6 +49,25 @@ func TestRunOneTickRoutesErrorAndPanicToOnError(t *testing.T) {
 	}
 }
 
+func TestRunOneTickSuppressesErrorOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate a graceful drain: the parent ctx is cancelled
+	// A returned error while the parent ctx is cancelled (shutdown) must NOT fire onError —
+	// the read was aborted by the drain, not a real fault (else the samplers would emit a
+	// spurious SampleError on every deploy).
+	called := false
+	runOneTick(ctx, 0, func(context.Context) error { return errors.New("read aborted by drain") }, func(any, bool) { called = true })
+	if called {
+		t.Fatal("a shutdown-cancelled pass must not fire onError")
+	}
+	// But a PANIC during shutdown is still a bug → must be reported.
+	panicked := false
+	runOneTick(ctx, 0, func(context.Context) error { panic("bug on the way out") }, func(_ any, isPanic bool) { panicked = isPanic })
+	if !panicked {
+		t.Fatal("a panic during shutdown must still be reported (it's a bug, not a drain)")
+	}
+}
+
 func TestRunOneTickTimeoutBoundsFn(t *testing.T) {
 	// timeout>0 gives fn a ctx with a deadline; timeout<=0 runs on the parent ctx (no deadline).
 	runOneTick(context.Background(), 50*time.Millisecond, func(fctx context.Context) error {

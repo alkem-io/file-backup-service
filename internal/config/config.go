@@ -403,15 +403,25 @@ func (c *Config) validateLimits() error {
 			return fmt.Errorf("%s (%d) exceeds the max %d", f.name, f.sec, maxSec)
 		}
 	}
-	// staleTTL must exceed the per-object timeout PLUS the detached-bookkeeping window: an
-	// object can hit the full per-object timeout and then spend up to BookkeepingTimeout
-	// writing its MarkDone/Fail on a detached ctx while still status='in_progress'. If the
-	// reaper's TTL falls inside that window it requeues the completed object (deliveries++),
-	// creeping it toward the crash-loop dead-letter for a non-problem.
-	minStaleTTL := c.PerObjectTimeoutSec + int(domain.BookkeepingTimeout.Seconds())
+	// staleTTL must exceed the per-object timeout PLUS the detached-bookkeeping window. After
+	// the per-object timeout, an object does TWO sequential detached writes while still
+	// status='in_progress', each up to BookkeepingTimeout: first the pipeline's RecordBackup
+	// (ledger), then the consumer's MarkDone/Fail/Defer (outbox). So the true worst-case
+	// settling time is perObjectTimeout + 2*BookkeepingTimeout; if the reaper's TTL falls
+	// inside it, it requeues the completed object (deliveries++), creeping it toward the
+	// crash-loop dead-letter for a non-problem.
+	minStaleTTL := c.PerObjectTimeoutSec + 2*int(domain.BookkeepingTimeout.Seconds())
 	if c.StaleTTLSec <= minStaleTTL {
-		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec + bookkeeping (%d), else the reaper can requeue a settling object",
+		return fmt.Errorf("staleTTLSec (%d) must exceed perObjectTimeoutSec + 2*bookkeeping (%d), else the reaper can requeue a settling object",
 			c.StaleTTLSec, minStaleTTL)
+	}
+	// circuitThreshold must be < maxAttempts, or an object needing a persistently-down target
+	// dead-letters (Fail at maxAttempts) BEFORE the per-target circuit accumulates threshold
+	// failures to trip — so it FAILS instead of DEFERRING (T017a), and in a single/all-target
+	// outage it stores nowhere and reconcile can't repair it. The circuit must trip first.
+	if c.CircuitThreshold >= c.MaxAttempts {
+		return fmt.Errorf("circuitThreshold (%d) must be < maxAttempts (%d), else an object dead-letters before its target's circuit trips (defeating T017a defer-not-dead-letter)",
+			c.CircuitThreshold, c.MaxAttempts)
 	}
 	// The stall-drop MUST fire before the per-object timeout, or a hung target stalls the
 	// whole fan-out barrier until the shared timeout aborts every target in lockstep (the
