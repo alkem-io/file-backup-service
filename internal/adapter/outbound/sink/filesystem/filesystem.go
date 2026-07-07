@@ -95,7 +95,7 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // cancelled write is removed rather than committed). Returns the bytes written.
 func writeAtomic(ctx context.Context, dir, base string, r io.Reader) (int64, error) {
 	var n int64
-	err := fsutil.CommitWrite(ctx, dir, base, 0o644, func(f *os.File) error {
+	err := fsutil.CommitWrite(ctx, dir, base, func(f *os.File) error {
 		var cerr error
 		n, cerr = io.Copy(f, r)
 		return cerr

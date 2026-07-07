@@ -35,7 +35,7 @@ func NewFileRepo(p *Pool) *FileRepo { return &FileRepo{p: p} }
 // temporaryLocation IS NOT TRUE (not "= FALSE") so a NULL never silently drops a file.
 func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) error) error {
 	// uuid.Nil sorts first; no real file.id is nil (gen_random_uuid).
-	return keysetLoop(uuid.Nil,
+	return domain.KeysetLoop(uuid.Nil, dbPageSize,
 		func(after uuid.UUID, limit int) ([]domain.OutboxEntry, error) { return r.filesPage(ctx, after, limit) },
 		func(e domain.OutboxEntry) uuid.UUID { return e.FileID },
 		fn)

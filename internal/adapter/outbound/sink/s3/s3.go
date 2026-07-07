@@ -113,6 +113,17 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 // completes a multipart with an empty part, which Scaleway (and many S3 backends)
 // reject (EntityTooSmall); detect empty with a single-byte read (no per-object bufio
 // buffer) and use one empty PutObject, re-prepending the read byte via MultiReader.
+//
+// WORM / incomplete-multipart caveat (operational, cross-repo): size=-1 makes minio-go use
+// a MULTIPART upload even for sub-part objects. We CANNOT pass the real size to force a
+// single-PUT: a length-gated PutObject commits after reading exactly N bytes, BEFORE the
+// caller's VerifyReader reaches EOF and checks the hash — the very early-commit this size=-1
+// prevents. The tradeoff: on a mid-stream abort (per-object timeout, VerifyReader hash
+// mismatch, or shutdown ctx-cancel), minio-go's deferred AbortMultipartUpload runs, but on a
+// PutObject-only WORM credential it 403s and the error is swallowed, leaving an orphaned
+// incomplete multipart that this worker can never reclaim. The immutable target bucket MUST
+// therefore carry an `AbortIncompleteMultipartUpload` lifecycle rule (provisioned in
+// infrastructure-operations) to reap them — see specs/008 data-model (Backup Target).
 func (s *Sink) putStream(ctx context.Context, key string, r io.Reader) (int64, error) {
 	var one [1]byte
 	n, err := io.ReadFull(r, one[:]) // 1-byte buf: (1,nil) if a byte, (0,io.EOF) if empty

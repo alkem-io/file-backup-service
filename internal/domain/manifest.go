@@ -78,20 +78,10 @@ const storedPageSize = 1000
 // slow fn — a manifest's pipe write blocked on a slow upload — doesn't pin a pool
 // connection for the whole sweep (the connection is held only for each fast page query).
 func eachStoredObject(ctx context.Context, led Ledger, target string, fn func(ObjectMeta) error) error {
-	after := ""
-	for {
-		page, err := led.StoredObjectsPage(ctx, target, after, storedPageSize)
-		if err != nil {
-			return err
-		}
-		for i := range page {
-			if err := fn(page[i]); err != nil {
-				return err
-			}
-		}
-		if len(page) < storedPageSize {
-			return nil // a short page is the last
-		}
-		after = page[len(page)-1].ExternalID
-	}
+	return KeysetLoop("", storedPageSize,
+		func(after string, limit int) ([]ObjectMeta, error) {
+			return led.StoredObjectsPage(ctx, target, after, limit)
+		},
+		func(m ObjectMeta) string { return m.ExternalID },
+		fn)
 }

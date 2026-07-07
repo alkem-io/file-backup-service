@@ -60,7 +60,7 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 	}
 	// 0644 so file-service (uid 65532) can read restored objects. The temp/fsync/
 	// ctx-gate/commit ceremony is the same durable spine the sink write uses.
-	return fsutil.CommitWrite(ctx, destDir, hash, 0o644, func(tmp *os.File) error {
+	return fsutil.CommitWrite(ctx, destDir, hash, func(tmp *os.File) error {
 		// reset rewinds the temp if the rare magic-collision fallback re-decodes it.
 		return decodeStream(ctx, src, hash, tmp, func() error { return rewindTruncate(tmp) })
 	})

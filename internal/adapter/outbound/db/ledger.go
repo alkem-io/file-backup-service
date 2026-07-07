@@ -111,7 +111,7 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 // pass (blocking VACUUM on the ledger). An object stored on all of allTargets is excluded;
 // stale statuses for removed targets are ignored (the count/agg filter to allTargets).
 func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
-	return keysetLoop("",
+	return domain.KeysetLoop("", dbPageSize,
 		func(after string, limit int) ([]targetGap, error) {
 			return r.targetGapsPage(ctx, allTargets, after, limit)
 		},

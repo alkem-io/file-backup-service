@@ -1,5 +1,17 @@
 components:
   schemas:
+    http.HealthResponse:
+      properties:
+        details:
+          additionalProperties:
+            type: string
+          type: object
+        status:
+          type: string
+      required:
+        - status
+        - details
+      type: object
     http.LiveResponse:
       properties:
         status:
@@ -24,6 +36,16 @@ info:
   version: 0.1.0
 openapi: 3.1.1
 paths:
+  /health:
+    get:
+      operationId: Health.ServeHTTP
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/http.HealthResponse'
+          description: OK
   /live:
     get:
       operationId: http.ServeLive
@@ -37,3 +59,13 @@ paths:
       summary: |-
         ServeLive is the K8s liveness handler: returns 200 unconditionally so the
         probe reflects process-alive only, independent of DB/target availability.
+  /metrics:
+    get:
+      operationId: Metrics.ServeHTTP
+      responses:
+        default:
+          content:
+            application/json:
+              schema:
+                type: object
+          description: Default response (no response found)

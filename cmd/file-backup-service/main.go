@@ -77,7 +77,7 @@ func onShutdownOK(err error) error {
 
 func configFlag(name string, args []string) string {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	cfgPath := fs.String("config", "config.yaml", "path to the config file")
+	cfgPath := registerConfigFlag(fs)
 	_ = fs.Parse(args)
 	return *cfgPath
 }
@@ -118,14 +118,14 @@ func serve(cfgPath string) error {
 	// config.Load guarantees both DSNs and >=1 target — no silent no-op mode.
 	// Size for: 1 permanent LISTEN + up to Concurrency in-flight bookkeeping +
 	// health + margin, so a NOTIFY burst can't starve MarkDone/Fail.
-	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(8))
+	alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(8), "alkemio")
 	if err != nil {
-		return fmt.Errorf("alkemio pool: %w", err)
+		return err
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
+	ledgerPool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), "ledger")
 	if err != nil {
-		return fmt.Errorf("ledger pool: %w", err)
+		return err
 	}
 	defer ledgerPool.Close()
 
@@ -202,7 +202,7 @@ func signalContext() (context.Context, context.CancelFunc) {
 // under a signal-cancellable context.
 func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(ctx context.Context, sink domain.Sink, hash string) error) error {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	cfgPath := fs.String("config", "config.yaml", "config file")
+	cfgPath := registerConfigFlag(fs)
 	hash := fs.String("hash", "", "content hash (externalID)")
 	from := fs.String("from", "", "source target name")
 	if register != nil {
@@ -245,6 +245,24 @@ func runVerify(args []string) error {
 		})
 }
 
+// openPool opens a pgx pool, wrapping the error with a "<label> pool" prefix — the one
+// owner of that error shape, shared by serve/backfill/ledgerJob (each of which still owns
+// its own `defer pool.Close()` at the call site). label is the DB's role in the message.
+func openPool(ctx context.Context, dsn string, size int32, label string) (*db.Pool, error) {
+	p, err := db.NewPool(ctx, dsn, size)
+	if err != nil {
+		return nil, fmt.Errorf("%s pool: %w", label, err)
+	}
+	return p, nil
+}
+
+// registerConfigFlag registers the shared --config flag on fs with one canonical default +
+// help, so the subcommands don't drift on the path default or the description. Used both by
+// the parse-and-return configFlag wrapper and by the multi-flag subcommands (which own an fs).
+func registerConfigFlag(fs *flag.FlagSet) *string {
+	return fs.String("config", "config.yaml", "path to the config file")
+}
+
 // ledgerJob opens config for a ledger-DB-only subcommand (reconcile/audit): it
 // validates the targets (not the full serve config — these run in the DR state without
 // file-service / the outbox DB), opens + probes the ledger pool, and builds the sinks.
@@ -257,9 +275,9 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 	if err := cfg.ValidateDR(); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
-	pool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
+	pool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), "ledger")
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("ledger pool: %w", err)
+		return nil, nil, nil, nil, err
 	}
 	ledger := db.NewLedgerRepo(pool)
 	if err := ledger.Probe(ctx); err != nil {
@@ -279,7 +297,7 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 // has it and re-fan-out to the missing ones. Needs only the ledger DB + the targets.
 func runReconcile(args []string) error {
 	fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.yaml", "config file")
+	cfgPath := registerConfigFlag(fs)
 	ratePerSec := fs.Int("rate", 0, "max repairs per second (0 = unlimited)")
 	_ = fs.Parse(args)
 	ctx, stop := signalContext()
@@ -326,7 +344,7 @@ func runReconcile(args []string) error {
 // it fetches from file-service AND reads the alkemio `file` table AND writes the ledger.
 func runBackfill(args []string) error {
 	fs := flag.NewFlagSet("backfill", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.yaml", "config file")
+	cfgPath := registerConfigFlag(fs)
 	ratePerSec := fs.Int("rate", 0, "max backups per second (0 = unlimited)")
 	_ = fs.Parse(args)
 	cfg, err := config.Load(*cfgPath)
@@ -339,14 +357,14 @@ func runBackfill(args []string) error {
 	ctx, stop := signalContext()
 	defer stop()
 
-	alkemioPool, err := db.NewPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(4))
+	alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(4), "alkemio")
 	if err != nil {
-		return fmt.Errorf("alkemio pool: %w", err)
+		return err
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := db.NewPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4))
+	ledgerPool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), "ledger")
 	if err != nil {
-		return fmt.Errorf("ledger pool: %w", err)
+		return err
 	}
 	defer ledgerPool.Close()
 
@@ -428,7 +446,7 @@ func randHex() string {
 // 'missing' count means silent loss on a target — a nonzero exit so cron/CI can alert.
 func runAudit(args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
-	cfgPath := fs.String("config", "config.yaml", "config file")
+	cfgPath := registerConfigFlag(fs)
 	sample := fs.Int("sample", 0, "objects to check per target (0 = all)")
 	_ = fs.Parse(args)
 	ctx, stop := signalContext()

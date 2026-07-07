@@ -46,13 +46,15 @@ func NewRouter(deps Deps) *chi.Mux {
 
 	// Liveness (K8s livenessProbe): process-alive only, no dependency checks.
 	r.Get("/live", ServeLive)
-	// Readiness (K8s readinessProbe): probes the outbox + ledger DBs.
+	// Readiness (K8s readinessProbe): probes the outbox + ledger DBs. Registered as a GET
+	// func value (not r.Method with the bare handler) so the apispec generator traces it into
+	// openapi.yaml alongside /live — else the readiness contract k8s depends on is undocumented.
 	if deps.Health != nil {
-		r.Method(http.MethodGet, "/health", deps.Health)
+		r.Get("/health", deps.Health.ServeHTTP)
 	}
-	// Metrics (Prometheus).
+	// Metrics (Prometheus) — GET func value, same reason (keeps it in the generated spec).
 	if deps.Metrics != nil {
-		r.Handle("/metrics", deps.Metrics)
+		r.Get("/metrics", deps.Metrics.ServeHTTP)
 	}
 	return r
 }

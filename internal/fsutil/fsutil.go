@@ -55,7 +55,7 @@ func CreateTemp(dir, prefix string) (*os.File, string, error) {
 // and restore. It: MkdirAll(dir,0755) -> temp -> fill(temp) -> fsync -> close ->
 // ctx-cancel gate -> chmod(mode)+rename+dir-fsync, removing the temp on any failure
 // or cancellation. fill writes the object body into the temp (an io.Copy, a decode).
-func CommitWrite(ctx context.Context, dir, base string, mode os.FileMode, fill func(*os.File) error) error {
+func CommitWrite(ctx context.Context, dir, base string, fill func(*os.File) error) error {
 	// 0755 (not 0750): blobs are chmod'd 0644 so a different-uid restore/reconcile/
 	// file-service can read them, which needs world-execute to traverse the shard dirs.
 	if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // content-addressed store, readable by the restore uid
@@ -85,15 +85,17 @@ func CommitWrite(ctx context.Context, dir, base string, mode os.FileMode, fill f
 		return err // cancelled mid-write — don't commit a late/orphaned object
 	}
 	committed = true // commitFile owns the temp from here (removes it on its own error)
-	return commitFile(tmp, filepath.Join(dir, base), mode)
+	return commitFile(tmp, filepath.Join(dir, base))
 }
 
-// commitFile durably publishes an already-written+closed temp to dest: chmod mode,
+// commitFile durably publishes an already-written+closed temp to dest: chmod 0644,
 // atomic rename, and a parent-dir fsync (atomic != durable). The temp is removed on
 // any error so a failure never leaks it. Callers gate on ctx BEFORE calling this so
-// a cancelled write is never committed.
-func commitFile(tmpName, dest string, mode os.FileMode) error {
-	if err := os.Chmod(tmpName, mode); err != nil {
+// a cancelled write is never committed. 0644 (so a different-uid restore/reconcile/
+// file-service can read the blob) is fixed by design at both call sites — a constant, not
+// a threaded parameter.
+func commitFile(tmpName, dest string) error {
+	if err := os.Chmod(tmpName, 0o644); err != nil { //nolint:gosec // content-addressed blob, must be readable by the restore uid
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("chmod: %w", err)
 	}
