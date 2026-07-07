@@ -9,7 +9,29 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestDecodeStreamAbandonsWedgedSource: a filesystem source whose Fetch blocks uninterruptibly
+// (a wedged mount) must NOT hang decodeStream past its ctx deadline — the abandonment wrapper
+// (callWithCtx) returns ctx.Err() and abandons the stuck goroutine, so reconcile/restore/verify
+// stay bounded instead of needing SIGKILL. (F1)
+func TestDecodeStreamAbandonsWedgedSource(t *testing.T) {
+	h := newHangingSink("wedged")
+	t.Cleanup(func() { close(h.release) })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- decodeStream(ctx, h, strings.Repeat("a", 64), io.Discard, nil) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("decodeStream on a wedged source must return a ctx error, not succeed")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("decodeStream HUNG on a wedged source — abandonment failed (F1 regression)")
+	}
+}
 
 func TestRestoreRoundTripRaw(t *testing.T) {
 	data := []byte("restore me raw")

@@ -212,6 +212,27 @@ func (m *memSink) PutManifest(_ context.Context, name string, r io.Reader) error
 	return nil
 }
 
+// hangingSink blocks in Fetch/Exists IGNORING ctx — models a filesystem sink on a wedged
+// mount (os.Open/os.Stat stuck in uninterruptible kernel sleep). It proves the read/probe
+// abandonment wrappers (callWithCtx in decodeStream, existsWithCtx in audit) actually return
+// at the ctx deadline rather than hanging. release is closed at test end to free the goroutine.
+type hangingSink struct {
+	stubSink
+	release chan struct{}
+}
+
+func newHangingSink(name string) *hangingSink {
+	return &hangingSink{stubSink: stubSink{name: name}, release: make(chan struct{})}
+}
+func (h *hangingSink) Fetch(_ context.Context, _ string) (io.ReadCloser, error) {
+	<-h.release // block ignoring ctx, like a wedged os.Open
+	return nil, errors.New("released")
+}
+func (h *hangingSink) Exists(_ context.Context, _ string) (bool, error) {
+	<-h.release // block ignoring ctx, like a wedged os.Stat
+	return false, errors.New("released")
+}
+
 func TestPipelineBackupOne(t *testing.T) {
 	data := []byte("back me up")
 	h, err := sum(bytes.NewReader(data))

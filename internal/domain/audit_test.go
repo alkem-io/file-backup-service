@@ -4,7 +4,29 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
+
+// TestExistsWithCtxAbandonsWedgedProbe: an Exists probe that blocks uninterruptibly (a
+// filesystem os.Stat on a wedged mount) must return a ctx-error result at the deadline, not
+// hang — so a scheduled audit self-bounds on an unhealthy filesystem target instead of running
+// forever and never alerting. (F2)
+func TestExistsWithCtxAbandonsWedgedProbe(t *testing.T) {
+	h := newHangingSink("wedged")
+	t.Cleanup(func() { close(h.release) })
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan existsResult, 1)
+	go func() { done <- existsWithCtx(ctx, h, "hash") }()
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatal("existsWithCtx on a wedged probe must return a ctx error, not a clean result")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("existsWithCtx HUNG on a wedged probe — abandonment failed (F2 regression)")
+	}
+}
 
 // TestAuditDetectsMissing: an object the ledger records stored on a target that no
 // longer holds it is reported as missing (the silent-loss case).

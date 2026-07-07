@@ -95,7 +95,21 @@ func VerifyObject(ctx context.Context, src Sink, hash string) error {
 // (magic-peek: bounded zstd, else raw) into dst, verifying the plaintext hash, in
 // one pass. dst may be io.Discard (verify) or a temp file (restore). reset, if
 // non-nil, rewinds dst for the rare zstd-magic-but-actually-raw fallback.
+//
+// It runs the whole fetch+decode in an ABANDONABLE goroutine (callWithCtx): a filesystem
+// source's os.Open (Fetch) and os.File.Read ignore ctx and block UNINTERRUPTIBLY on a wedged
+// mount — the exact reason the WRITE path uses storeWithCtx — so a bare call would hang
+// reconcile/restore/verify past their deadline (reconcile's perObjectTimeout, the DR command's
+// sourceOp timeout), needing SIGKILL; under reconcile's worker pool enough concurrent wedged
+// reads would exhaust every slot and stall the whole pass. On ctx cancellation callWithCtx
+// returns ctx.Err() and abandons the goroutine (bounded, one per wedged read) so the caller
+// unblocks — symmetric to storeWithCtx on the write side. On the happy path callWithCtx waits
+// for the goroutine, so all dst writes complete before it returns (no torn read of dst).
 func decodeStream(ctx context.Context, src Sink, hash string, dst io.Writer, reset func() error) error {
+	return callWithCtx(ctx, func() error { return decodeStreamInner(ctx, src, hash, dst, reset) })
+}
+
+func decodeStreamInner(ctx context.Context, src Sink, hash string, dst io.Writer, reset func() error) error {
 	rc, err := src.Fetch(ctx, hash)
 	if err != nil {
 		return err

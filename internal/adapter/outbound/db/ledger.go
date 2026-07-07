@@ -135,8 +135,11 @@ func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, af
 
 // CoverageGaps counts objects NOT stored on every configured target — the coverage backstop
 // gauge (a dead-lettered object leaves the pending backlog but is still under-replicated).
-// Computed as total objects MINUS fully-replicated; MUST stay consistent with TargetGaps'
-// stored-on-target predicate (see the coverage integration test). The total is an EXACT
+// Computed as total objects MINUS fully-replicated; its "fully-replicated on a configured
+// target" predicate (state='stored' AND target=ANY(targets), counted against target_count)
+// MUST stay consistent with TargetGapsPage's, or the gauge disagrees with what reconcile
+// actually repairs. That coupling is guarded by TestCoverageAndGapPredicatesAgree
+// (queries package), which fails if the two queries' predicates drift. The total is an EXACT
 // count, not a reltuples estimate — a backstop must never under-report.
 func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int, error) {
 	if len(allTargets) == 0 {

@@ -235,13 +235,31 @@ type existsResult struct {
 	err     error
 }
 
+// existsWithCtx runs Sink.Exists honoring ctx even when the sink CANNOT — a filesystem
+// os.Stat on a wedged mount ignores ctx and blocks uninterruptibly, exactly like the write
+// path's os.Open/fsync. It runs the probe in its own goroutine and, on ctx cancellation
+// (the per-probe auditProbeTimeout), returns a ctx-error result and ABANDONS the goroutine
+// (bounded, one per wedged probe), so the per-probe timeout is actually ENFORCED for os.Stat
+// and the audit can't hang. A panic in the driver becomes an error result. Symmetric to
+// storeWithCtx on the write side.
+func existsWithCtx(ctx context.Context, sink Sink, hash string) existsResult {
+	return RunAbandonable(ctx,
+		func() existsResult {
+			present, err := sink.Exists(ctx, hash)
+			return existsResult{present: present, err: err}
+		},
+		func() existsResult { return existsResult{err: ctx.Err()} },
+		func(r any) existsResult { return existsResult{err: PanicErr("sink Exists "+sink.Name(), r)} })
+}
+
 // existsPage probes Sink.Exists for every object in the page concurrently (bounded by
 // auditConcurrency), so a page of independent HEAD RTTs collapses to ~page/concurrency
-// wall-clock instead of a serial sum. Both the concurrency-acquire AND the result
-// collection observe ctx, so a cancelled audit RETURNS promptly even when in-flight
-// probes are wedged on an uninterruptible os.Stat (a hung filesystem mount) — the stuck
-// goroutines are abandoned (their buffered send never blocks), not waited on, so the
-// audit can't hang. The caller re-checks ctx.Err() and surfaces the cancellation.
+// wall-clock instead of a serial sum. Each probe goes through existsWithCtx, so a
+// per-probe timeout is enforced even against a filesystem os.Stat that ignores ctx (a hung
+// mount) — the probe returns a timeout-error result within auditProbeTimeout rather than
+// blocking forever, so the collect loop always completes and a scheduled audit self-bounds
+// (it does NOT depend on the deadline-less audit ctx being cancelled). The collect loop also
+// still escapes on ctx.Done so a SIGINT returns promptly.
 func existsPage(ctx context.Context, sink Sink, page []string) []existsResult {
 	results := make([]existsResult, len(page))
 	for i := range results {
@@ -264,24 +282,14 @@ dispatch:
 		dispatched++
 		go func(i int) {
 			defer func() { <-sem }()
-			// Recover a sink.Exists panic (a driver nil-deref / malformed response) into an
-			// error result — else the missing `ch` send hangs the collect loop, and an
-			// unrecovered panic in this child goroutine crashes the whole audit process
-			// (every other sink-call site guards the same way).
-			defer func() {
-				if r := recover(); r != nil {
-					ch <- done{i, existsResult{err: PanicErr("sink Exists", r)}}
-				}
-			}()
-			// Bound each probe: audit runs under signalContext (no deadline of its own), so a
-			// black-holing Exists — an S3 StatObject on a wedged endpoint — would otherwise block
-			// the integrity check until an operator kills it. The timeout surfaces it as an Errors
-			// (unverifiable) result instead. (A filesystem os.Stat on a wedged mount ignores ctx,
-			// as everywhere; the abandoned goroutine's send is absorbed by the buffered ch.)
+			// Bound each probe with auditProbeTimeout, enforced via existsWithCtx even when the
+			// sink op ignores ctx (a filesystem os.Stat on a wedged mount): the probe returns a
+			// timeout-error result at the deadline and the stuck os.Stat goroutine is abandoned
+			// (its buffered ch send never blocks). A black-holing S3 StatObject is bounded the
+			// same way. existsWithCtx recovers a driver panic into an error result too.
 			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
-			defer cancel() // deferred (not inline): a recovered sink.Exists panic must not skip it and leak the timer
-			present, err := sink.Exists(pctx, page[i])
-			ch <- done{i, existsResult{present: present, err: err}}
+			defer cancel()
+			ch <- done{i, existsWithCtx(pctx, sink, page[i])}
 		}(i)
 	}
 	for n := 0; n < dispatched; n++ {

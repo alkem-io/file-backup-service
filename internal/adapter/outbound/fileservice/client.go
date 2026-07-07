@@ -19,6 +19,14 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
+// errRemoteStatus marks a fetch that got a NON-success HTTP status (not 200/404/410) — the
+// server ANSWERED, it just returned an error (e.g. a transient 5xx during a coordinated
+// deploy, or a 403). It is distinct from a transport error (dial/TLS/timeout — the server
+// didn't answer). Preflight treats "the server answered" as reachable (a required-check pass)
+// so a transient 5xx doesn't crash-loop the worker, while the fetch path still treats it as a
+// retryable failure. Errors wrap it so callers test with errors.Is.
+var errRemoteStatus = errors.New("file-service returned a non-success status")
+
 // Client streams object content from file-service.
 type Client struct {
 	baseURL string
@@ -75,16 +83,23 @@ func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.Read
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 			return nil, fmt.Errorf("file-service GET %s: %w", reqURL, domain.ErrSourceGone)
 		}
-		return nil, fmt.Errorf("file-service GET %s: status %d", reqURL, resp.StatusCode)
+		// The server ANSWERED with a non-success status (5xx/403/…). Wrap errRemoteStatus so
+		// Preflight can tell it apart from a transport error (reachable vs unreachable); the
+		// fetch path still sees a non-nil, non-gone error and retries as before.
+		return nil, fmt.Errorf("file-service GET %s: status %d: %w", reqURL, resp.StatusCode, errRemoteStatus)
 	}
 	return resp.Body, nil
 }
 
 // Preflight checks file-service is reachable at startup (parity with the DB/sink
-// checks): a GET for a nonexistent object. Any HTTP response — including the expected
-// 404 (ErrSourceGone) for the probe id — means the server answered; only a
-// connection/dial/timeout error (wrong host, down) fails. It can't detect a wrong path
-// PREFIX (that also 404s, indistinguishable from a missing object) — a mass
+// checks): a GET for a nonexistent object. ANY HTTP response — the expected 404
+// (ErrSourceGone) for the probe id, OR a non-success status like a transient 5xx (a
+// coordinated platform deploy where file-service is up but its DB isn't ready yet, or a 403)
+// — means the server ANSWERED and is reachable, so the startup gate passes and the worker
+// starts; runtime fetches retry with backoff until file-service is healthy. Only a
+// connection/dial/timeout error (wrong host, down — the server did NOT answer) fails, so a
+// transient 5xx can't turn this required check into a CrashLoopBackOff. It can't detect a
+// wrong path PREFIX (that also 404s, indistinguishable from a missing object) — a mass
 // filebackup_source_gone_total spike surfaces that at runtime.
 func (c *Client) Preflight(ctx context.Context) error {
 	rc, err := c.FetchContent(ctx, domain.BackupItem{FileID: uuid.Nil})
@@ -94,6 +109,8 @@ func (c *Client) Preflight(ctx context.Context) error {
 		return nil
 	case errors.Is(err, domain.ErrSourceGone):
 		return nil // 404/410: reachable, the probe id simply doesn't exist
+	case errors.Is(err, errRemoteStatus):
+		return nil // 5xx/403/…: the server ANSWERED (reachable); a transient error must not crash-loop startup
 	default:
 		return fmt.Errorf("file-service unreachable: %w", err)
 	}
