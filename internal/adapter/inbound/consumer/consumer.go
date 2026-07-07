@@ -309,11 +309,11 @@ func (c *Consumer) reap(ctx context.Context) {
 			}
 			return nil
 		},
-		func(cause any) {
-			if err, ok := cause.(error); ok {
-				c.d.Logger.Error("reap stale", zap.Error(err))
-			} else {
+		func(cause any, isPanic bool) {
+			if isPanic {
 				c.d.Logger.Error("panic in reaper", zap.Any("panic", cause), zap.Stack("stack"))
+			} else if err, ok := cause.(error); ok {
+				c.d.Logger.Error("reap stale", zap.Error(err))
 			}
 		})
 }

@@ -42,9 +42,9 @@ type Sink interface {
 	Preflight(ctx context.Context) error
 }
 
-// Source fetches an object's bytes. It takes the whole OutboxEntry because different
-// sources key on different fields: the file-service source fetches by FileID (uuid),
-// while reconcile's target-backed source fetches by ExternalID (content hash) — so
+// Source fetches an object's bytes. It takes a BackupItem (the content-identity, no outbox ID)
+// because different sources key on different fields: the file-service source fetches by FileID
+// (uuid), while reconcile's target-backed source fetches by ExternalID (content hash) — so
 // neither has to fake the other's identifier.
 type Source interface {
 	// FetchContent streams the object's bytes for e.

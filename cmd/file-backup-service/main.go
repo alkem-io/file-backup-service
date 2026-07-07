@@ -187,11 +187,11 @@ func serve(cfgPath string) error {
 	// to onError), so a frozen stale-green gauge is itself detectable.
 	go func() {
 		defer bgWG.Done()
-		domain.TickLoop(ctx, 15*time.Second, 5*time.Second, sampler.SampleRPO, func(any) { mx.SampleError() })
+		domain.TickLoop(ctx, 15*time.Second, 5*time.Second, sampler.SampleRPO, func(any, bool) { mx.SampleError() })
 	}()
 	go func() { // coarse cadence: CoverageGaps is a full-ledger scan, not every 15s
 		defer bgWG.Done()
-		domain.TickLoop(ctx, 5*time.Minute, 30*time.Second, sampler.SampleCoverage, func(any) { mx.SampleError() })
+		domain.TickLoop(ctx, 5*time.Minute, 30*time.Second, sampler.SampleCoverage, func(any, bool) { mx.SampleError() })
 	}()
 	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger, mx) }()
 	defer bgWG.Wait()
@@ -516,12 +516,12 @@ func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.T
 			}
 			return nil // a shutdown-cancelled snapshot is not a failure
 		},
-		func(cause any) {
+		func(cause any, isPanic bool) {
 			mx.ManifestError()
-			if err, ok := cause.(error); ok {
-				logger.Warn("manifest snapshot", zap.Error(err))
-			} else {
+			if isPanic {
 				logger.Warn("manifest snapshot panicked", zap.Any("panic", cause))
+			} else if err, ok := cause.(error); ok {
+				logger.Warn("manifest snapshot", zap.Error(err))
 			}
 		})
 }
