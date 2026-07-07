@@ -97,14 +97,19 @@ type Ledger interface {
 	// migration fails loudly at startup and via readiness, not as a green-health
 	// stall where every RecordBackup errors "relation does not exist".
 	Probe(ctx context.Context) error
-	// StoredObjectsPage returns up to limit objects currently stored ON target (what the
-	// target actually holds — so a manifest/audit reads a true per-target inventory),
-	// keyset-paginated by externalID: after is the last externalID of the previous page
-	// ("" to start), results are ordered by externalID, and a short page (< limit) is the
-	// last. Paging — not a held streaming cursor — releases the DB connection between
-	// pages, so a slow consumer (audit's per-object Exists, a manifest's slow upload)
-	// can't pin a pool connection for the whole operation.
+	// StoredObjectsPage returns up to limit objects currently stored ON target WITH their
+	// breadcrumbs (size/createdBy/sourceCreatedDate) — the manifest export's per-target
+	// inventory — keyset-paginated by externalID: after is the last externalID of the previous
+	// page ("" to start), results are ordered by externalID, and a short page (< limit) is the
+	// last. Paging — not a held streaming cursor — releases the DB connection between pages, so
+	// a slow consumer (a manifest's slow upload) can't pin a pool connection for the whole
+	// operation. (Audit uses the lighter index-only StoredExternalIDsPage.)
 	StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]ObjectMeta, error)
+	// StoredExternalIDsPage returns up to limit externalIDs stored ON target, keyset-paged by
+	// externalID (same paging contract as StoredObjectsPage). It is the audit sweep's source —
+	// audit re-probes each object on the sink and needs ONLY the id, so this is a covering
+	// index-only scan with no per-row heap fetch for the object breadcrumbs audit discards.
+	StoredExternalIDsPage(ctx context.Context, target, after string, limit int) ([]string, error)
 	// TargetGaps streams objects that are NOT stored on every configured target,
 	// with the set of target names that DO hold each — the reconcile work-list.
 	TargetGaps(ctx context.Context, allTargets []string, fn func(externalID string, stored map[string]bool) error) error

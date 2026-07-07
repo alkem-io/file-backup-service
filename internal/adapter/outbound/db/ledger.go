@@ -57,8 +57,10 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 	return nil
 }
 
-// StoredObjectsPage returns up to limit objects stored ON target (FR-015 manifest / FR-014
-// audit), keyset-paginated by externalID (the connection is released when the page returns).
+// StoredObjectsPage returns up to limit objects stored ON target with their breadcrumbs
+// (size/createdBy/sourceCreatedDate) for the FR-015 manifest export, keyset-paginated by
+// externalID (the connection is released when the page returns). Audit uses the lighter
+// index-only StoredExternalIDsPage, which needs only the id.
 func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]domain.ObjectMeta, error) {
 	rows, err := r.q.StoredObjectsPage(ctx, queries.StoredObjectsPageParams{
 		Target: target, After: after, PageLimit: int32(limit), //nolint:gosec // limit is domain.KeysetPageSize (1000)
@@ -76,6 +78,19 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 		}
 	}
 	return out, nil
+}
+
+// StoredExternalIDsPage returns up to limit externalIDs stored ON target (the audit sweep),
+// keyset-paged by externalID — an index-only scan (no join into file_backup_object), so it
+// doesn't heap-fetch the object breadcrumbs audit discards.
+func (r *LedgerRepo) StoredExternalIDsPage(ctx context.Context, target, after string, limit int) ([]string, error) {
+	ids, err := r.q.StoredExternalIDsPage(ctx, queries.StoredExternalIDsPageParams{
+		Target: target, After: after, PageLimit: int32(limit), //nolint:gosec // limit is domain.KeysetPageSize (1000)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stored external ids page: %w", err)
+	}
+	return ids, nil
 }
 
 // TargetGaps invokes fn for every object NOT stored on every configured target, with the set

@@ -152,22 +152,21 @@ func TargetNames(targets []Target) []string {
 // gap when the target returns. A flaky target leaves the object not-done for retry while
 // never blocking the healthy ones.
 func (p *Pipeline) BackupOne(ctx context.Context, e BackupItem) (done, deferred bool, err error) {
-	return p.backupFrom(ctx, p.Source, e)
+	return p.backupFrom(ctx, p.Source, e, nil)
 }
 
 // backupFrom is BackupOne parameterized on the source, so reconcile can supply a
-// target-backed source per call without mutating shared Pipeline state.
-func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem) (done, deferred bool, err error) {
+// target-backed source per call without mutating shared Pipeline state. knownStored, when
+// non-nil, is the object's already-stored target set the caller ALREADY holds (reconcile's
+// TargetGaps computed it), so backupFrom skips the redundant StoredTargets query; nil means
+// "read it" (serve/backfill, where a fresh outbox row may reference already-stored content).
+func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem, knownStored map[string]bool) (done, deferred bool, err error) {
 	if err := p.precheck(e); err != nil {
 		return false, false, err
 	}
-	// Dedup is per content-hash, NOT per outbox row: a fresh row (attempts=0) can
-	// reference an already-stored externalID (duplicate content, or a backfill/
-	// reconcile re-enqueue), so the StoredTargets read must run unconditionally —
-	// skipping it on a "fresh" row would re-PUT duplicates to every target incl. WORM.
-	stored, err := p.Ledger.StoredTargets(ctx, e.ExternalID) // one query, not N
+	stored, err := p.resolveStored(ctx, e.ExternalID, knownStored)
 	if err != nil {
-		return false, false, fmt.Errorf("ledger read: %w", err)
+		return false, false, err
 	}
 	pending, skippedOpen := p.pendingTargets(stored)
 	if len(pending) == 0 {
@@ -253,6 +252,23 @@ func (p *Pipeline) precheck(e BackupItem) error {
 		return errors.New("backup: no targets configured")
 	}
 	return nil
+}
+
+// resolveStored returns the object's already-stored target set, the input to dedup. Dedup is
+// per content-hash, NOT per outbox row: a fresh row (attempts=0) can reference an
+// already-stored externalID (duplicate content, or a backfill/reconcile re-enqueue), so the
+// set is always consulted — skipping it on a "fresh" row would re-PUT duplicates to every
+// target incl. WORM. `known` (reconcile's TargetGaps result, same current-target predicate as
+// pendingTargets) is used as-is when non-nil, avoiding a per-gap-object re-query; nil reads it.
+func (p *Pipeline) resolveStored(ctx context.Context, externalID string, known map[string]bool) (map[string]bool, error) {
+	if known != nil {
+		return known, nil
+	}
+	stored, err := p.Ledger.StoredTargets(ctx, externalID) // one query, not N
+	if err != nil {
+		return nil, fmt.Errorf("ledger read: %w", err)
+	}
+	return stored, nil
 }
 
 // pendingTargets returns the targets that still need the object — not already stored

@@ -42,6 +42,16 @@ JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
 WHERE ts.target = sqlc.arg(target) AND ts.state = 'stored' AND o."externalID" > sqlc.arg(after)
 ORDER BY o."externalID" LIMIT sqlc.arg(page_limit);
 
+-- name: StoredExternalIDsPage :many
+-- Just the externalIDs stored ON one target, keyset-paged by externalID — what the audit
+-- sweep needs (it re-probes the sink and consumes ONLY the id). Unlike StoredObjectsPage this
+-- does NOT join file_backup_object, so it is a covering INDEX-ONLY scan on
+-- (target, state, "externalID") with no per-row heap fetch for size/createdBy the audit
+-- discards. (StoredObjectsPage stays for the manifest export, which needs those columns.)
+SELECT "externalID" FROM file_backup_target_status
+WHERE target = sqlc.arg(target) AND state = 'stored' AND "externalID" > sqlc.arg(after)
+ORDER BY "externalID" LIMIT sqlc.arg(page_limit);
+
 -- name: TargetGapsPage :many
 -- One keyset page (externalID order) of under-replicated objects with the CURRENT targets
 -- that DO hold each. An object stored on all target_count targets is excluded (HAVING);

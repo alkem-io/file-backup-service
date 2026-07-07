@@ -167,6 +167,43 @@ func (q *Queries) RecordBackup(ctx context.Context, arg RecordBackupParams) erro
 	return err
 }
 
+const storedExternalIDsPage = `-- name: StoredExternalIDsPage :many
+SELECT "externalID" FROM file_backup_target_status
+WHERE target = $1 AND state = 'stored' AND "externalID" > $2
+ORDER BY "externalID" LIMIT $3
+`
+
+type StoredExternalIDsPageParams struct {
+	Target    string `json:"target"`
+	After     string `json:"after"`
+	PageLimit int32  `json:"page_limit"`
+}
+
+// Just the externalIDs stored ON one target, keyset-paged by externalID — what the audit
+// sweep needs (it re-probes the sink and consumes ONLY the id). Unlike StoredObjectsPage this
+// does NOT join file_backup_object, so it is a covering INDEX-ONLY scan on
+// (target, state, "externalID") with no per-row heap fetch for size/createdBy the audit
+// discards. (StoredObjectsPage stays for the manifest export, which needs those columns.)
+func (q *Queries) StoredExternalIDsPage(ctx context.Context, arg StoredExternalIDsPageParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, storedExternalIDsPage, arg.Target, arg.After, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var externalID string
+		if err := rows.Scan(&externalID); err != nil {
+			return nil, err
+		}
+		items = append(items, externalID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const storedObjectsPage = `-- name: StoredObjectsPage :many
 SELECT o."externalID", o.size, o."createdBy", o."sourceCreatedDate"
 FROM file_backup_object o

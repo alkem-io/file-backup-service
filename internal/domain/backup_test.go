@@ -110,6 +110,21 @@ func (f *fakeLedger) StoredObjectsPage(_ context.Context, target, after string, 
 	}
 	return out, nil
 }
+func (f *fakeLedger) StoredExternalIDsPage(_ context.Context, target, after string, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]string, 0, len(f.objects))
+	for id := range f.objects {
+		if f.states[id+"/"+target] == StateStored && id > after {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	return ids, nil
+}
 func (f *fakeLedger) TargetGaps(_ context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
 	// Snapshot the gaps under the lock, then invoke fn WITHOUT holding it: fn dispatches
 	// concurrent repair workers that call RecordBackup (which locks), and when the worker

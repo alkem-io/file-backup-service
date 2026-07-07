@@ -156,7 +156,7 @@ func TestFinalizeHangTripsCircuit(t *testing.T) {
 		data := bytes.Repeat([]byte("x"), 20+i) // distinct content per object
 		h, _ := sum(bytes.NewReader(data))
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_, _, _ = p.backupFrom(ctx, fakeSource{data}, BackupItem{ExternalID: h})
+		_, _, _ = p.backupFrom(ctx, fakeSource{data}, BackupItem{ExternalID: h}, nil)
 		cancel()
 	}
 	if !p.Circuit.Down("hung") {
@@ -180,7 +180,7 @@ func TestSingleTargetFinalizeHangTripsCircuit(t *testing.T) {
 		data := bytes.Repeat([]byte("y"), 20+i)
 		h, _ := sum(bytes.NewReader(data))
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_, _, _ = p.backupFrom(ctx, fakeSource{data}, BackupItem{ExternalID: h})
+		_, _, _ = p.backupFrom(ctx, fakeSource{data}, BackupItem{ExternalID: h}, nil)
 		cancel()
 	}
 	if !p.Circuit.Down("solo") {

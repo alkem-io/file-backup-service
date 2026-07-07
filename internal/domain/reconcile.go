@@ -112,7 +112,9 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 			continue // stale status for a removed target
 		}
 		tried = true
-		done, _, err := p.backupFrom(ctx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry)
+		// Pass the stored set TargetGaps already computed so backupFrom doesn't re-query the
+		// ledger per gap object (the set uses the same current-target predicate pendingTargets does).
+		done, _, err := p.backupFrom(ctx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry, stored)
 		if err == nil {
 			// The source fetched + verified cleanly. Either fully repaired (done), or a
 			// DESTINATION target failed (!done) — and rotating to another source can't fix
@@ -176,6 +178,14 @@ func (rc *Reconciler) orderSources(stored map[string]bool) []string {
 // upload on a CodecNone target) — the latter needs the re-read-as-raw fallback, which a
 // one-pass stream can't do. The temp file is bounded + verified against externalID and
 // removed on Close.
+//
+// The pipeline's VerifyReader then hashes this decoded plaintext AGAIN before fan-out, so a
+// repaired object is SHA3-256'd twice (here to stage+arbitrate the source, and in fanOut to
+// gate the commit). That second pass is deliberately kept: it is the pipeline's UNIFORM
+// integrity commit-gate (every source — untrusted file-service fetch or local temp — is
+// verified the same way), and reconcile is a cold DR path where the fetch/decode/store I/O
+// dominates, not the extra hash. A source-pre-verified bypass would trade that uniformity for
+// CPU we can spare here.
 type decodingSource struct {
 	src        Sink
 	scratchDir string // "" = OS temp dir

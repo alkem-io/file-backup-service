@@ -161,7 +161,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 			}
 			limit = min(limit, remaining)
 		}
-		page, err := led.StoredObjectsPage(ctx, ta.Target, after, limit)
+		page, err := led.StoredExternalIDsPage(ctx, ta.Target, after, limit)
 		if err != nil {
 			return ta, fmt.Errorf("audit target %s: %w", ta.Target, err)
 		}
@@ -183,7 +183,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 				return ta, err
 			}
 			ta.tally(results)
-			after = page[len(page)-1].ExternalID
+			after = page[len(page)-1]
 		}
 		if segmentEnd {
 			if wrapEnd(samplePerTarget, startAfter, &wrapped) {
@@ -196,11 +196,11 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 	return ta, nil
 }
 
-// trimAtBoundary returns page truncated at the first object whose externalID >= boundary
-// (the wrapped pass must not re-check objects already covered in pass 1), and whether it
-// trimmed (reached the boundary).
-func trimAtBoundary(page []ObjectMeta, boundary string) ([]ObjectMeta, bool) {
-	if i := slices.IndexFunc(page, func(m ObjectMeta) bool { return m.ExternalID >= boundary }); i >= 0 {
+// trimAtBoundary returns page truncated at the first externalID >= boundary (the wrapped pass
+// must not re-check objects already covered in pass 1), and whether it trimmed (reached the
+// boundary).
+func trimAtBoundary(page []string, boundary string) ([]string, bool) {
+	if i := slices.IndexFunc(page, func(id string) bool { return id >= boundary }); i >= 0 {
 		return page[:i], true
 	}
 	return page, false
@@ -242,7 +242,7 @@ type existsResult struct {
 // probes are wedged on an uninterruptible os.Stat (a hung filesystem mount) — the stuck
 // goroutines are abandoned (their buffered send never blocks), not waited on, so the
 // audit can't hang. The caller re-checks ctx.Err() and surfaces the cancellation.
-func existsPage(ctx context.Context, sink Sink, page []ObjectMeta) []existsResult {
+func existsPage(ctx context.Context, sink Sink, page []string) []existsResult {
 	results := make([]existsResult, len(page))
 	for i := range results {
 		results[i].err = context.Canceled // default: unchecked (a cancelled/abandoned probe)
@@ -280,7 +280,7 @@ dispatch:
 			// as everywhere; the abandoned goroutine's send is absorbed by the buffered ch.)
 			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
 			defer cancel() // deferred (not inline): a recovered sink.Exists panic must not skip it and leak the timer
-			present, err := sink.Exists(pctx, page[i].ExternalID)
+			present, err := sink.Exists(pctx, page[i])
 			ch <- done{i, existsResult{present: present, err: err}}
 		}(i)
 	}
