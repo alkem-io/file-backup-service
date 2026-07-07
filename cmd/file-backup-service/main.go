@@ -158,13 +158,13 @@ func serve(cfgPath string) error {
 		return err
 	}
 
-	pipeline := domain.NewPipeline(fsClient, ledger, targets)
-	pipeline.Metrics = mx
 	// Per-target circuit breaker (T017a): a persistently-down/hung target trips out of the
-	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered.
+	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered. serve goes
+	// through WithIsolation (stall-drop + circuit) like backfill/reconcile, so the isolation
+	// wiring has ONE owner and serve can't silently miss a field a future isolation knob adds.
 	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
-	pipeline.Circuit = breaker
-	pipeline.StallTimeout = cfg.FanoutStall() // drop a hung target individually, don't stall the barrier
+	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
+	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
 		Pipeline:         pipeline,

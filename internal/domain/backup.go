@@ -455,69 +455,61 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 	return results, vr.Total, nil
 }
 
-// callWithCtx runs fn in its own goroutine and returns fn's error, but honors ctx even
-// when fn cannot (a filesystem call blocked in a hung fsync/write on a wedged mount — a
-// regular-file syscall Go can't interrupt): on ctx cancellation it returns ctx.Err() and
-// ABANDONS the goroutine (bounded, one per wedged op), so the caller unblocks rather than
-// pinning forever. It RECOVERS a panic in fn (the goroutine is on the other side of a
-// boundary the caller's recover can't reach — same reason storeWithCtx recovers its own
-// Store goroutine) and returns it as an error, so a panicking sink op fails its target
-// instead of crashing the process. The manifest writer's abandonment path.
-func callWithCtx(ctx context.Context, fn func() error) error {
-	ch := make(chan error, 1) // buffered so an abandoned goroutine never blocks
+// runAbandonable runs fn in its OWN goroutine and returns its result, but honors ctx even when
+// fn cannot (a filesystem call blocked in a hung fsync/write on a wedged mount — a regular-file
+// syscall Go can't interrupt): on ctx cancellation it returns onCancel() and ABANDONS the
+// goroutine (bounded, one per wedged op), so the caller unblocks rather than pinning forever.
+// The result channel is BUFFERED (cap 1) so the abandoned goroutine never blocks on its send. A
+// panic in fn is recovered HERE (a recover only catches its own goroutine — the caller's recover
+// can't reach across this boundary) and mapped via onPanic. The single owner of this
+// abandon + buffered-chan + recover primitive, shared by storeWithCtx and callWithCtx.
+func runAbandonable[T any](ctx context.Context, fn func() T, onCancel func() T, onPanic func(recovered any) T) T {
+	ch := make(chan T, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				ch <- PanicErr("sink op", r)
+				ch <- onPanic(r)
 			}
 		}()
 		ch <- fn()
 	}()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-ch:
-		return err
-	}
-}
-
-// storeWithCtx runs Sink.Store but honors ctx even when the sink cannot (a
-// filesystem sink blocked in a hung fsync/write on a wedged mount — a regular-file
-// syscall Go cannot interrupt by closing the fd): on ctx cancellation it returns
-// the ctx error and abandons the inner Store goroutine, so wg.Wait / the dispatcher
-// unblock and the worker slot is freed rather than pinned forever. The abandoned
-// goroutine is bounded (one per wedged object); if it ever completes, the filesystem
-// sink's own ctx-gate refuses to commit a cancelled write (the temp is removed), and
-// an S3 sink writes identical content-addressed bytes — never corruption either way.
-//
-// The Store call is in its OWN goroutine, so a panicking sink is recovered HERE
-// (a recover() only catches its own goroutine) and converted to an error — the
-// per-target recover() in fanOut cannot reach across this goroutine boundary.
-//
-// Reading r to EOF is load-bearing: commit is gated on the dispatcher closing the
-// pipes AFTER VerifyReader checks the hash; a sink that finalized on a known
-// byte-count (e.g. minio single-PUT) would commit before verification, which is why
-// Store takes no length.
-func storeWithCtx(ctx context.Context, sink Sink, hash string, er *eofReader) targetResult {
-	ch := make(chan targetResult, 1) // buffered so an abandoned goroutine never blocks
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				ch <- targetResult{err: PanicErr("sink "+sink.Name(), rec)}
-			}
-		}()
-		sn, serr := sink.Store(ctx, hash, er)
-		// Read er.sawEOF HERE, on the goroutine that owns er — sending it via the channel
-		// gives the fanOut reader a happens-before. On the ctx.Done path below we return
-		// without touching er, so the abandoned goroutine's sawEOF write never races.
-		ch <- targetResult{stored: sn, err: serr, sawEOF: er.sawEOF}
-	}()
-	select {
-	case <-ctx.Done():
-		return targetResult{err: ctx.Err()}
+		return onCancel()
 	case res := <-ch:
 		return res
 	}
+}
+
+// callWithCtx runs fn honoring ctx even when fn cannot (a hung fsync/write on a wedged mount Go
+// can't interrupt): on cancellation it returns ctx.Err() and abandons the goroutine; a panic in
+// fn becomes an error so a panicking sink op fails its target instead of crashing the process.
+// The manifest writer's abandonment path. See runAbandonable.
+func callWithCtx(ctx context.Context, fn func() error) error {
+	return runAbandonable(ctx, fn,
+		func() error { return ctx.Err() },
+		func(r any) error { return PanicErr("sink op", r) })
+}
+
+// storeWithCtx runs Sink.Store honoring ctx even when the sink cannot (a filesystem sink blocked
+// in a hung fsync/write on a wedged mount Go cannot interrupt by closing the fd): on ctx
+// cancellation it returns the ctx error and abandons the inner Store goroutine so wg.Wait / the
+// dispatcher unblock and the worker slot is freed. The abandoned goroutine is bounded (one per
+// wedged object); if it ever completes, the filesystem sink's ctx-gate refuses to commit a
+// cancelled write (temp removed) and an S3 sink writes identical content-addressed bytes — never
+// corruption. er.sawEOF is read INSIDE fn (the goroutine that owns er) and sent via the channel,
+// giving the fanOut reader a happens-before; the onCancel path never touches er, so the abandoned
+// goroutine's sawEOF write never races. Reading r to EOF is load-bearing: commit is gated on the
+// dispatcher closing the pipes AFTER VerifyReader checks the hash, so Store takes no length (a
+// known-length finalize, e.g. minio single-PUT, would commit before verification).
+func storeWithCtx(ctx context.Context, sink Sink, hash string, er *eofReader) targetResult {
+	return runAbandonable(ctx,
+		func() targetResult {
+			sn, serr := sink.Store(ctx, hash, er)
+			return targetResult{stored: sn, err: serr, sawEOF: er.sawEOF}
+		},
+		func() targetResult { return targetResult{err: ctx.Err()} },
+		func(r any) targetResult { return targetResult{err: PanicErr("sink "+sink.Name(), r)} })
 }
 
 // fanoutCopy streams vr into fw in ~1 MiB writes. An HTTP-body Read returns only

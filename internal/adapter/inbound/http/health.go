@@ -3,8 +3,9 @@ package http
 import (
 	"context"
 	"net/http"
-	"sync"
 	"time"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 // Prober verifies a dependency is USABLE — the schema is reachable via the scoped
@@ -40,35 +41,23 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}{{"outbox", h.Outbox}, {"ledger", h.Ledger}}
 	details := make([]string, len(checks))
 
-	var wg sync.WaitGroup
-	for i, c := range checks {
-		wg.Add(1)
-		go func(i int, p Prober) {
-			defer wg.Done()
-			// A driver panic in Probe must report unusable, not crash the serve process:
-			// this goroutine is spawned per readiness scrape, and chi's Recoverer only
-			// wraps the request goroutine, not its children.
-			defer func() {
-				if r := recover(); r != nil {
-					details[i] = "unusable"
-				}
-			}()
-			if p == nil { // a missing dependency is UNHEALTHY, never silently skipped
-				details[i] = "not configured"
-				return
-			}
-			// Detached from the request context: a kubelet timeoutSeconds shorter than
-			// probeTimeout must not cancel the probe and report a healthy DB as unusable.
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), probeTimeout)
-			defer cancel()
-			if err := p.Probe(ctx); err != nil {
-				details[i] = "unusable"
-				return
-			}
-			details[i] = "ok"
-		}(i, c.p)
+	// domain.RunParallel owns the per-goroutine recover that every other concurrent sweep in
+	// the service reuses — needed here because a driver panic in Probe must report unusable,
+	// not crash serve: these goroutines are spawned per readiness scrape and chi's Recoverer
+	// only wraps the request goroutine, not its children. A recovered panic leaves details[i]
+	// unwritten (""), which the post-loop maps to "unusable".
+	idxs := make([]int, len(checks))
+	for i := range idxs {
+		idxs[i] = i
 	}
-	wg.Wait()
+	errs := domain.RunParallel(idxs,
+		func(i int) string { return "probe " + checks[i].name },
+		func(i int) error { details[i] = probeDetail(req, checks[i].p); return nil })
+	for i := range details {
+		if errs[i] != nil { // Probe panicked (RunParallel recovered it) → unusable
+			details[i] = "unusable"
+		}
+	}
 
 	out := HealthResponse{Status: "healthy", Details: map[string]string{}}
 	code := http.StatusOK
@@ -79,4 +68,20 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	writeJSON(w, code, out)
+}
+
+// probeDetail runs one dependency check and returns its readiness detail. A nil prober is
+// "not configured" (a missing dependency is UNHEALTHY, never silently skipped). The probe ctx
+// is DETACHED from the request (context.WithoutCancel) + bounded, so a kubelet timeoutSeconds
+// shorter than probeTimeout can't cancel it and report a healthy DB as unusable.
+func probeDetail(req *http.Request, p Prober) string {
+	if p == nil {
+		return "not configured"
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), probeTimeout)
+	defer cancel()
+	if err := p.Probe(ctx); err != nil {
+		return "unusable"
+	}
+	return "ok"
 }
