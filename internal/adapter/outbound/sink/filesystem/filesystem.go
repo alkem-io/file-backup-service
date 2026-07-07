@@ -31,7 +31,17 @@ func (s *Sink) osPath(key string) string {
 	return filepath.Join(s.root, filepath.FromSlash(key))
 }
 
-func (s *Sink) pathFor(hash string) string { return s.osPath(fsutil.ShardKey(hash)) }
+// pathFor resolves a content hash to its on-disk path, rejecting any hash that is not a
+// well-formed content address BEFORE it is joined to the root — the actual chokepoint for
+// the path-traversal class (a "../" in an unvalidated hash resolves through filepath.Join
+// and escapes s.root). The domain validates at its ingress too; this is the last line at
+// the filesystem boundary, so the traversal cannot happen regardless of caller.
+func (s *Sink) pathFor(hash string) (string, error) {
+	if err := fsutil.ValidateContentHash(hash); err != nil {
+		return "", fmt.Errorf("filesystem %q: %w", s.name, err)
+	}
+	return s.osPath(fsutil.ShardKey(hash)), nil
+}
 
 // Preflight verifies the root exists and is writable, so a missing mount / wrong
 // path / read-only volume fails loudly at startup instead of dead-lettering every
@@ -57,7 +67,11 @@ func (s *Sink) Preflight(ctx context.Context) error {
 
 // Exists reports whether the object is present.
 func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
-	_, err := os.Stat(s.pathFor(hash))
+	path, err := s.pathFor(hash)
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Stat(path)
 	switch {
 	case err == nil:
 		return true, nil
@@ -73,13 +87,20 @@ func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 // byte count is returned — an identical existing object is just overwritten
 // atomically.
 func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, error) {
-	dest := s.pathFor(hash)
+	dest, err := s.pathFor(hash)
+	if err != nil {
+		return 0, err
+	}
 	return writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r)
 }
 
 // Fetch opens the stored object.
 func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
-	f, err := os.Open(s.pathFor(hash)) //nolint:gosec // path derived from a validated hash
+	path, err := s.pathFor(hash) // validates hash → path can't traverse out of s.root
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path) //nolint:gosec // pathFor validated the hash is 64-hex, so no traversal
 	if err != nil {
 		return nil, fmt.Errorf("open: %w", err)
 	}

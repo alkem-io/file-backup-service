@@ -24,6 +24,17 @@ func sum(r io.Reader) (string, error) {
 	return hexSum(h), nil
 }
 
+// hashOf returns a deterministic, format-valid 64-hex externalID for a label — the source/
+// sink fakes ignore the hash's CONTENT (they key on it as an opaque id), they just need it
+// to pass the content-address format gate (fsutil.ValidateContentHash) that the production
+// ingress now enforces. Use it anywhere a test needs a stand-in externalID that is NOT the
+// hash of specific bytes.
+func hashOf(label string) string {
+	h := newHash()
+	_, _ = h.Write([]byte(label))
+	return hexSum(h)
+}
+
 type fakeSource struct{ data []byte }
 
 func (f fakeSource) FetchContent(context.Context, BackupItem) (io.ReadCloser, error) {
@@ -266,7 +277,7 @@ func TestPipelineFetchCancelledNoPanic(t *testing.T) {
 	cancel()
 	sink := newMemSink("t")
 	p := NewPipeline(ctxErrSource{}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
-	ok, _, err := p.BackupOne(ctx, BackupItem{ExternalID: "abc"})
+	ok, _, err := p.BackupOne(ctx, BackupItem{ExternalID: hashOf("abc")})
 	if err == nil || ok {
 		t.Fatal("a ctx-cancelled fetch must return an error, not succeed (and must not panic)")
 	}
@@ -298,7 +309,7 @@ func TestBackupRejectsOverCapObject(t *testing.T) {
 func TestPipelineSourceCorrupt(t *testing.T) {
 	sink := newMemSink("t1")
 	p := NewPipeline(fakeSource{[]byte("wrong")}, newFakeLedger(), []Target{{Sink: sink}})
-	ok, _, err := p.BackupOne(context.Background(), BackupItem{ExternalID: "deadbeef"})
+	ok, _, err := p.BackupOne(context.Background(), BackupItem{ExternalID: hashOf("deadbeef")})
 	if err == nil {
 		t.Fatal("expected the source integrity error to be surfaced, not hidden as a target failure")
 	}
@@ -504,6 +515,34 @@ func TestPipelineAllTargetsFailRecordsOutboxSize(t *testing.T) {
 	}
 }
 
+// TestBackupRejectsMalformedExternalID: a hostile/drifted externalID (traversal payload,
+// wrong length, non-hex) must be rejected at the pipeline ingress — never fetched, never
+// handed to a sink as a path component — so it can't drive a directory-traversal write or
+// an over-length ledger INSERT. (V1)
+func TestBackupRejectsMalformedExternalID(t *testing.T) {
+	sink := newMemSink("t")
+	p := NewPipeline(fakeSource{[]byte("x")}, newFakeLedger(), []Target{{Sink: sink, Codec: CodecNone}})
+	for _, bad := range []string{"", "abc", "../../../../etc/passwd",
+		strings.Repeat("a", 63), strings.Repeat("A", 64), strings.Repeat("a", 65), strings.Repeat("g", 64)} {
+		if _, _, err := p.BackupOne(context.Background(), BackupItem{ExternalID: bad}); err == nil {
+			t.Fatalf("malformed externalID %q must be rejected", bad)
+		}
+	}
+	if len(sink.store) != 0 {
+		t.Fatal("a malformed externalID must never reach a sink")
+	}
+}
+
+// TestBackupRejectsZeroTargets: a pipeline with no targets must fail loudly, never report an
+// object done while storing nothing (the silent-total-loss guard the config check backstops). (V2)
+func TestBackupRejectsZeroTargets(t *testing.T) {
+	p := NewPipeline(fakeSource{[]byte("x")}, newFakeLedger(), nil)
+	done, deferred, err := p.BackupOne(context.Background(), BackupItem{ExternalID: hashOf("x")})
+	if err == nil || done || deferred {
+		t.Fatalf("zero-target pipeline must error, got done=%v deferred=%v err=%v", done, deferred, err)
+	}
+}
+
 // goneSource models a source object deleted before backup (404 → ErrSourceGone).
 type goneSource struct{}
 
@@ -516,7 +555,7 @@ func (goneSource) FetchContent(context.Context, BackupItem) (io.ReadCloser, erro
 func TestPipelineSourceGonePropagates(t *testing.T) {
 	p := NewPipeline(goneSource{}, newFakeLedger(),
 		[]Target{{Sink: newMemSink("t"), Codec: CodecNone}})
-	_, _, err := p.BackupOne(context.Background(), BackupItem{ExternalID: "abc"})
+	_, _, err := p.BackupOne(context.Background(), BackupItem{ExternalID: hashOf("abc")})
 	if !errors.Is(err, ErrSourceGone) {
 		t.Fatalf("expected ErrSourceGone to propagate, got %v", err)
 	}

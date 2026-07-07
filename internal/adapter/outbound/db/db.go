@@ -5,6 +5,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -26,17 +27,26 @@ type Pool struct {
 	*pgxpool.Pool
 }
 
-// NewPool opens a pgx pool for dsn with an explicit MaxConns. Sizing matters:
-// the permanent LISTEN connection plus concurrent Claim/MarkDone/Fail/health must
-// all fit, or bookkeeping starves under a NOTIFY burst (default max is only
-// max(4, NumCPU)).
-func NewPool(ctx context.Context, dsn string, maxConns int32) (*Pool, error) {
+// NewPool opens a pgx pool for dsn with an explicit MaxConns and a server-side
+// statement_timeout. Sizing matters: the permanent LISTEN connection plus concurrent
+// Claim/MarkDone/Fail/health must all fit, or bookkeeping starves under a NOTIFY burst
+// (default max is only max(4, NumCPU)). statementTimeout bounds EVERY query on the pool
+// server-side, so a slow/overloaded DB can't hang a worker indefinitely in an otherwise
+// unbounded Claim/reap — the query is aborted and retried instead. 0 leaves it unset.
+// (The migrate step opens its own database/sql connection, NOT this pool, so long DDL
+// like CREATE INDEX is unaffected by this bound.) statement_timeout does not affect a
+// connection parked in WaitForNotification — LISTEN already returned; the wait is a
+// client-side socket read, not a running statement.
+func NewPool(ctx context.Context, dsn string, maxConns int32, statementTimeout time.Duration) (*Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
 	}
 	if maxConns > 0 {
 		cfg.MaxConns = maxConns
+	}
+	if statementTimeout > 0 {
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(statementTimeout.Milliseconds(), 10)
 	}
 	p, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

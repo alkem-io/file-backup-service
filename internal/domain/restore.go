@@ -42,6 +42,11 @@ var errHashMismatch = errors.New("hash mismatch")
 // it is hash-verified first — a corrupt file in the primary store does not mask the
 // good backup copy.
 func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
+	// Validate before hash is used as a path component: filepath.Join(destDir, "../..")
+	// resolves the traversal and escapes destDir, and src.Fetch keys the sink on it too.
+	if err := fsutil.ValidateContentHash(hash); err != nil {
+		return err
+	}
 	dest := filepath.Join(destDir, hash)
 	if _, err := os.Stat(dest); err == nil {
 		if f, oerr := os.Open(dest); oerr == nil { //nolint:gosec // primary-store path
@@ -70,6 +75,11 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 // writing the plaintext to io.Discard — no temp file, no scratch disk, bounded
 // memory, bomb-safe (the decode is length-capped). One pass.
 func VerifyObject(ctx context.Context, src Sink, hash string) error {
+	// Same ingress guard as RestoreObject: a --hash of "../../etc/passwd" would otherwise
+	// key the filesystem sink's Fetch onto an arbitrary file (an arbitrary-file read).
+	if err := fsutil.ValidateContentHash(hash); err != nil {
+		return err
+	}
 	return decodeStream(ctx, src, hash, io.Discard, nil)
 }
 

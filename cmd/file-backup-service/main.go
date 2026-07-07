@@ -118,12 +118,12 @@ func serve(cfgPath string) error {
 	// config.Load guarantees both DSNs and >=1 target — no silent no-op mode.
 	// Size for: 1 permanent LISTEN + up to Concurrency in-flight bookkeeping +
 	// health + margin, so a NOTIFY burst can't starve MarkDone/Fail.
-	alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(8), "alkemio")
+	alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(8), cfg.DBTimeout(), "alkemio")
 	if err != nil {
 		return err
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), "ledger")
+	ledgerPool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "ledger")
 	if err != nil {
 		return err
 	}
@@ -171,6 +171,7 @@ func serve(cfgPath string) error {
 		PollEvery:        cfg.PollEvery(),
 		StaleTTL:         cfg.StaleTTL(),
 		PerObjectTimeout: cfg.PerObjectTimeout(),
+		DBTimeout:        cfg.DBTimeout(),
 		OnDeadLetter:     mx.DeadLetter,
 		OnObjectTimeout:  mx.ObjectTimeout,
 		OnSourceGone:     mx.SourceGone,
@@ -267,8 +268,8 @@ func runVerify(args []string) error {
 // openPool opens a pgx pool, wrapping the error with a "<label> pool" prefix — the one
 // owner of that error shape, shared by serve/backfill/ledgerJob (each of which still owns
 // its own `defer pool.Close()` at the call site). label is the DB's role in the message.
-func openPool(ctx context.Context, dsn string, size int32, label string) (*db.Pool, error) {
-	p, err := db.NewPool(ctx, dsn, size)
+func openPool(ctx context.Context, dsn string, size int32, stmtTimeout time.Duration, label string) (*db.Pool, error) {
+	p, err := db.NewPool(ctx, dsn, size, stmtTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("%s pool: %w", label, err)
 	}
@@ -294,7 +295,7 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 	if err := cfg.ValidateDR(); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
-	pool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), "ledger")
+	pool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "ledger")
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -380,12 +381,12 @@ func runBackfill(args []string) error {
 	ctx, stop := signalContext()
 	defer stop()
 
-	alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(4), "alkemio")
+	alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "alkemio")
 	if err != nil {
 		return err
 	}
 	defer alkemioPool.Close()
-	ledgerPool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), "ledger")
+	ledgerPool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "ledger")
 	if err != nil {
 		return err
 	}

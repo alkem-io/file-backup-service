@@ -7,6 +7,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // errAbortedBeforeEOF marks a target whose pipe went dead before consuming the
@@ -156,6 +158,9 @@ func (p *Pipeline) BackupOne(ctx context.Context, e BackupItem) (done, deferred 
 // backupFrom is BackupOne parameterized on the source, so reconcile can supply a
 // target-backed source per call without mutating shared Pipeline state.
 func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem) (done, deferred bool, err error) {
+	if err := p.precheck(e); err != nil {
+		return false, false, err
+	}
 	// Dedup is per content-hash, NOT per outbox row: a fresh row (attempts=0) can
 	// reference an already-stored externalID (duplicate content, or a backfill/
 	// reconcile re-enqueue), so the StoredTargets read must run unconditionally —
@@ -229,6 +234,25 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem) (do
 	// are down/timed-out targets → DEFERRED (retry later, NO attempt; reconcile refills).
 	done = allStored && !skippedOpen && !aborted
 	return done, !done, nil
+}
+
+// precheck rejects a backup that must not proceed, before any fetch or ledger read:
+//   - a malformed externalID (a drifted/hostile outbox producer) — as a filesystem key a
+//     "../" escapes the sink root, and >128 chars breaks the ledger INSERT; rejecting it
+//     here fails the poison object loudly (→ dead-letter after retries) rather than driving a
+//     traversal write or a silent under-backup. Covers serve/backfill/reconcile uniformly.
+//   - a zero-target pipeline — the symmetric done-gate is vacuously true, so BackupOne would
+//     report every object done while storing nothing (silent total loss, green gauges).
+//     config.ValidateTargets guards construction, but enforce it in the domain too so no
+//     future caller can build a silently-lossy pipeline.
+func (p *Pipeline) precheck(e BackupItem) error {
+	if err := fsutil.ValidateContentHash(e.ExternalID); err != nil {
+		return err
+	}
+	if len(p.Targets) == 0 {
+		return errors.New("backup: no targets configured")
+	}
+	return nil
 }
 
 // pendingTargets returns the targets that still need the object — not already stored

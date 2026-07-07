@@ -18,7 +18,28 @@ import (
 const (
 	manifestPrefix  = "_manifest"
 	preflightPrefix = "_preflight"
+	// contentHashLen is the hex length of a SHA3-256 externalID (32 bytes -> 64 hex chars).
+	contentHashLen = 64
 )
+
+// ValidateContentHash rejects an externalID that is not exactly 64 lowercase-hex
+// characters (a SHA3-256 digest). It is the ONE gate that stops an untrusted or
+// schema-drifted externalID — from the file-service outbox, or an operator's --hash
+// argument — from becoming a directory-traversing filesystem path (a "../" resolves
+// through filepath.Join and escapes the sink root / restore destDir) or an over-length
+// ledger key (the file_backup_object / _target_status columns are VARCHAR(128)). Enforced
+// at every ingress: the backup pipeline, restore/verify, and the filesystem sink.
+func ValidateContentHash(s string) error {
+	if len(s) != contentHashLen {
+		return fmt.Errorf("invalid content hash: %d chars, want %d lowercase-hex", len(s), contentHashLen)
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("invalid content hash: byte %d is not lowercase hex", i)
+		}
+	}
+	return nil
+}
 
 // PreflightKey returns a unique reserved key for a startup write-probe object. It is
 // unique per run so an object-lock/WORM bucket can't reject an overwrite on restart.

@@ -107,12 +107,13 @@ func TestRestoreRawOversizedZstdFrame(t *testing.T) {
 }
 
 func TestRestoreCorruptFails(t *testing.T) {
-	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{"deadbeef": []byte("garbage not zstd")}}
+	h := hashOf("corrupt") // a valid content-address whose stored bytes are garbage
+	sink := &memSink{stubSink: stubSink{name: "s"}, store: map[string][]byte{h: []byte("garbage not zstd")}}
 	dir := t.TempDir()
-	if err := RestoreObject(context.Background(), sink, "deadbeef", dir); err == nil {
+	if err := RestoreObject(context.Background(), sink, h, dir); err == nil {
 		t.Fatal("expected integrity error on a corrupt object")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "deadbeef")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, h)); err == nil {
 		t.Fatal("corrupt object must not be written to dest")
 	}
 }

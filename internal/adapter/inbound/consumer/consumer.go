@@ -34,6 +34,10 @@ type Deps struct {
 	// PerObjectTimeout bounds a single object's backup so a hung fetch/sink can't
 	// pin a worker slot forever.
 	PerObjectTimeout time.Duration
+	// DBTimeout bounds the otherwise-unbounded outbox Claim and stale-reap queries so a
+	// slow/wedged Alkemio DB fails the op (retried after backoff) instead of parking a
+	// worker forever with /live still green. 0 = unbounded (direct-construction tests).
+	DBTimeout time.Duration
 	// OnDeadLetter is called whenever an entry is moved to dead-letter (optional).
 	OnDeadLetter func()
 	// OnObjectTimeout is called when an object hits the per-object timeout (a
@@ -82,21 +86,16 @@ func (c *Consumer) Run(ctx context.Context) error {
 // poll signals wake every PollEvery so an idle worker re-checks even if a NOTIFY was
 // missed — ONE shared ticker feeding the wake cascade, instead of one ticker per
 // worker (which fired N empty claims against the shared DB every interval at idle).
+// It uses domain.TickLoop (the one ticker-skeleton owner, like reap) rather than
+// hand-rolling NewTicker + for/select; the extra immediate wake at startup is a harmless
+// coalesced signal (workers already drain the backlog on entry), timeout 0 because
+// signal() can't block or fail, and onError nil for the same reason.
 func (c *Consumer) poll(ctx context.Context, wake chan<- struct{}) {
 	interval := c.d.PollEvery
 	if interval <= 0 { // floor it (as reap does) so a non-positive PollEvery can't panic NewTicker
 		interval = time.Second
 	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			signal(wake)
-		}
-	}
+	domain.TickLoop(ctx, interval, 0, func(context.Context) error { signal(wake); return nil }, nil)
 }
 
 // worker claims and processes ONE object at a time until ctx is cancelled.
@@ -130,11 +129,16 @@ func (c *Consumer) claimStep(ctx context.Context, wake chan struct{}) (worked bo
 			worked = true // retry after backoff rather than block on wake
 		}
 	}()
-	entries, err := c.d.Outbox.Claim(ctx, 1)
+	cctx, cancel := c.opCtx(ctx) // bound the claim so a wedged DB can't park this worker forever
+	defer cancel()
+	entries, err := c.d.Outbox.Claim(cctx, 1)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			return true // graceful shutdown cancelled the claim — the ctx.Err() loop guard exits
 		}
+		// A DBTimeout (DeadlineExceeded) or a genuine DB error both log + back off + retry,
+		// rather than the worker hanging in Claim: the pod stays live AND makes visible,
+		// retrying progress instead of silently wedging with /live green.
 		c.d.Logger.Error("claim outbox", zap.Error(err))
 		backoff(ctx) // don't hot-loop a broken DB
 		return true
@@ -145,6 +149,16 @@ func (c *Consumer) claimStep(ctx context.Context, wake chan struct{}) (worked bo
 		return true
 	}
 	return false // outbox empty
+}
+
+// opCtx bounds a single DB operation with DBTimeout (derived from ctx, so shutdown still
+// aborts it); DBTimeout<=0 leaves it unbounded (returns ctx + a no-op cancel). The one
+// owner of the claim/reap query-deadline policy.
+func (c *Consumer) opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.d.DBTimeout > 0 {
+		return context.WithTimeout(ctx, c.d.DBTimeout)
+	}
+	return ctx, func() {}
 }
 
 // signal does a non-blocking send — a coalescing wakeup.
@@ -241,19 +255,33 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 		// (circuit-open) target — NOT a failure of THIS object. Defer it (backoff,
 		// re-claimable, NO attempt) so a single-target outage doesn't march the corpus to
 		// dead-letter; reconcile refills the gap when the target returns (T017a).
+		//
+		// A per-object TIMEOUT during a target's finalization can trip that target's circuit
+		// and surface HERE as a defer (not an error) — still fire the timeout metric so a
+		// wedged target isn't a blind spot just because its circuit tripped on the same object
+		// that timed out.
+		c.fireObjectTimeout(ctx, objCtx)
 		if derr := c.d.Outbox.Defer(bctx, e.ID); derr != nil {
 			c.d.Logger.Error("defer down-target object", zap.Int64("id", e.ID), zap.Error(derr))
 		}
 	case err != nil:
 		// A per-object timeout (objCtx deadline hit while the parent is still live)
 		// is a slow/wedged target — surface it as its own metric, not just a failure.
-		if c.d.OnObjectTimeout != nil && errors.Is(objCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-			c.d.OnObjectTimeout()
-		}
+		c.fireObjectTimeout(ctx, objCtx)
 		c.d.Logger.Warn("backup failed", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(err))
 		c.fail(bctx, e.ID, err.Error())
 	default: // !ok
 		c.fail(bctx, e.ID, "not all targets stored")
+	}
+}
+
+// fireObjectTimeout fires the per-object-timeout observer iff THIS object hit its own
+// deadline (objCtx DeadlineExceeded) rather than a graceful shutdown (parent ctx live).
+// Shared by the failed branch and the deferred-with-tripped-circuit branch — both of which
+// can be the surface of a per-object timeout — so the "was it a timeout" rule lives once.
+func (c *Consumer) fireObjectTimeout(ctx, objCtx context.Context) {
+	if c.d.OnObjectTimeout != nil && errors.Is(objCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		c.d.OnObjectTimeout()
 	}
 }
 
@@ -282,12 +310,12 @@ func (c *Consumer) reap(ctx context.Context) {
 	if interval < time.Minute {
 		interval = time.Minute
 	}
-	// domain.TickLoop owns the ticker + startup sweep + panic recover; timeout 0 means the
-	// single-UPDATE sweep runs on ctx (no per-tick bound — shutdown still aborts it). A panic
-	// (a pgx Scan on a drifted foreign-outbox column) and a returned error both route to
-	// onError, so the reaper degrades to a logged error, never a crashed worker (this goroutine
-	// is outside process()'s recover).
-	domain.TickLoop(ctx, interval, 0,
+	// domain.TickLoop owns the ticker + startup sweep + panic recover; DBTimeout bounds each
+	// sweep so a wedged Alkemio DB can't park the reaper indefinitely (shutdown still aborts it
+	// via the parent ctx). A panic (a pgx Scan on a drifted foreign-outbox column), a returned
+	// error, and a per-tick timeout all route to onError, so the reaper degrades to a logged
+	// error, never a crashed worker (this goroutine is outside process()'s recover).
+	domain.TickLoop(ctx, interval, c.d.DBTimeout,
 		func(fctx context.Context) error {
 			deadLettered, err := c.d.Outbox.ReapStale(fctx, c.d.StaleTTL)
 			if err != nil {

@@ -121,6 +121,7 @@ type Config struct {
 	CircuitThreshold    int      `yaml:"circuitThreshold"`   // per-target failures within the last 2x this many outcomes that trip its circuit open (T017a)
 	CircuitCooldownSec  int      `yaml:"circuitCooldownSec"` // how long a tripped target's circuit stays open before a probe half-opens it
 	FanoutStallSec      int      `yaml:"fanoutStallSec"`     // per-chunk drain deadline: a target not consuming a fan-out chunk in this long is dropped (hung-sink isolation)
+	DBTimeoutSec        int      `yaml:"dbTimeoutSec"`       // bound on a single DB operation (pool statement_timeout + the claim/reap query deadline) so a slow/wedged DB can't hang a worker forever
 	// ScratchDir is where reconcile stages a decoded object before re-fanning it out.
 	// Empty = the OS temp dir; point it at a SIZED volume (not a small memory-backed
 	// emptyDir/tmpfs) so a large-object repair on the recovery host can't fill /tmp.
@@ -158,6 +159,11 @@ func (c *Config) NewCircuitBreaker() *domain.CircuitBreaker {
 func (c *Config) FanoutStall() time.Duration {
 	return time.Duration(c.FanoutStallSec) * time.Second
 }
+
+// DBTimeout bounds a single DB operation — the pool's server-side statement_timeout AND the
+// client-side deadline on the otherwise-unbounded claim/reap queries — so a slow or wedged
+// Alkemio/ledger DB fails the op (retried) instead of parking a worker forever.
+func (c *Config) DBTimeout() time.Duration { return time.Duration(c.DBTimeoutSec) * time.Second }
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env
 // (FBS_* scalars/DB, FBS_TARGET_<NAME>_* per target), then applies defaults.
@@ -206,6 +212,7 @@ func (c *Config) applyEnv() error {
 	add(setInt(&c.CircuitThreshold, envPrefix+"CIRCUITTHRESHOLD"))
 	add(setInt(&c.CircuitCooldownSec, envPrefix+"CIRCUITCOOLDOWNSEC"))
 	add(setInt(&c.FanoutStallSec, envPrefix+"FANOUTSTALLSEC"))
+	add(setInt(&c.DBTimeoutSec, envPrefix+"DBTIMEOUTSEC"))
 	add(applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_"))
 	add(applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_"))
 	add(c.applyTargetEnv())
@@ -246,41 +253,21 @@ func (c *Config) applyTargetEnv() error {
 }
 
 func (c *Config) applyDefaults() {
-	// All floors are <= 0 (not == 0): a negative env override must not survive into
-	// pool sizing, a ":-1" listen addr, or a negative-duration ticker (panics).
-	if c.Concurrency <= 0 {
-		c.Concurrency = 8
-	}
-	if c.MetricsPort <= 0 {
-		c.MetricsPort = 4004
-	}
-	if c.PerObjectTimeoutSec <= 0 {
-		c.PerObjectTimeoutSec = 1800 // 30 min — must exceed the slowest legit backup
-	}
-	if c.StaleTTLSec <= 0 {
-		c.StaleTTLSec = 3600 // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
-	}
-	if c.PollEverySec <= 0 {
-		c.PollEverySec = 10
-	}
-	if c.MaxAttempts <= 0 {
-		c.MaxAttempts = 10
-	}
-	if c.MaxDeliveries <= 0 {
-		c.MaxDeliveries = 50
-	}
-	if c.ManifestEverySec <= 0 {
-		c.ManifestEverySec = 24 * 60 * 60 // daily
-	}
-	if c.CircuitThreshold <= 0 {
-		c.CircuitThreshold = 5 // trip a target's circuit at 5 failures within its last 10 outcomes
-	}
-	if c.CircuitCooldownSec <= 0 {
-		c.CircuitCooldownSec = 60 // re-probe a down target once a minute
-	}
-	if c.FanoutStallSec <= 0 {
-		c.FanoutStallSec = 60 // a target not draining a 1 MiB chunk in 60s is hung, not slow
-	}
+	// All floors are <= 0 (not == 0): a negative env override must not survive into pool
+	// sizing, a ":-1" listen addr, or a negative-duration ticker (panics). orDefault holds the
+	// per-field branch so this stays a flat list (one edit to add a knob, no cyclo creep).
+	c.Concurrency = orDefault(c.Concurrency, 8)
+	c.MetricsPort = orDefault(c.MetricsPort, 4004)
+	c.PerObjectTimeoutSec = orDefault(c.PerObjectTimeoutSec, 1800) // 30 min — must exceed the slowest legit backup
+	c.StaleTTLSec = orDefault(c.StaleTTLSec, 3600)                 // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
+	c.PollEverySec = orDefault(c.PollEverySec, 10)
+	c.MaxAttempts = orDefault(c.MaxAttempts, 10)
+	c.MaxDeliveries = orDefault(c.MaxDeliveries, 50)
+	c.ManifestEverySec = orDefault(c.ManifestEverySec, 24*60*60) // daily
+	c.CircuitThreshold = orDefault(c.CircuitThreshold, 5)        // trip a target's circuit at 5 failures within its last 10 outcomes
+	c.CircuitCooldownSec = orDefault(c.CircuitCooldownSec, 60)   // re-probe a down target once a minute
+	c.FanoutStallSec = orDefault(c.FanoutStallSec, 60)           // a target not draining a 1 MiB chunk in 60s is hung, not slow
+	c.DBTimeoutSec = orDefault(c.DBTimeoutSec, 30)               // generous vs any healthy indexed/paged query; bounds a wedged DB
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {
 			d.Port = 5432
@@ -289,6 +276,15 @@ func (c *Config) applyDefaults() {
 			d.SSLMode = "require"
 		}
 	}
+}
+
+// orDefault returns v when it is positive, else d — the "floor a non-positive knob to its
+// default" rule, in one place so applyDefaults stays a flat assignment list.
+func orDefault(v, d int) int {
+	if v <= 0 {
+		return d
+	}
+	return v
 }
 
 // envToken upcases a target name and replaces non-alphanumerics with '_' so it is
@@ -404,6 +400,7 @@ func (c *Config) validateLimits() error {
 		{"perObjectTimeoutSec", c.PerObjectTimeoutSec}, {"staleTTLSec", c.StaleTTLSec},
 		{"pollEverySec", c.PollEverySec}, {"manifestEverySec", c.ManifestEverySec},
 		{"circuitCooldownSec", c.CircuitCooldownSec}, {"fanoutStallSec", c.FanoutStallSec},
+		{"dbTimeoutSec", c.DBTimeoutSec},
 	} {
 		if f.sec > maxSec {
 			return fmt.Errorf("%s (%d) exceeds the max %d", f.name, f.sec, maxSec)

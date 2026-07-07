@@ -22,7 +22,7 @@ func (hangingSource) FetchContent(ctx context.Context, _ BackupItem) (io.ReadClo
 // TestBackfillPerObjectTimeout: a hung object must fail via the per-object timeout and
 // the pass must continue — not stall the whole single-threaded backfill indefinitely.
 func TestBackfillPerObjectTimeout(t *testing.T) {
-	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: "h1"}, {ExternalID: "h2"}}}
+	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: hashOf("h1")}, {ExternalID: hashOf("h2")}}}
 	p := NewPipeline(hangingSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
 	// Run ctx is Background (un-cancelled) so ONLY the per-object timeout can end a hang.
 	st, err := NewBackfiller(corpus, p, 50*time.Millisecond, 4).Run(context.Background(), 0)
@@ -80,7 +80,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 // goneSource (backup_test.go) returns a WRAPPED ErrSourceGone, so this also confirms the
 // backfill switch matches via errors.Is, not ==.
 func TestBackfillSkipsSourceGone(t *testing.T) {
-	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: "gone1"}, {ExternalID: "gone2"}}}
+	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: hashOf("gone1")}, {ExternalID: hashOf("gone2")}}}
 	p := NewPipeline(goneSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
 	st, err := NewBackfiller(corpus, p, time.Minute, 4).Run(context.Background(), 0)
 	if err != nil {
