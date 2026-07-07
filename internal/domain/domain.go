@@ -48,5 +48,5 @@ type Sink interface {
 // neither has to fake the other's identifier.
 type Source interface {
 	// FetchContent streams the object's bytes for e.
-	FetchContent(ctx context.Context, e OutboxEntry) (io.ReadCloser, error)
+	FetchContent(ctx context.Context, e BackupItem) (io.ReadCloser, error)
 }

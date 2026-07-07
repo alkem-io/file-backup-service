@@ -137,13 +137,13 @@ func TargetNames(targets []Target) []string {
 // single-target outage doesn't march the corpus to dead-letter — reconcile refills the
 // gap when the target returns. A flaky target leaves the object not-done for retry while
 // never blocking the healthy ones.
-func (p *Pipeline) BackupOne(ctx context.Context, e OutboxEntry) (done, deferred bool, err error) {
+func (p *Pipeline) BackupOne(ctx context.Context, e BackupItem) (done, deferred bool, err error) {
 	return p.backupFrom(ctx, p.Source, e)
 }
 
 // backupFrom is BackupOne parameterized on the source, so reconcile can supply a
 // target-backed source per call without mutating shared Pipeline state.
-func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (done, deferred bool, err error) {
+func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem) (done, deferred bool, err error) {
 	// Dedup is per content-hash, NOT per outbox row: a fresh row (attempts=0) can
 	// reference an already-stored externalID (duplicate content, or a backfill/
 	// reconcile re-enqueue), so the StoredTargets read must run unconditionally —
@@ -334,7 +334,7 @@ func (e *eofReader) Read(p []byte) (int, error) {
 // nothing is committed anywhere. Returns per-target results and the VERIFIED byte
 // count (>=0 only when the full stream was read and hash-verified, else -1); a
 // non-nil error is a SOURCE failure (integrity mismatch or ctx cancellation).
-func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, targets []Target) ([]targetResult, int64, error) {
+func (p *Pipeline) fanOut(ctx context.Context, src Source, e BackupItem, targets []Target) ([]targetResult, int64, error) {
 	rc, err := src.FetchContent(ctx, e)
 	if err != nil {
 		return nil, -1, err

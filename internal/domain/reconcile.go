@@ -91,7 +91,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 	defer recoverFailed(&st.Failed)
 	ctx, cancel := context.WithTimeout(ctx, rc.perObjectT) // a hung source/sink fails this object, not the pass
 	defer cancel()
-	entry := OutboxEntry{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
+	entry := BackupItem{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
 	tried := false
 	var lastErr error // the last source's fetch/decode cause, surfaced if every source fails
 	for name := range stored {
@@ -149,7 +149,7 @@ type decodingSource struct {
 // FetchContent implements Source: decode the stored object to a temp file and serve it.
 // It keys on e.ExternalID (the content hash — the target is content-addressed), NOT
 // e.FileID, so reconcile no longer fakes a FileID.
-func (d decodingSource) FetchContent(ctx context.Context, e OutboxEntry) (io.ReadCloser, error) {
+func (d decodingSource) FetchContent(ctx context.Context, e BackupItem) (io.ReadCloser, error) {
 	externalID := e.ExternalID
 	tmp, err := os.CreateTemp(d.scratchDir, "reconcile-*.plain") // "" = OS temp dir
 	if err != nil {

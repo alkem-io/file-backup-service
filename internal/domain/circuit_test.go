@@ -45,7 +45,7 @@ func TestFanoutDropsHungTarget(t *testing.T) {
 	var ok, deferred bool
 	var berr error
 	go func() {
-		ok, deferred, berr = p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+		ok, deferred, berr = p.BackupOne(context.Background(), BackupItem{ExternalID: h})
 		close(done)
 	}()
 	select {
@@ -156,7 +156,7 @@ func TestFinalizeHangTripsCircuit(t *testing.T) {
 		data := bytes.Repeat([]byte("x"), 20+i) // distinct content per object
 		h, _ := sum(bytes.NewReader(data))
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_, _, _ = p.backupFrom(ctx, fakeSource{data}, OutboxEntry{ExternalID: h})
+		_, _, _ = p.backupFrom(ctx, fakeSource{data}, BackupItem{ExternalID: h})
 		cancel()
 	}
 	if !p.Circuit.Down("hung") {
@@ -180,7 +180,7 @@ func TestSingleTargetFinalizeHangTripsCircuit(t *testing.T) {
 		data := bytes.Repeat([]byte("y"), 20+i)
 		h, _ := sum(bytes.NewReader(data))
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		_, _, _ = p.backupFrom(ctx, fakeSource{data}, OutboxEntry{ExternalID: h})
+		_, _, _ = p.backupFrom(ctx, fakeSource{data}, BackupItem{ExternalID: h})
 		cancel()
 	}
 	if !p.Circuit.Down("solo") {
@@ -203,7 +203,7 @@ func TestBackupOneDefersOnDownTarget(t *testing.T) {
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: up, Codec: CodecNone}, {Sink: down, Codec: CodecNone}})
 	p.Circuit = NewCircuitBreaker(1, time.Minute) // threshold 1: "down" trips open on its first failure
 
-	done, deferred, err := p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	done, deferred, err := p.BackupOne(context.Background(), BackupItem{ExternalID: h})
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestBackupOneDefersOnDownTarget(t *testing.T) {
 		t.Fatal("the reachable target must still be stored")
 	}
 	// Second attempt: the object dedups on "up" and SKIPS the now-open "down" circuit → deferred again.
-	done, deferred, err = p.BackupOne(context.Background(), OutboxEntry{ExternalID: h})
+	done, deferred, err = p.BackupOne(context.Background(), BackupItem{ExternalID: h})
 	if err != nil || done || !deferred {
 		t.Fatalf("retry must defer while the target stays down: done=%v deferred=%v err=%v", done, deferred, err)
 	}

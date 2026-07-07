@@ -40,9 +40,9 @@ func recoverFailed(failed *int) {
 // SHOULD be backed up (the file-service `file` table). Backfill uses it to find + fill
 // the pre-existing objects the outbox never carried (those created before the service).
 type CorpusEnumerator interface {
-	// EachFile invokes fn once per corpus file (as an OutboxEntry); if fn returns an
+	// EachFile invokes fn once per corpus file (as a BackupItem); if fn returns an
 	// error, iteration stops and returns it.
-	EachFile(ctx context.Context, fn func(OutboxEntry) error) error
+	EachFile(ctx context.Context, fn func(BackupItem) error) error
 }
 
 // BackfillStats summarizes a backfill pass.
@@ -75,7 +75,7 @@ func (b *Backfiller) Run(ctx context.Context, ratePerSec int) (BackfillStats, er
 	var st BackfillStats
 	wait, stop := newPacer(ratePerSec)
 	defer stop()
-	err := b.corpus.EachFile(ctx, func(e OutboxEntry) error {
+	err := b.corpus.EachFile(ctx, func(e BackupItem) error {
 		if err := wait(ctx); err != nil {
 			return err
 		}
@@ -87,7 +87,7 @@ func (b *Backfiller) Run(ctx context.Context, ratePerSec int) (BackfillStats, er
 
 // backupOne backs up one corpus entry, contained by a recover so a single poison object
 // (e.g. a nil-slice panic on a shutdown-interrupted fetch) can't crash the whole pass.
-func (b *Backfiller) backupOne(ctx context.Context, e OutboxEntry, st *BackfillStats) {
+func (b *Backfiller) backupOne(ctx context.Context, e BackupItem, st *BackfillStats) {
 	defer recoverFailed(&st.Failed)
 	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
 	defer cancel()

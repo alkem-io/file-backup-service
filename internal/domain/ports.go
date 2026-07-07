@@ -7,15 +7,27 @@ import (
 	"github.com/google/uuid"
 )
 
-// OutboxEntry is a claimed backup-outbox row (Alkemio DB). Priority is not carried
-// into Go — ordering is done DB-side in the claim SQL.
-type OutboxEntry struct {
-	ID          int64
-	FileID      uuid.UUID     // native uuid (file.id) — pgx scans/encodes it directly
-	ExternalID  string        // content hash (SHA3-256), NOT a uuid
-	Size        int64         // object size (from the outbox) — recorded up front
+// BackupItem is the content-identity of one object to back up: everything the pipeline and
+// the Source need, and NOTHING outbox-specific. All three producers — a claimed outbox row, the
+// corpus `file` reader (backfill), and reconcile — build a BackupItem, and BackupOne consumes
+// it. Because it carries no outbox row ID, the pipeline CANNOT accidentally read an outbox-only
+// field that backfill/reconcile don't populate (which would silently be the zero value); the
+// "pipeline reads only content-identity" invariant is thus enforced by the type, not a comment.
+type BackupItem struct {
+	FileID      uuid.UUID     // file.id — the fileservice Source fetches bytes by it (uuid.Nil for reconcile, which keys on ExternalID)
+	ExternalID  string        // content hash (SHA3-256), NOT a uuid — the identity, key, and verifier
+	Size        int64         // object size (breadcrumb; unverified outbox hearsay until the stream is hashed)
 	CreatedBy   uuid.NullUUID // breadcrumb; Valid=false for a NULL createdBy
 	CreatedDate time.Time     // when the source object was created — breadcrumb
+}
+
+// OutboxEntry is a claimed backup-outbox row (Alkemio DB): a BackupItem plus the outbox-only
+// row ID the consumer needs for MarkDone/Fail/Defer/Skip. The pipeline takes the embedded
+// BackupItem, never the whole OutboxEntry, so it can't reach ID. Priority is not carried into
+// Go — ordering is done DB-side in the claim SQL.
+type OutboxEntry struct {
+	BackupItem
+	ID int64
 }
 
 // Outbox is the read/claim side of the backup outbox in the Alkemio DB, accessed

@@ -8,13 +8,13 @@ import (
 	"time"
 )
 
-type fakeCorpus struct{ entries []OutboxEntry }
+type fakeCorpus struct{ entries []BackupItem }
 
 // hangingSource blocks until its (per-object) ctx fires — models a fetch stalled after
 // headers / a wedged sink.
 type hangingSource struct{}
 
-func (hangingSource) FetchContent(ctx context.Context, _ OutboxEntry) (io.ReadCloser, error) {
+func (hangingSource) FetchContent(ctx context.Context, _ BackupItem) (io.ReadCloser, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -22,7 +22,7 @@ func (hangingSource) FetchContent(ctx context.Context, _ OutboxEntry) (io.ReadCl
 // TestBackfillPerObjectTimeout: a hung object must fail via the per-object timeout and
 // the pass must continue — not stall the whole single-threaded backfill indefinitely.
 func TestBackfillPerObjectTimeout(t *testing.T) {
-	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: "h1"}, {ExternalID: "h2"}}}
+	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: "h1"}, {ExternalID: "h2"}}}
 	p := NewPipeline(hangingSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
 	// Run ctx is Background (un-cancelled) so ONLY the per-object timeout can end a hang.
 	st, err := NewBackfiller(corpus, p, 50*time.Millisecond).Run(context.Background(), 0)
@@ -34,7 +34,7 @@ func TestBackfillPerObjectTimeout(t *testing.T) {
 	}
 }
 
-func (c fakeCorpus) EachFile(_ context.Context, fn func(OutboxEntry) error) error {
+func (c fakeCorpus) EachFile(_ context.Context, fn func(BackupItem) error) error {
 	for _, e := range c.entries {
 		if err := fn(e); err != nil {
 			return err
@@ -54,7 +54,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 	sink := newMemSink("t1")
 	led := newFakeLedger()
 	p := NewPipeline(fakeSource{data}, led, []Target{{Sink: sink, Codec: CodecNone}})
-	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: h}}}
+	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: h}}}
 
 	st, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestBackfillBacksUpCorpus(t *testing.T) {
 // goneSource (backup_test.go) returns a WRAPPED ErrSourceGone, so this also confirms the
 // backfill switch matches via errors.Is, not ==.
 func TestBackfillSkipsSourceGone(t *testing.T) {
-	corpus := fakeCorpus{entries: []OutboxEntry{{ExternalID: "gone1"}, {ExternalID: "gone2"}}}
+	corpus := fakeCorpus{entries: []BackupItem{{ExternalID: "gone1"}, {ExternalID: "gone2"}}}
 	p := NewPipeline(goneSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
 	st, err := NewBackfiller(corpus, p, time.Minute).Run(context.Background(), 0)
 	if err != nil {

@@ -33,16 +33,16 @@ func NewFileRepo(p *Pool) *FileRepo { return &FileRepo{p: p} }
 // snapshot on the SHARED production Alkemio DB for the whole (hours-to-days) pass,
 // holding back xmin and blocking autovacuum. Paging keeps each query short.
 // temporaryLocation IS NOT TRUE (not "= FALSE") so a NULL never silently drops a file.
-func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.OutboxEntry) error) error {
+func (r *FileRepo) EachFile(ctx context.Context, fn func(domain.BackupItem) error) error {
 	// uuid.Nil sorts first; no real file.id is nil (gen_random_uuid).
 	return domain.KeysetLoop(uuid.Nil, dbPageSize,
-		func(after uuid.UUID, limit int) ([]domain.OutboxEntry, error) { return r.filesPage(ctx, after, limit) },
-		func(e domain.OutboxEntry) uuid.UUID { return e.FileID },
+		func(after uuid.UUID, limit int) ([]domain.BackupItem, error) { return r.filesPage(ctx, after, limit) },
+		func(e domain.BackupItem) uuid.UUID { return e.FileID },
 		fn)
 }
 
 // filesPage returns one keyset page of non-temporary files after `after` (id order).
-func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([]domain.OutboxEntry, error) {
+func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([]domain.BackupItem, error) {
 	// Native uuid: id → FileID, createdBy → CreatedBy (pgx scans both directly). The `file`
 	// PK on id serves the id > $1 ORDER BY id keyset.
 	//
@@ -61,8 +61,8 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	if err != nil {
 		return nil, fmt.Errorf("files page: %w", err)
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.OutboxEntry, error) {
-		var e domain.OutboxEntry
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.BackupItem, error) {
+		var e domain.BackupItem
 		var createdDate pgtype.Timestamptz
 		if err := row.Scan(&e.FileID, &e.ExternalID, &e.CreatedBy, &createdDate, &e.Size); err != nil {
 			return e, err

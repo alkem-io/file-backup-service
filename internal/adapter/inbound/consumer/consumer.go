@@ -198,7 +198,7 @@ func (c *Consumer) process(ctx context.Context, e domain.OutboxEntry) {
 
 	objCtx, cancel := context.WithTimeout(ctx, c.d.PerObjectTimeout)
 	defer cancel()
-	ok, deferred, err := c.d.Pipeline.BackupOne(objCtx, e)
+	ok, deferred, err := c.d.Pipeline.BackupOne(objCtx, e.BackupItem) // pipeline gets the content-identity, not the outbox ID
 
 	// Bookkeeping MUST survive per-object-timeout and shutdown cancellation, or the
 	// row is stranded in_progress. Detach from the cancelled ctx with a fresh deadline.

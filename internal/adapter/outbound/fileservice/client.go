@@ -55,7 +55,7 @@ func New(baseURL string, maxIdleConns int, hc *http.Client) *Client {
 
 // FetchContent streams GET {base}/internal/file/{id}/content. The caller closes
 // the returned reader.
-func (c *Client) FetchContent(ctx context.Context, e domain.OutboxEntry) (io.ReadCloser, error) {
+func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.ReadCloser, error) {
 	reqURL := fmt.Sprintf("%s/internal/file/%s/content", c.baseURL, url.PathEscape(e.FileID.String()))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
@@ -87,7 +87,7 @@ func (c *Client) FetchContent(ctx context.Context, e domain.OutboxEntry) (io.Rea
 // PREFIX (that also 404s, indistinguishable from a missing object) — a mass
 // filebackup_source_gone_total spike surfaces that at runtime.
 func (c *Client) Preflight(ctx context.Context) error {
-	rc, err := c.FetchContent(ctx, domain.OutboxEntry{FileID: uuid.Nil})
+	rc, err := c.FetchContent(ctx, domain.BackupItem{FileID: uuid.Nil})
 	switch {
 	case err == nil:
 		_ = rc.Close()
