@@ -11,11 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// dbPageSize is the keyset page size for the connection-releasing corpus/gap sweeps
-// (backfill EachFile, reconcile TargetGaps) so a slow per-object consumer never pins a
-// pool connection for the whole pass. The paging loop itself is domain.KeysetLoop.
-const dbPageSize = 1000
-
 // nullTime maps a scanned nullable TIMESTAMPTZ to a time.Time (zero when SQL NULL) — one
 // owner for the pgtype→domain breadcrumb mapping shared by the ledger + corpus readers.
 func nullTime(t pgtype.Timestamptz) time.Time {

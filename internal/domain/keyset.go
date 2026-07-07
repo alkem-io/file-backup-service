@@ -1,5 +1,11 @@
 package domain
 
+// KeysetPageSize is the ONE page size for every connection-releasing keyset sweep — the db
+// adapter's corpus/gap sweeps (backfill EachFile, reconcile TargetGaps) AND the domain's
+// manifest + audit sweeps. Paged (not a held cursor) so a slow per-item consumer never pins a
+// pool connection for the whole pass; 1000 balances round-trips against per-page memory.
+const KeysetPageSize = 1000
+
 // KeysetLoop drives a keyset-paginated sweep: fetch pages via pageFn(after, pageSize) until
 // a SHORT page (the last), invoking fn per item; cursorOf extracts the next `after` from the
 // last item of a full page. It is the ONE owner of the after-cursor + short-page-stops loop,

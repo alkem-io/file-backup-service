@@ -20,11 +20,14 @@ type manifestLine struct {
 	SourceCreatedDate *time.Time `json:"sourceCreatedDate,omitempty"`
 }
 
-// ManifestName is the object name for a snapshot taken at t: <UTC-timestamp>.jsonl. A
-// full timestamp (not just the date) keeps each run's key unique so an object-lock/WORM
-// target can't reject the write as an overwrite, and DR tooling picks the newest.
+// ManifestName is the object name for a snapshot taken at t: <UTC-timestamp>.jsonl, with
+// NANOSECOND precision so two runs in the same wall-clock second (a scheduled snapshot
+// overlapping a manual drill, or two serve instances) get DISTINCT keys and DR tooling picks
+// the newest. An immutable/WORM target rejects a PutObject that would overwrite a retained
+// object, so a colliding key would fail the second run's write; two independent time.Now()
+// reads never share a nanosecond.
 func ManifestName(t time.Time) string {
-	return t.UTC().Format("2006-01-02T150405Z") + ".jsonl"
+	return t.UTC().Format("2006-01-02T150405.000000000Z") + ".jsonl"
 }
 
 // WriteManifests writes each target's OWN inventory as a JSONL snapshot to its
@@ -70,15 +73,12 @@ func writeManifest(ctx context.Context, led Ledger, sink Sink, name string) erro
 	return err
 }
 
-// storedPageSize is the keyset page size for the manifest + audit sweeps.
-const storedPageSize = 1000
-
 // eachStoredObject pages through every object stored on target (Ledger.StoredObjectsPage)
 // and invokes fn per object. Paging releases the ledger connection between pages, so a
 // slow fn — a manifest's pipe write blocked on a slow upload — doesn't pin a pool
 // connection for the whole sweep (the connection is held only for each fast page query).
 func eachStoredObject(ctx context.Context, led Ledger, target string, fn func(ObjectMeta) error) error {
-	return KeysetLoop("", storedPageSize,
+	return KeysetLoop("", KeysetPageSize,
 		func(after string, limit int) ([]ObjectMeta, error) {
 			return led.StoredObjectsPage(ctx, target, after, limit)
 		},

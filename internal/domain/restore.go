@@ -207,14 +207,14 @@ func decodeZstd(r io.Reader, hash string, dst io.Writer) error {
 	// COMPRESSED input — an incompressible near-cap object stores as raw zstd blocks
 	// slightly LARGER than its plaintext, and an input cap would truncate its frame and
 	// make it (falsely) unrestorable.
-	zr, err := newZstdDecoder(tr)
+	zr, err := getZstdDecoder(tr)
 	if err != nil {
 		if tr.err != nil && !errors.Is(tr.err, io.EOF) {
 			return fmt.Errorf("zstd source read: %w", tr.err) // the header read itself failed — I/O, not "not zstd"
 		}
 		return errTryRaw
 	}
-	defer zr.Close()
+	defer putZstdDecoder(zr)
 	// Cap the DECODED output (bomb protection); a tiny zstd frame can expand to PB.
 	// An over-cap decode returns errTryRaw so decodeStream falls back to decodeRaw —
 	// which is ITSELF bounded at maxObjectBytes, so the fallback is inherently bomb-safe:

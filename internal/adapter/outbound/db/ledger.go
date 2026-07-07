@@ -61,7 +61,7 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 // audit), keyset-paginated by externalID (the connection is released when the page returns).
 func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]domain.ObjectMeta, error) {
 	rows, err := r.q.StoredObjectsPage(ctx, queries.StoredObjectsPageParams{
-		Target: target, After: after, PageLimit: int32(limit), //nolint:gosec // limit is dbPageSize (1000)
+		Target: target, After: after, PageLimit: int32(limit), //nolint:gosec // limit is domain.KeysetPageSize (1000)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("stored objects page: %w", err)
@@ -83,7 +83,7 @@ func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string
 // externalID (domain.KeysetLoop), releasing the ledger connection between pages so the
 // per-object repair inside fn doesn't pin a connection + open snapshot for the whole pass.
 func (r *LedgerRepo) TargetGaps(ctx context.Context, allTargets []string, fn func(string, map[string]bool) error) error {
-	return domain.KeysetLoop("", dbPageSize,
+	return domain.KeysetLoop("", domain.KeysetPageSize,
 		func(after string, limit int) ([]targetGap, error) {
 			return r.targetGapsPage(ctx, allTargets, after, limit)
 		},
@@ -102,7 +102,7 @@ func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, af
 		Targets:     allTargets,
 		After:       after,
 		TargetCount: int32(len(allTargets)), //nolint:gosec // configured target count, small
-		PageLimit:   int32(limit),           //nolint:gosec // limit is dbPageSize (1000)
+		PageLimit:   int32(limit),           //nolint:gosec // limit is domain.KeysetPageSize (1000)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("target gaps page: %w", err)

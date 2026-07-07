@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // auditConcurrency bounds the parallel Exists probes per page (each is an independent
@@ -151,7 +152,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 		if err := ctx.Err(); err != nil { // a cancelled audit must error, not read as a clean pass
 			return ta, err
 		}
-		limit := storedPageSize
+		limit := KeysetPageSize
 		if samplePerTarget > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
 			remaining := samplePerTarget - ta.Checked
 			if remaining <= 0 {
@@ -200,10 +201,8 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 // (the wrapped pass must not re-check objects already covered in pass 1), and whether it
 // trimmed (reached the boundary).
 func trimAtBoundary(page []ObjectMeta, boundary string) ([]ObjectMeta, bool) {
-	for i := range page {
-		if page[i].ExternalID >= boundary {
-			return page[:i], true
-		}
+	if i := slices.IndexFunc(page, func(m ObjectMeta) bool { return m.ExternalID >= boundary }); i >= 0 {
+		return page[:i], true
 	}
 	return page, false
 }

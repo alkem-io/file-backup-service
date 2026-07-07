@@ -14,11 +14,16 @@ import (
 // field that backfill/reconcile don't populate (which would silently be the zero value); the
 // "pipeline reads only content-identity" invariant is thus enforced by the type, not a comment.
 type BackupItem struct {
-	FileID      uuid.UUID     // file.id — the fileservice Source fetches bytes by it (uuid.Nil for reconcile, which keys on ExternalID)
-	ExternalID  string        // content hash (SHA3-256), NOT a uuid — the identity, key, and verifier
-	Size        int64         // object size (breadcrumb; unverified outbox hearsay until the stream is hashed)
-	CreatedBy   uuid.NullUUID // breadcrumb; Valid=false for a NULL createdBy
-	CreatedDate time.Time     // when the source object was created — breadcrumb
+	FileID     uuid.UUID     // file.id — the fileservice Source fetches bytes by it (uuid.Nil for reconcile, which keys on ExternalID)
+	ExternalID string        // content hash (SHA3-256), NOT a uuid — the identity, key, and verifier
+	Size       int64         // object size (breadcrumb; unverified outbox hearsay until the stream is hashed)
+	CreatedBy  uuid.NullUUID // breadcrumb; Valid=false for a NULL createdBy
+	// CreatedDate is a BEST-EFFORT source-age breadcrumb, not load-bearing: the backfill path
+	// reads file.createdDate (true source creation), but the serve path carries the OUTBOX
+	// createdDate, which is ENQUEUE time (≈ creation for a new file, but the replace/re-enqueue
+	// time for an updated one). The outbox's enqueue-time semantics are what BacklogStats needs
+	// for the RPO lag gauge; this breadcrumb just rides along.
+	CreatedDate time.Time
 }
 
 // OutboxEntry is a claimed backup-outbox row (Alkemio DB): a BackupItem plus the outbox-only

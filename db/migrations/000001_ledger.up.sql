@@ -12,7 +12,7 @@ CREATE TABLE file_backup_object (
 CREATE TABLE file_backup_target_status (
     "externalID"  VARCHAR(128) NOT NULL REFERENCES file_backup_object("externalID"),
     target        VARCHAR(64)  NOT NULL,
-    state         VARCHAR(16)  NOT NULL,                   -- stored | failed
+    state         VARCHAR(16)  NOT NULL CHECK (state IN ('stored','failed')), -- domain.State{Stored,Failed}; the CHECK stops a typo'd/mis-cased value that every query's state='stored' filter would silently make invisible (perpetual under-replication)
     "storedBytes" BIGINT,
     "verifiedAt"  TIMESTAMPTZ,
     PRIMARY KEY ("externalID", target)

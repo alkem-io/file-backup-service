@@ -34,12 +34,39 @@ func ParseCodec(s string) (Codec, error) {
 	}
 }
 
-// newZstdDecoder builds the single-goroutine zstd decoder used by BOTH decode paths
-// (restore + reconcile) — one owner for the concurrency cap (WithDecoderConcurrency(1)
-// avoids the per-core block-decoder allocation). The DECODED-output bomb bound is
-// applied by each caller (copyVerify's limit in restore, a LimitReader in reconcile).
-func newZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
-	return zstd.NewReader(r, zstd.WithDecoderConcurrency(1))
+// zstdDecoderPool reuses single-goroutine zstd decoders across objects — like the encoder
+// pool below, a fresh zstd.NewReader per object allocates block-decoder state, which a
+// reconcile over a large zstd-stored corpus (one decode per object) would churn + GC. The
+// decoder is Reset(r) per use and Reset(nil)'d back to the pool. WithDecoderConcurrency(1)
+// avoids the per-core block-decoder allocation.
+var zstdDecoderPool = sync.Pool{
+	New: func() any {
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		if err != nil { // a fixed valid option set — an error here is a build-time bug
+			panic(fmt.Sprintf("zstd decoder: %v", err))
+		}
+		return dec
+	},
+}
+
+// getZstdDecoder returns a pooled single-goroutine decoder Reset to read r — used by BOTH
+// decode paths (restore + reconcile). Release it with putZstdDecoder after use (do NOT Close a
+// pooled decoder — Close permanently frees it). The DECODED-output bomb bound is applied by each
+// caller (copyVerify's limit). A Reset error (rare — a decoder in a bad state) drops the decoder.
+func getZstdDecoder(r io.Reader) (*zstd.Decoder, error) {
+	dec := zstdDecoderPool.Get().(*zstd.Decoder)
+	if err := dec.Reset(r); err != nil {
+		return nil, err // don't return a bad-state decoder to the pool
+	}
+	return dec, nil
+}
+
+// putZstdDecoder releases dec's reader reference (Reset(nil)) and returns it to the pool for
+// reuse. Reset recovers the decoder even after a mid-stream decode error (the normal
+// decode→reset→decode cycle), so a "not zstd" fallback decoder is still reusable.
+func putZstdDecoder(dec *zstd.Decoder) {
+	_ = dec.Reset(nil) // Reset(nil) only drops the reader reference; it cannot fail
+	zstdDecoderPool.Put(dec)
 }
 
 // zstdEncoderPool reuses single-goroutine zstd encoders across objects — each
