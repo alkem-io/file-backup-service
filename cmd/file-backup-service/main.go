@@ -184,7 +184,7 @@ func serve(cfgPath string) error {
 	bgWG.Add(3)
 	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, targets, breaker, mx) }()
 	go func() { defer bgWG.Done(); sampleCoverage(ctx, ledger, targets, mx) }()
-	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger) }()
+	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger, mx) }()
 	defer bgWG.Wait()
 
 	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
@@ -289,9 +289,35 @@ func runReconcile(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	st, err := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout(), cfg.ScratchDir).Run(ctx, *ratePerSec)
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return fmt.Errorf("logger: %w", err)
+	}
+	defer func() { _ = logger.Sync() }()
+	// A decoded object is staged to scratchDir (up to the object-size cap) before re-fan-out;
+	// a missing/read-only path must fail LOUD at startup, not per-object mid-repair.
+	if err := preflightScratch(cfg.ScratchDir, logger); err != nil {
+		return err
+	}
+	// Same hung-target isolation as serve: a black-holing destination target is stall-dropped
+	// (not left to wedge every repair for the full perObjectTimeout) and circuit-tripped after
+	// repeated failures so the pass stops hammering it.
+	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
+	rec := domain.NewReconciler(ledger, targets, cfg.PerObjectTimeout(), cfg.ScratchDir, cfg.FanoutStall(), breaker).
+		OnError(func(id string, e error) {
+			logger.Warn("reconcile repair failed", zap.String("externalID", id), zap.Error(e))
+		})
+	st, err := rec.Run(ctx, *ratePerSec)
 	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d\n", st.Repaired, st.Skipped, st.Failed)
-	return err
+	if err != nil {
+		return err // sweep error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
+	}
+	// A COMPLETED pass that left objects unrepaired must exit nonzero so a cron/CI backstop
+	// alerts — a silent exit 0 on an all-failed reconcile hides persistent under-replication.
+	if st.Failed > 0 {
+		return fmt.Errorf("reconcile left %d object(s) unrepaired (still under-replicated)", st.Failed)
+	}
+	return nil
 }
 
 // runBackfill backs up the pre-existing corpus (US2/T022): it enumerates the
@@ -349,9 +375,42 @@ func runBackfill(args []string) error {
 		return err
 	}
 
-	st, err := domain.NewBackfiller(files, domain.NewPipeline(fsClient, ledger, targets), cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
+	// Same hung-target isolation as serve (stall-drop + circuit) — a bare pipeline would let a
+	// black-holing target wedge every object for the full perObjectTimeout, invisibly.
+	breaker := domain.NewCircuitBreaker(cfg.CircuitThreshold, cfg.CircuitCooldown())
+	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
+	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout()).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d failed=%d\n", st.Backed, st.Failed)
-	return err
+	if err != nil {
+		return err // sweep/DB error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
+	}
+	// A COMPLETED pass that couldn't fully back up every object exits nonzero so an operator
+	// scripting `backfill && next-step` doesn't proceed as if the corpus were fully protected.
+	if st.Failed > 0 {
+		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
+	}
+	return nil
+}
+
+// preflightScratch fails loud at reconcile startup if the scratch dir can't be written —
+// reconcile stages each decoded object there (up to the object-size cap) before re-fan-out,
+// so a missing/read-only mount would otherwise fail EVERY repair mid-pass with only a
+// "failed=N" count. An empty dir uses the OS temp dir; warn, because a memory-backed /tmp
+// (a tmpfs emptyDir) stages the full object into RAM and can OOM the pod on a large object —
+// scratchDir should be a disk-backed volume sized for the largest object.
+func preflightScratch(dir string, logger *zap.Logger) error {
+	if dir == "" {
+		logger.Warn("scratchDir unset: staging decoded objects under the OS temp dir — set scratchDir to a disk-backed volume sized for the largest object, else a tmpfs /tmp can OOM the pod",
+			zap.String("osTempDir", os.TempDir()))
+	}
+	f, err := os.CreateTemp(dir, "reconcile-preflight-*")
+	if err != nil {
+		return fmt.Errorf("scratchDir not writable (set scratchDir to a writable, disk-backed path): %w", err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
 }
 
 // randHex returns a random externalID-shaped hex string — a rotating keyset start so a
@@ -509,12 +568,15 @@ func sampleCoverage(ctx context.Context, ledger *db.LedgerRepo, targets []domain
 // manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),
 // starting immediately. Best-effort: a failed snapshot is logged, not fatal (a target's
 // manifest is a DR convenience, not the backup itself).
-func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, every time.Duration, logger *zap.Logger) {
+func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, every time.Duration, logger *zap.Logger, mx *metrics.Metrics) {
 	everyTick(ctx, every, 30*time.Minute, func(fctx context.Context) {
 		if err := domain.WriteManifests(fctx, ledger, targets, domain.ManifestName(time.Now())); err != nil && ctx.Err() == nil {
+			// Metric + log: a persistently failing manifest write silently defeats a target's
+			// standalone restorability while every per-object gauge stays green (FR-015).
+			mx.ManifestError()
 			logger.Warn("manifest snapshot", zap.Error(err))
 		}
-	}, func(r any) { logger.Warn("manifest snapshot panicked", zap.Any("panic", r)) })
+	}, func(r any) { mx.ManifestError(); logger.Warn("manifest snapshot panicked", zap.Any("panic", r)) })
 }
 
 type startCheck struct {

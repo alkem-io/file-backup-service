@@ -231,7 +231,8 @@ func (c *Config) applyTargetEnv() error {
 		errs = append(errs,
 			setBool(&c.Targets[i].UseSSL, p+"USESSL"),
 			setBool(&c.Targets[i].SSE, p+"SSE"),
-			setBool(&c.Targets[i].Insecure, p+"INSECURE"))
+			setBool(&c.Targets[i].Insecure, p+"INSECURE"),
+			setBool(&c.Targets[i].Worm, p+"WORM")) // structural: audit reads it — must be env-overridable like the rest
 	}
 	return errors.Join(errs...)
 }
@@ -430,12 +431,26 @@ func (c *Config) validateLimits() error {
 	if c.MaxDeliveries > 1000 {
 		return fmt.Errorf("maxDeliveries (%d) exceeds 1000", c.MaxDeliveries)
 	}
+	// CircuitThreshold feeds window = 2*threshold in NewCircuitBreaker; cap it so (a) the
+	// per-target `recent []bool` can't be sized into GBs and (b) 2*threshold can't overflow
+	// to a NEGATIVE window (a value > MaxInt/2), which would panic the breaker's slice reslice
+	// on the FIRST outcome and — via the consumer's recover — march every object to dead-letter
+	// while /health stays green. 10000 is far above any sane failure count to trip on.
+	if c.CircuitThreshold > 10000 {
+		return fmt.Errorf("circuitThreshold (%d) exceeds 10000", c.CircuitThreshold)
+	}
 	return nil
 }
 
 func validateTarget(i int, t Target, seen map[string]string) error {
 	if t.Name == "" {
 		return fmt.Errorf("target[%d]: name is required", i)
+	}
+	// The ledger's file_backup_target_status.target is VARCHAR(64); reject an over-long name
+	// at config time, else every RecordBackup INSERT for it fails at runtime ("value too long
+	// for type character varying(64)") → all its objects retry → dead-letter.
+	if len(t.Name) > 64 {
+		return fmt.Errorf("target %q: name exceeds 64 chars (ledger target column is VARCHAR(64))", t.Name)
 	}
 	// Dedup on the env-var token, not just the raw name: two distinct names that
 	// collapse to the same FBS_TARGET_<TOKEN>_* prefix (e.g. "s3-eu" / "s3_eu") would

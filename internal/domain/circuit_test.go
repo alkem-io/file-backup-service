@@ -141,8 +141,9 @@ func (h *finalizeHangSink) Store(ctx context.Context, _ string, r io.Reader) (in
 }
 
 // TestFinalizeHangTripsCircuit: a target that hangs on FINALIZE (post-stream) is caught by
-// the per-object timeout on the aborted path; because a sibling stored (anyStored), its
-// failure folds into the circuit and it trips — instead of never tripping and dead-lettering.
+// the per-object timeout on the aborted path; because the stream was fully read + verified
+// (streamVerified), its failure folds into the circuit and it trips — instead of never
+// tripping and dead-lettering.
 func TestFinalizeHangTripsCircuit(t *testing.T) {
 	up := newMemSink("up")
 	hung := &finalizeHangSink{stubSink: stubSink{name: "hung"}, release: make(chan struct{})}
@@ -159,7 +160,31 @@ func TestFinalizeHangTripsCircuit(t *testing.T) {
 		cancel()
 	}
 	if !p.Circuit.Down("hung") {
-		t.Fatal("a finalize-hung target must trip its circuit (via the timeout+anyStored fold), not dead-letter forever")
+		t.Fatal("a finalize-hung target must trip its circuit (via the timeout+streamVerified fold), not dead-letter forever")
+	}
+}
+
+// TestSingleTargetFinalizeHangTripsCircuit: the SOLE target hangs on finalize — no sibling
+// ever stores, so the old anyStored signal would never fold the failure and the circuit
+// would never trip, abandoning an fd+.partial-holding goroutine per object UNBOUNDED over
+// the outage. streamVerified (the stream was fully read + verified regardless of how many
+// targets stored) must still trip it, bounding the leak to ~threshold objects.
+func TestSingleTargetFinalizeHangTripsCircuit(t *testing.T) {
+	hung := &finalizeHangSink{stubSink: stubSink{name: "solo"}, release: make(chan struct{})}
+	defer close(hung.release)
+	led := newFakeLedger()
+	p := NewPipeline(nil, led, []Target{{Sink: hung, Codec: CodecNone}})
+	p.Circuit = NewCircuitBreaker(3, time.Minute)
+
+	for i := 0; i < 6 && !p.Circuit.Down("solo"); i++ {
+		data := bytes.Repeat([]byte("y"), 20+i)
+		h, _ := sum(bytes.NewReader(data))
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, _, _ = p.backupFrom(ctx, fakeSource{data}, OutboxEntry{ExternalID: h})
+		cancel()
+	}
+	if !p.Circuit.Down("solo") {
+		t.Fatal("a single finalize-hung target (no sibling) must still trip via streamVerified, else the abandoned-goroutine leak is unbounded")
 	}
 }
 

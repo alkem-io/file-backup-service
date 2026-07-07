@@ -16,12 +16,13 @@ import (
 
 // Metrics holds the Prometheus collectors.
 type Metrics struct {
-	reg        *prometheus.Registry
-	objects    *prometheus.CounterVec
-	bytes      *prometheus.CounterVec
-	deadletter prometheus.Counter
-	timeout    prometheus.Counter
-	sourceGone prometheus.Counter
+	reg         *prometheus.Registry
+	objects     *prometheus.CounterVec
+	bytes       *prometheus.CounterVec
+	deadletter  prometheus.Counter
+	timeout     prometheus.Counter
+	sourceGone  prometheus.Counter
+	manifestErr prometheus.Counter
 	// RPO/lag gauges — the alerting spine (FR-026/SC-001). Set periodically by the
 	// serve sampler, not on the per-object path.
 	backlogPending   prometheus.Gauge
@@ -60,6 +61,10 @@ func New() *Metrics {
 		sourceGone: f.NewCounter(prometheus.CounterOpts{
 			Name: "filebackup_source_gone_total",
 			Help: "Entries skipped because the source object was absent (404/410) — a mass spike means a wrong fileServiceBase, not benign deletions.",
+		}),
+		manifestErr: f.NewCounter(prometheus.CounterOpts{
+			Name: "filebackup_manifest_write_errors_total",
+			Help: "Failed periodic manifest-snapshot writes (per pass, any target) — alert on rate>0: a persistently failing manifest defeats a target's STANDALONE restorability (FR-015) while every per-object gauge stays green.",
 		}),
 		backlogPending: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_outbox_pending", Help: "Outbox entries awaiting backup (backlog depth).",
@@ -157,6 +162,10 @@ func (m *Metrics) ObjectTimeout() { m.timeout.Inc() }
 
 // SourceGone records an entry skipped because its source object was absent.
 func (m *Metrics) SourceGone() { m.sourceGone.Inc() }
+
+// ManifestError records a failed manifest-snapshot pass so a target silently losing its
+// standalone-restore inventory is alertable, not just a log line.
+func (m *Metrics) ManifestError() { m.manifestErr.Inc() }
 
 // Handler returns the Prometheus HTTP handler.
 func (m *Metrics) Handler() http.Handler {

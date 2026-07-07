@@ -78,6 +78,19 @@ func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, Metrics: Nop{}}
 }
 
+// WithIsolation gives a pipeline the same per-target hung-target isolation serve uses: a
+// stall-drop (drop a target not draining a fan-out chunk within stall, BEFORE the object
+// timeout) and a circuit breaker (skip a persistently-down target). The batch/DR paths
+// (backfill, reconcile) MUST set these too — a bare pipeline has StallTimeout=0 (no drop)
+// and Circuit=nil, so a black-holing target wedges every object for the full per-object
+// timeout with no isolation. stall<=0 / circuit==nil leave the respective mechanism off
+// (the in-memory-sink tests). Returns p for fluent construction.
+func (p *Pipeline) WithIsolation(stall time.Duration, circuit *CircuitBreaker) *Pipeline {
+	p.StallTimeout = stall
+	p.Circuit = circuit
+	return p
+}
+
 // RunParallel runs run(item) for every item CONCURRENTLY, each guarded by a recover that
 // converts a panic into an error labelled by label(item) — so one item's driver panic
 // fails just that item, never the process (a recover only catches its own goroutine). The
@@ -160,7 +173,7 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e OutboxEntry) (d
 		return false, false, ferr
 	}
 
-	if shouldRecordCircuit(ctx, aborted, results) {
+	if shouldRecordCircuit(ctx, aborted, verified >= 0) {
 		p.recordCircuit(pending, results)
 	}
 
@@ -228,29 +241,24 @@ func (p *Pipeline) pendingTargets(stored map[string]bool) (pending []Target, ski
 
 // shouldRecordCircuit decides whether to fold per-target results into the circuit breaker.
 // Fold on the clean path (each target's outcome is its own), OR on a per-object TIMEOUT
-// where at least one target durably STORED. The stall-drop handles a mid-STREAM hang, but a
-// FINALIZATION hang (a target that drained + verified the stream, then hangs on S3
-// CompleteMultipartUpload / fsync+rename) reaches the aborted path with siblings already
-// stored — anyStored proves it's a target-SPECIFIC hang, not a shared-barrier stall where
-// NOTHING stored (there, folding would trip healthy targets in lockstep). Without this a
-// finalize-hung target never trips → its objects FAIL not DEFER → dead-letter (the T017a mode).
-func shouldRecordCircuit(ctx context.Context, aborted bool, results []targetResult) bool {
+// where the source stream was fully read + hash-VERIFIED (streamVerified). The stall-drop
+// handles a mid-STREAM hang; a FINALIZATION hang (a target that drained + verified the
+// stream, then hangs on S3 CompleteMultipartUpload / fsync+rename) reaches the aborted path
+// with the copy already complete. streamVerified (fanOut returns verified size >=0 only when
+// copyErr==nil, i.e. the whole stream was delivered to every pipe and VerifyReader confirmed
+// the hash) proves it's a target-SPECIFIC finalize hang, NOT a shared-barrier stall — in a
+// barrier stall the copy blocks on the hung target so copyErr is the ctx deadline (verified
+// = -1), and folding would trip healthy targets in lockstep. Unlike the old anyStored signal
+// this also holds for a SINGLE-target deployment (or an all-targets-finalize-hang), where no
+// sibling stored: streamVerified is true regardless of how many targets stored, so a
+// finalize-hung sole target now trips (bounding storeWithCtx's abandoned-goroutine leak to
+// ~threshold objects, after which the object DEFERS) instead of never tripping and leaking
+// an fd + .partial per object over the whole outage.
+func shouldRecordCircuit(ctx context.Context, aborted, streamVerified bool) bool {
 	if !aborted {
 		return true
 	}
-	return errors.Is(ctx.Err(), context.DeadlineExceeded) && anyStored(results)
-}
-
-// anyStored reports whether at least one target durably stored — proof the stream
-// completed, so a concurrent abort is a target-specific finalization hang (some stored)
-// rather than a shared-barrier stall (nothing stored).
-func anyStored(results []targetResult) bool {
-	for i := range results {
-		if results[i].err == nil {
-			return true
-		}
-	}
-	return false
+	return errors.Is(ctx.Err(), context.DeadlineExceeded) && streamVerified
 }
 
 // recordCircuit folds each fanned target's Store result into the circuit breaker.
@@ -386,8 +394,20 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e OutboxEntry, target
 	}
 	fw := newFanoutWriter(writers, drop, p.StallTimeout)
 	// copyErr is a SOURCE failure: a VerifyReader hash mismatch (corrupt source) or
-	// ctx cancellation/timeout during the read.
-	copyErr := fanoutCopy(fw, vr)
+	// ctx cancellation/timeout during the read. Recover a PANIC in the source read (vr.Read
+	// on a wrapped/custom reader) here — like every other concurrent driver — and convert it
+	// to copyErr, so the teardown below (fw.close + pw.CloseWithError + wg.Wait) always runs.
+	// Without this, a panic would unwind past the teardown and permanently leak the pump +
+	// store goroutines (parked on an unclosed pipe/channel), masked by the caller's recover.
+	var copyErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				copyErr = PanicErr("fanout source", r)
+			}
+		}()
+		copyErr = fanoutCopy(fw, vr)
+	}()
 	fw.close() // stop the pump goroutines before closing the pipes
 	for _, pw := range writers {
 		_ = pw.CloseWithError(copyErr)

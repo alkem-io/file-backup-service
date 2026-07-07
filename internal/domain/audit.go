@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 )
 
 // auditConcurrency bounds the parallel Exists probes per page (each is an independent
@@ -67,16 +66,20 @@ func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget in
 	// distinct indices (config order preserved); a cancelled sweep on any target surfaces
 	// its error via errors.Join.
 	rep := AuditReport{Targets: make([]TargetAudit, len(targets))}
-	errs := make([]error, len(targets))
-	var wg sync.WaitGroup
-	for i, t := range targets {
-		wg.Add(1)
-		go func(i int, t Target) {
-			defer wg.Done()
-			rep.Targets[i], errs[i] = auditTarget(ctx, led, t, samplePerTarget, startAfter)
-		}(i, t)
+	// RunParallel (not a bare WaitGroup) so a panic in one target's auditTarget — e.g. a pgx
+	// scan on a drifted ledger column — becomes that target's error instead of crashing the
+	// audit process; every other concurrent sweep here is recover-guarded, this must be too.
+	idxs := make([]int, len(targets))
+	for i := range idxs {
+		idxs[i] = i
 	}
-	wg.Wait()
+	errs := RunParallel(idxs,
+		func(i int) string { return "audit " + targets[i].Sink.Name() },
+		func(i int) error {
+			var err error
+			rep.Targets[i], err = auditTarget(ctx, led, targets[i], samplePerTarget, startAfter)
+			return err
+		})
 	return rep, errors.Join(errs...)
 }
 

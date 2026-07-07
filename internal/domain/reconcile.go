@@ -21,17 +21,38 @@ type Reconciler struct {
 	byName     map[string]Target
 	perObjectT time.Duration // bounds one object's repair (a hung source/sink), like serve
 	scratchDir string        // where decodingSource stages a decoded object ("" = OS temp dir)
+	stall      time.Duration // fan-out stall-drop (hung DESTINATION target), like serve
+	circuit    *CircuitBreaker
+	onError    func(externalID string, err error) // per-object failure sink (logging); nil = silent
+}
+
+// OnError registers a callback invoked with the cause each time an object can't be repaired,
+// so a DR run surfaces a SYSTEMIC failure (an unwritable scratchDir, a decode bug) that the
+// failed COUNT alone hides — the consumer logs every backup failure; the repair path must too.
+func (rc *Reconciler) OnError(fn func(externalID string, err error)) *Reconciler {
+	rc.onError = fn
+	return rc
+}
+
+// reportErr invokes the failure callback if set.
+func (rc *Reconciler) reportErr(externalID string, err error) {
+	if rc.onError != nil && err != nil {
+		rc.onError(externalID, err)
+	}
 }
 
 // NewReconciler binds a Reconciler to the ledger and target set; perObjectTimeout bounds
 // one object's repair so a hung fetch/sink can't stall the whole single-threaded pass,
 // and scratchDir ("" = OS temp) is where a decoded object is staged before re-fan-out.
-func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration, scratchDir string) *Reconciler {
+// stall + circuit give the repair fan-out the SAME hung-target isolation as serve (a black-
+// holing destination target is dropped at stall / skipped once its circuit trips, instead
+// of wedging every repair for the full perObjectTimeout); pass 0/nil to disable (tests).
+func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration, scratchDir string, stall time.Duration, circuit *CircuitBreaker) *Reconciler {
 	byName := make(map[string]Target, len(targets))
 	for _, t := range targets {
 		byName[t.Sink.Name()] = t
 	}
-	return &Reconciler{ledger: led, targets: targets, byName: byName, perObjectT: perObjectTimeout, scratchDir: scratchDir}
+	return &Reconciler{ledger: led, targets: targets, byName: byName, perObjectT: perObjectTimeout, scratchDir: scratchDir, stall: stall, circuit: circuit}
 }
 
 // ReconcileStats reports one reconcile pass.
@@ -49,7 +70,7 @@ func (rc *Reconciler) Run(ctx context.Context, ratePerSec int) (ReconcileStats, 
 	wait, stop := newPacer(ratePerSec)
 	defer stop()
 	names := TargetNames(rc.targets)
-	p := NewPipeline(nil, rc.ledger, rc.targets)
+	p := NewPipeline(nil, rc.ledger, rc.targets).WithIsolation(rc.stall, rc.circuit)
 	err := rc.ledger.TargetGaps(ctx, names, func(externalID string, stored map[string]bool) error {
 		if err := wait(ctx); err != nil {
 			return err
@@ -72,6 +93,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 	defer cancel()
 	entry := OutboxEntry{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
 	tried := false
+	var lastErr error // the last source's fetch/decode cause, surfaced if every source fails
 	for name := range stored {
 		src, ok := rc.byName[name]
 		if !ok {
@@ -89,9 +111,11 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 				st.Repaired++
 			} else {
 				st.Failed++
+				rc.reportErr(externalID, fmt.Errorf("repaired source but a destination target is still unwritable"))
 			}
 			return
 		}
+		lastErr = err
 		if ctx.Err() != nil {
 			st.Failed++ // shutdown mid-repair
 			return
@@ -103,6 +127,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 		return
 	}
 	st.Failed++ // every source failed to fetch
+	rc.reportErr(externalID, fmt.Errorf("every source failed to fetch/decode: %w", lastErr))
 }
 
 // decodingSource adapts a backup target into a pipeline Source: it decodes the stored
