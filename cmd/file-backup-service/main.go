@@ -3,8 +3,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,36 +27,46 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
+// command pairs a subcommand's runner with its SIGTERM policy. cleanDrain=true maps a clean
+// shutdown (context.Canceled) to exit 0 — a long-running worker/DR op that drains on SIGTERM
+// isn't a failure. cleanDrain=false means an interrupted run exits nonzero: audit MUST be
+// false (an aborted integrity check is INCOMPLETE, not "passed"); restore/verify/migrate are
+// short and have no drain semantics. Declaring the policy once per command — rather than
+// wrapping some switch arms and not others — is what stops the drill stub (and any future
+// command) from silently getting the exit-code contract wrong.
+type command struct {
+	run        func(args []string) error
+	cleanDrain bool
+}
+
+var commands = map[string]command{
+	"serve":     {func(a []string) error { return serve(configFlag("serve", a)) }, true},
+	"migrate":   {func(a []string) error { return runMigrate(configFlag("migrate", a)) }, false},
+	"restore":   {runRestore, false},
+	"verify":    {runVerify, false},
+	"reconcile": {runReconcile, true},
+	"audit":     {runAudit, false}, // NOT clean-drain: an interrupted audit must exit nonzero
+	"backfill":  {runBackfill, true},
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
-	args := os.Args[2:]
-	var err error
-	switch os.Args[1] {
-	case "serve":
-		err = onShutdownOK(serve(configFlag("serve", args)))
-	case "migrate":
-		err = runMigrate(configFlag("migrate", args))
-	case "restore":
-		err = runRestore(args)
-	case "verify":
-		err = runVerify(args)
-	case "reconcile":
-		err = onShutdownOK(runReconcile(args))
-	case "audit":
-		// NOTE: no onShutdownOK — an interrupted audit is an INCOMPLETE integrity check and
-		// must exit nonzero, so a cron doesn't read an aborted verification as passed.
-		err = runAudit(args)
-	case "backfill":
-		err = onShutdownOK(runBackfill(args))
-	case "drill":
-		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
+	name := os.Args[1]
+	if name == "drill" {
+		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", name)
 		os.Exit(1)
-	default:
+	}
+	cmd, ok := commands[name]
+	if !ok {
 		usage()
 		os.Exit(2)
+	}
+	err := cmd.run(os.Args[2:])
+	if cmd.cleanDrain {
+		err = onShutdownOK(err)
 	}
 	if err != nil {
 		fatal(err)
@@ -67,7 +75,7 @@ func main() {
 
 // onShutdownOK maps a clean-shutdown context.Canceled to a success exit — a SIGTERM to a
 // long-running subcommand is an orderly drain, not a crash, so k8s/systemd/cron don't read
-// it as a failure. The one owner of this policy; audit deliberately opts out (see the switch).
+// it as a failure. Applied by main per the commands table's cleanDrain flag (audit opts out).
 func onShutdownOK(err error) error {
 	if errors.Is(err, context.Canceled) {
 		return nil
@@ -431,16 +439,6 @@ func preflightScratch(dir string, logger *zap.Logger) error {
 	return nil
 }
 
-// randHex returns a random externalID-shaped hex string — a rotating keyset start so a
-// sampled audit checks a different band each run instead of the same fixed prefix.
-func randHex() string {
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "" // fall back to the start; a failed rand never blocks the audit
-	}
-	return hex.EncodeToString(b[:])
-}
-
 // runAudit verifies the ledger against reality (FR-014/T030): for a sample per target,
 // confirm the target actually still holds what the ledger records as stored. A nonzero
 // 'missing' count means silent loss on a target — a nonzero exit so cron/CI can alert.
@@ -456,34 +454,23 @@ func runAudit(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	startAfter := "" // a full audit starts at the beginning
-	if *sample > 0 {
-		startAfter = randHex() // a sampled audit rotates its band each run (no fixed blind spot)
-	}
-	rep, err := domain.Audit(ctx, ledger, targets, *sample, startAfter)
-	var unexpected []string
+	// Audit derives its own random keyset band for a sampled run (*sample>0); the pass/fail
+	// verdict lives with the report (rep.FailErr) — cmd only prints + propagates.
+	rep, err := domain.Audit(ctx, ledger, targets, *sample)
 	for _, t := range rep.Targets {
 		status := ""
 		switch {
 		case t.UnexpectedlyUnverifiable():
 			status = "  [UNVERIFIABLE — every Exists denied but target is NOT worm: read credential/endpoint broken?]"
-			unexpected = append(unexpected, t.Target)
 		case t.Unverifiable():
 			status = "  [unverifiable — worm target, read-denying by design; no coverage expected]"
 		}
 		fmt.Printf("audit %s: checked=%d missing=%d errors=%d%s\n", t.Target, t.Checked, t.Missing, t.Errors, status)
 	}
-	// Exit nonzero on silent loss OR a normally-readable target that couldn't be verified
-	// (a broken read path) — an expected-worm Unverifiable target is fine (exit 0).
-	switch {
-	case err != nil:
+	if err != nil { // print partial per-target results above, then surface the sweep error
 		return err
-	case rep.Missing() > 0:
-		return fmt.Errorf("%d ledger-stored objects are missing from their target", rep.Missing())
-	case len(unexpected) > 0:
-		return fmt.Errorf("targets unverifiable (read path broken, not worm): %v", unexpected)
 	}
-	return nil
+	return rep.FailErr()
 }
 
 // sinkFor loads config, validates the target set, and builds the named target's sink.

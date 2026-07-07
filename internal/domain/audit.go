@@ -2,6 +2,8 @@ package domain
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -43,6 +45,38 @@ func (r AuditReport) Missing() int {
 	return n
 }
 
+// FailErr is the audit pass/fail VERDICT — the rule lives WITH the report, not re-derived by
+// each caller. Non-nil (a nonzero exit for cron/CI) when a ledger-stored object is MISSING
+// from its target (silent loss) OR a normally-readable target couldn't be verified at all
+// (a broken read path); an expected-WORM read-denying target is fine. nil = pass.
+func (r AuditReport) FailErr() error {
+	if m := r.Missing(); m > 0 {
+		return fmt.Errorf("%d ledger-stored objects are missing from their target", m)
+	}
+	var unexpected []string
+	for _, t := range r.Targets {
+		if t.UnexpectedlyUnverifiable() {
+			unexpected = append(unexpected, t.Target)
+		}
+	}
+	if len(unexpected) > 0 {
+		return fmt.Errorf("targets unverifiable (read path broken, not worm): %v", unexpected)
+	}
+	return nil
+}
+
+// randKeysetStart returns a random externalID-shaped hex string — a rotating keyset start so a
+// SAMPLED audit checks a different band each run instead of the same fixed lowest-prefix band
+// (a permanent blind spot). A failed rand falls back to "" (the beginning) so a sampled audit
+// never blocks on entropy.
+func randKeysetStart() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // Audit verifies the ledger against reality (FR-014 drift check / T030): for up to
 // samplePerTarget objects the ledger records as stored on each target, it checks the
 // target ACTUALLY still holds them (Sink.Exists). A "missing" object is one the ledger
@@ -53,14 +87,26 @@ func (r AuditReport) Missing() int {
 // Unverifiable rather than clean — Exists is definitionally blind under that credential,
 // so audit gives no coverage there and the caller must not mistake it for a pass.
 //
-// startAfter seeds the keyset cursor. For a SAMPLED audit the caller passes a RANDOM
-// externalID so repeated runs sample a different band each time — otherwise a fixed ""
-// start would re-check the same lowest-externalID prefix every run, a permanent blind
-// spot for every object past the first N. When a sampled sweep reaches the end of the
+// For a SAMPLED audit (samplePerTarget>0) Audit derives a RANDOM keyset start so repeated
+// runs sample a different band each time — otherwise a fixed "" start would re-check the same
+// lowest-externalID prefix every run, a permanent blind spot for every object past the first
+// N. Deriving the start HERE keeps the sample<->random-start pairing an INVARIANT of Audit,
+// not a contract each caller must remember. When a sampled sweep reaches the end of the
 // keyspace with budget remaining it WRAPS ONCE to "" (bounded by the start), so it still
-// checks min(sample, total) objects — a high random start doesn't under-check and read as
-// a false clean pass. A full audit (samplePerTarget<=0) passes "" and never wraps.
-func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int, startAfter string) (AuditReport, error) {
+// checks min(sample, total) objects — a high random start doesn't under-check and read as a
+// false clean pass. A full audit (samplePerTarget<=0) starts at "" and never wraps.
+func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int) (AuditReport, error) {
+	startAfter := ""
+	if samplePerTarget > 0 {
+		startAfter = randKeysetStart()
+	}
+	return auditWithStart(ctx, led, targets, samplePerTarget, startAfter)
+}
+
+// auditWithStart is the deterministic core: it sweeps from an EXPLICIT startAfter (Audit
+// derives a random one for a sampled run; tests inject a fixed one to exercise the wrap /
+// boundary cases). Kept unexported so the sample<->random-start pairing stays Audit's invariant.
+func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePerTarget int, startAfter string) (AuditReport, error) {
 	// Sweep targets CONCURRENTLY — each is an independent backend + keyset with its own
 	// TargetAudit, so wall-clock is the slowest target, not the sum. Results are written to
 	// distinct indices (config order preserved); a cancelled sweep on any target surfaces
