@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1.24
+# Base images are pinned by minor-version tag, NOT by @sha256 digest, on purpose: absent a
+# renovate/dependabot policy in this repo to bump digests, a frozen digest silently misses
+# Alpine/Go base-image CVE patches, whereas the tag picks them up on the next CI rebuild. If a
+# fleet-wide digest-pinning + auto-update policy lands (shared github-workflows), pin here too.
 ARG GO_VERSION=1.26
 ARG ALPINE_VERSION=3.24
 
