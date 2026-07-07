@@ -278,51 +278,44 @@ func (c *Consumer) fail(ctx context.Context, id int64, reason string) {
 // then on an interval SHORTER than StaleTTL so a stuck row is caught within
 // ~StaleTTL rather than up to 2×.
 func (c *Consumer) reap(ctx context.Context) {
-	sweep := func() {
-		deadLettered, err := c.d.Outbox.ReapStale(ctx, c.d.StaleTTL)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) { // shutdown, not a real error
-				c.d.Logger.Error("reap stale", zap.Error(err))
-			}
-			return
-		}
-		// A crash-loop dead-letter happens HERE (not via Fail), so it must fire the
-		// same observer/metric — otherwise the exact case the delivery-count bound
-		// exists for is invisible to alerting.
-		if deadLettered > 0 {
-			c.d.Logger.Error("crash-loop dead-lettered", zap.Int("count", deadLettered))
-			if c.d.OnDeadLetter != nil {
-				for i := 0; i < deadLettered; i++ {
-					c.d.OnDeadLetter()
-				}
-			}
-		}
-	}
 	interval := c.d.StaleTTL / 4
 	if interval < time.Minute {
 		interval = time.Minute
 	}
-	// A panic in the reaper (a pgx Scan on a drifted foreign-outbox column) must degrade to
-	// a logged error, not crash the worker — the reap goroutine is outside process()'s recover.
-	guardedSweep := func() {
-		defer func() {
-			if r := recover(); r != nil {
-				c.d.Logger.Error("panic in reaper", zap.Any("panic", r), zap.Stack("stack"))
+	// domain.TickLoop owns the ticker + startup sweep + panic recover; timeout 0 means the
+	// single-UPDATE sweep runs on ctx (no per-tick bound — shutdown still aborts it). A panic
+	// (a pgx Scan on a drifted foreign-outbox column) and a returned error both route to
+	// onError, so the reaper degrades to a logged error, never a crashed worker (this goroutine
+	// is outside process()'s recover).
+	domain.TickLoop(ctx, interval, 0,
+		func(fctx context.Context) error {
+			deadLettered, err := c.d.Outbox.ReapStale(fctx, c.d.StaleTTL)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return nil // shutdown, not a real error
+				}
+				return err
 			}
-		}()
-		sweep()
-	}
-	guardedSweep() // startup sweep
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			guardedSweep()
-		}
-	}
+			// A crash-loop dead-letter happens HERE (not via Fail), so it fires the same
+			// observer/metric — else the exact case the delivery-count bound exists for is
+			// invisible to alerting.
+			if deadLettered > 0 {
+				c.d.Logger.Error("crash-loop dead-lettered", zap.Int("count", deadLettered))
+				if c.d.OnDeadLetter != nil {
+					for i := 0; i < deadLettered; i++ {
+						c.d.OnDeadLetter()
+					}
+				}
+			}
+			return nil
+		},
+		func(cause any) {
+			if err, ok := cause.(error); ok {
+				c.d.Logger.Error("reap stale", zap.Error(err))
+			} else {
+				c.d.Logger.Error("panic in reaper", zap.Any("panic", cause), zap.Stack("stack"))
+			}
+		})
 }
 
 // backoff waits ~1s or until ctx is cancelled — avoids hot-looping a transient

@@ -180,10 +180,19 @@ func serve(cfgPath string) error {
 	// Background loops, stopped before the pools close (defer runs LIFO, ahead of the
 	// pool Close defers above): the RPO/lag gauges (FR-026) and the periodic ledger
 	// snapshot to each target (FR-015, standalone-restorability).
+	sampler := domain.NewSampler(outbox, ledger, targets, breaker, mx)
 	var bgWG sync.WaitGroup
 	bgWG.Add(3)
-	go func() { defer bgWG.Done(); sampleRPO(ctx, outbox, ledger, targets, breaker, mx) }()
-	go func() { defer bgWG.Done(); sampleCoverage(ctx, ledger, targets, mx) }()
+	// SampleError once per failed pass (a returned read error OR a panic — TickLoop routes both
+	// to onError), so a frozen stale-green gauge is itself detectable.
+	go func() {
+		defer bgWG.Done()
+		domain.TickLoop(ctx, 15*time.Second, 5*time.Second, sampler.SampleRPO, func(any) { mx.SampleError() })
+	}()
+	go func() { // coarse cadence: CoverageGaps is a full-ledger scan, not every 15s
+		defer bgWG.Done()
+		domain.TickLoop(ctx, 5*time.Minute, 30*time.Second, sampler.SampleCoverage, func(any) { mx.SampleError() })
+	}()
 	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger, mx) }()
 	defer bgWG.Wait()
 
@@ -493,94 +502,28 @@ func sinkFor(cfgPath, name string) (domain.Sink, error) {
 	return nil, fmt.Errorf("target %q not found in config", name)
 }
 
-// everyTick runs fn immediately and then every interval until ctx is cancelled. Each
-// fn call gets a timeout-bounded child ctx (derived from ctx, so shutdown aborts it)
-// so a slow pass can't wedge shutdown. onPanic is invoked with the recovered value if fn
-// panics, so the pass stays OBSERVABLE (sample-error counter / log) instead of the panic
-// being swallowed silently. The shared skeleton for the background samplers.
-func everyTick(ctx context.Context, interval, timeout time.Duration, fn func(context.Context), onPanic func(recovered any)) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		runTick(ctx, timeout, fn, onPanic)
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
-}
-
-// runTick runs one bounded tick with a recover, so a pgx/driver panic in a sampler or the
-// manifest loop degrades that one pass instead of crashing the serve process — these
-// background goroutines are on the other side of a boundary no request/pipeline recover
-// reaches. A panic unwinds fn BEFORE its own error branch runs (where SampleError lives),
-// so the recover routes the panic to onPanic to still fire the sample-error / log — else a
-// sampler that panics every tick would freeze its gauge stale-green with zero signal.
-func runTick(ctx context.Context, timeout time.Duration, fn func(context.Context), onPanic func(recovered any)) {
-	fctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	defer func() {
-		if r := recover(); r != nil && onPanic != nil {
-			onPanic(r)
-		}
-	}()
-	fn(fctx)
-}
-
-// sampleRPO refreshes the backlog/lag/last-success gauges (FR-026). A failed pass
-// increments the sample-error counter (alert on rate>0) so a frozen, stale-green gauge
-// is itself detectable, rather than silently holding its last value.
-func sampleRPO(ctx context.Context, outbox *db.OutboxRepo, ledger *db.LedgerRepo, targets []domain.Target, breaker *domain.CircuitBreaker, mx *metrics.Metrics) {
-	names := domain.TargetNames(targets)
-	everyTick(ctx, 15*time.Second, 5*time.Second, func(fctx context.Context) {
-		mx.SetCircuitOpen(breaker.OpenCount()) // in-memory, always sampleable
-		failed := false
-		if pending, ageSec, err := outbox.BacklogStats(fctx); err == nil {
-			mx.SetBacklog(pending, ageSec)
-		} else {
-			failed = true
-		}
-		if ageSec, never, ok, err := ledger.LastVerifiedAge(fctx, names); err != nil {
-			failed = true
-		} else {
-			mx.SetNeverVerified(never) // a from-day-one dead target is counted, not invisible
-			if ok {
-				mx.SetLastSuccessAge(ageSec)
-			}
-		}
-		if failed {
-			mx.SampleError()
-		}
-	}, func(any) { mx.SampleError() }) // a panicking pass is a failed sample, not a silent freeze
-}
-
-// sampleCoverage refreshes the under-replication gauge on a coarse cadence (the count
-// is a full-ledger scan, so not every 15s) — the coverage backstop a dead-lettered
-// object can't hide from.
-func sampleCoverage(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, mx *metrics.Metrics) {
-	names := domain.TargetNames(targets)
-	everyTick(ctx, 5*time.Minute, 30*time.Second, func(fctx context.Context) {
-		if n, err := ledger.CoverageGaps(fctx, names); err == nil {
-			mx.SetUnderReplicated(n)
-		} else {
-			mx.SampleError()
-		}
-	}, func(any) { mx.SampleError() }) // a panicking pass is a failed sample, not a silent freeze
-}
-
 // manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),
-// starting immediately. Best-effort: a failed snapshot is logged, not fatal (a target's
-// manifest is a DR convenience, not the backup itself).
+// starting immediately. Best-effort: a failed snapshot is metered + logged, not fatal (a
+// target's manifest is a DR convenience, not the backup itself). The failure side-effect
+// (ManifestError + log) is stated ONCE in onError — TickLoop routes both a returned error and
+// a panic there, distinguished by a type switch on cause.
 func manifestLoop(ctx context.Context, ledger *db.LedgerRepo, targets []domain.Target, every time.Duration, logger *zap.Logger, mx *metrics.Metrics) {
-	everyTick(ctx, every, 30*time.Minute, func(fctx context.Context) {
-		if err := domain.WriteManifests(fctx, ledger, targets, domain.ManifestName(time.Now())); err != nil && ctx.Err() == nil {
-			// Metric + log: a persistently failing manifest write silently defeats a target's
-			// standalone restorability while every per-object gauge stays green (FR-015).
+	domain.TickLoop(ctx, every, 30*time.Minute,
+		func(fctx context.Context) error {
+			err := domain.WriteManifests(fctx, ledger, targets, domain.ManifestName(time.Now()))
+			if err != nil && ctx.Err() == nil {
+				return err
+			}
+			return nil // a shutdown-cancelled snapshot is not a failure
+		},
+		func(cause any) {
 			mx.ManifestError()
-			logger.Warn("manifest snapshot", zap.Error(err))
-		}
-	}, func(r any) { mx.ManifestError(); logger.Warn("manifest snapshot panicked", zap.Any("panic", r)) })
+			if err, ok := cause.(error); ok {
+				logger.Warn("manifest snapshot", zap.Error(err))
+			} else {
+				logger.Warn("manifest snapshot panicked", zap.Any("panic", cause))
+			}
+		})
 }
 
 type startCheck struct {
