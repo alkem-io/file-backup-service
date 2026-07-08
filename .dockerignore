@@ -1,0 +1,13 @@
+.git/
+.idea/
+.vscode/
+bin/
+coverage.out
+*.log
+.env*
+!.env.example
+specs/
+.specify/
+.claude/
+Dockerfile*
+.dockerignore
