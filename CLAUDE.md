@@ -38,7 +38,7 @@ target restorable with nothing but bytes + a hash check.
   client (`GET /internal/file/{id}/content`), the DB adapters (outbox in the
   Alkemio DB; ledger in the own DB).
 - **cmd**: subcommands — `serve`, `backfill`, `restore`, `verify`,
-  `reconcile`, `drill`, `migrate`.
+  `reconcile`, `audit`, `drill`, `migrate`.
 
 ## Anti-Patterns — Strictly Prohibited
 

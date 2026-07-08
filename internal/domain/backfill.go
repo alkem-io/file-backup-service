@@ -115,7 +115,24 @@ type Backfiller struct {
 // concurrency (the Concurrency knob) is the in-flight object count so the sweep overlaps
 // per-object fetch/store latency instead of running 1-at-a-time.
 func NewBackfiller(corpus CorpusEnumerator, p *Pipeline, perObjectTimeout time.Duration, concurrency int) *Backfiller {
-	return &Backfiller{corpus: corpus, p: p, perObjectT: perObjectTimeout, concurrency: concurrency}
+	// Floor a non-positive perObjectTimeout so backupOne's context.WithTimeout can't produce an
+	// already-expired deadline that fails every object (see normalizePerObjectTimeout).
+	return &Backfiller{corpus: corpus, p: p, perObjectT: normalizePerObjectTimeout(perObjectTimeout), concurrency: concurrency}
+}
+
+// defaultPerObjectTimeout is the fallback the sweep constructors floor a non-positive
+// perObjectTimeout to — matches config's applyDefaults default, so a direct (test/future)
+// caller that skips config validation still gets a sane bound instead of an all-fail pass.
+const defaultPerObjectTimeout = 30 * time.Minute
+
+// normalizePerObjectTimeout floors a non-positive per-object timeout to defaultPerObjectTimeout
+// so context.WithTimeout never yields an already-expired deadline. One owner, shared by
+// NewBackfiller and NewReconciler.
+func normalizePerObjectTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultPerObjectTimeout
+	}
+	return d
 }
 
 // Run enumerates the corpus and backs up each object with up to `concurrency` in flight, paced

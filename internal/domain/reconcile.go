@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,6 +53,11 @@ func (rc *Reconciler) reportErr(externalID string, err error) {
 // repair fan-out the SAME hung-target isolation as serve (a black-holing destination target is
 // dropped at stall / skipped once its circuit trips); pass 0/nil to disable (tests).
 func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration, scratchDir string, stall time.Duration, circuit *CircuitBreaker, concurrency int) *Reconciler {
+	// A non-positive perObjectTimeout would make context.WithTimeout in repair produce an
+	// already-expired deadline, failing EVERY object immediately (a silent total-reconcile
+	// outage). Production callers pass a config-validated value, but these constructors are
+	// exported and directly callable, so floor it to a sane default rather than trust the caller.
+	perObjectTimeout = normalizePerObjectTimeout(perObjectTimeout)
 	byName := make(map[string]Target, len(targets))
 	for _, t := range targets {
 		byName[t.Sink.Name()] = t
@@ -225,9 +231,14 @@ type tempReadCloser struct{ f *os.File }
 // Read yields the decoded plaintext.
 func (t *tempReadCloser) Read(p []byte) (int, error) { return t.f.Read(p) }
 
-// Close closes and removes the temp file.
+// Close closes and removes the temp file. A remove failure is JOINED into the returned error
+// (not swallowed) so a persistent scratch-dir delete failure — permissions, a busy mount — is
+// observable to the caller rather than silently leaking temp files on a long-running DR pass.
+// An already-gone file (IsNotExist) is not an error.
 func (t *tempReadCloser) Close() error {
 	err := t.f.Close()
-	_ = os.Remove(t.f.Name())
+	if rmErr := os.Remove(t.f.Name()); rmErr != nil && !os.IsNotExist(rmErr) {
+		err = errors.Join(err, rmErr)
+	}
 	return err
 }

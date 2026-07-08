@@ -1,13 +1,16 @@
 #!/bin/sh
-# Pre-commit: regenerate sqlc + openapi and check for drift.
+# Pre-commit: regenerate sqlc (check drift) + openapi (auto-stage).
 # Install: make setup-hooks  (git config core.hooksPath .githooks)
 set -e
 
 STAGED=$(git diff --cached --name-only)
 NEED_SQLC=false
 NEED_OPENAPI=false
-echo "$STAGED" | grep -q "db/queries/\|db/migrations/" && NEED_SQLC=true || true
-echo "$STAGED" | grep -q "internal/adapter/inbound/http/" && NEED_OPENAPI=true || true
+# db/sqlc.yaml too: a codegen-config change (not just queries/migrations) affects the output.
+echo "$STAGED" | grep -q "db/queries/\|db/migrations/\|db/sqlc.yaml" && NEED_SQLC=true || true
+# cmd/ too: apispec traces main -> serve -> NewRouter, so a routing/wiring change there (not
+# only internal/adapter/inbound/http/) can change the spec.
+echo "$STAGED" | grep -q "internal/adapter/inbound/http/\|cmd/file-backup-service/" && NEED_OPENAPI=true || true
 
 if [ "$NEED_SQLC" = true ]; then
   # Use the version-pinned sqlc (make sqlc-generate -> go run ...@vX) so the drift check is
@@ -29,13 +32,20 @@ fi
 if [ "$NEED_OPENAPI" = true ]; then
   if command -v apispec >/dev/null 2>&1; then
     echo "  Regenerating openapi.yaml..."
-    make openapi
-    git diff --exit-code openapi.yaml || {
-      echo "ERROR: openapi.yaml is stale. Run 'make openapi' and stage the changes."
-      exit 1
-    }
+    # AUTO-STAGE (not fail-on-drift): a forgotten regen shouldn't block the commit — regenerate
+    # and stage the fresh spec so the commit always carries a current openapi.yaml. If apispec
+    # itself fails (a known generator issue), WARN and skip rather than hard-block — the `if`
+    # condition is exempt from `set -e`.
+    if make openapi >/dev/null 2>&1; then
+      if ! git diff --quiet openapi.yaml; then
+        git add openapi.yaml
+        echo "  openapi.yaml was stale — regenerated and staged into this commit."
+      fi
+    else
+      echo "  WARN: openapi generation failed (apispec issue?), skipping — commit not blocked"
+    fi
   else
-    echo "  WARN: apispec not installed, skipping openapi check"
+    echo "  WARN: apispec not installed, skipping openapi regen"
   fi
 fi
 

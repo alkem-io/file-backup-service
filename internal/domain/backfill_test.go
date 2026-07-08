@@ -119,3 +119,25 @@ func TestBackfillSkipsSourceGone(t *testing.T) {
 		t.Fatalf("stats: %+v (want both objects skipped as source-gone, zero failed)", st)
 	}
 }
+
+// TestNormalizePerObjectTimeoutFloor: a non-positive perObjectTimeout must be floored to the
+// default in NewBackfiller/NewReconciler so a direct caller can't produce an already-expired
+// per-object deadline that fails every object (CodeRabbit #5). Asserts the shared normalizer
+// and that the constructors apply it.
+func TestNormalizePerObjectTimeoutFloor(t *testing.T) {
+	if got := normalizePerObjectTimeout(0); got != defaultPerObjectTimeout {
+		t.Fatalf("0 must floor to the default, got %v", got)
+	}
+	if got := normalizePerObjectTimeout(-time.Second); got != defaultPerObjectTimeout {
+		t.Fatalf("negative must floor to the default, got %v", got)
+	}
+	if got := normalizePerObjectTimeout(5 * time.Second); got != 5*time.Second {
+		t.Fatalf("a positive value must pass through, got %v", got)
+	}
+	if b := NewBackfiller(nil, nil, 0, 1); b.perObjectT != defaultPerObjectTimeout {
+		t.Fatalf("NewBackfiller must floor perObjectT, got %v", b.perObjectT)
+	}
+	if rc := NewReconciler(nil, nil, 0, "", 0, nil, 1); rc.perObjectT != defaultPerObjectTimeout {
+		t.Fatalf("NewReconciler must floor perObjectT, got %v", rc.perObjectT)
+	}
+}
