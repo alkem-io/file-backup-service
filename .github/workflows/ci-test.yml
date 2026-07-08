@@ -15,3 +15,21 @@ jobs:
       sqlc-config: db/sqlc.yaml
       sqlc-generated-path: internal/adapter/outbound/db/queries
       openapi-make-target: openapi
+
+  # Coverage gate (constitution §VII: >95%). `make cover-check` runs the FULL suite WITH
+  # `-tags integration` — a throwaway Postgres container via testcontainers (Docker is available
+  # on the ubuntu runner) — so this one job both exercises the live-DB integration paths AND
+  # fails the build if total coverage drops below 95%. The reusable go-ci job above does not
+  # run the integration tag, so this is the additive gate, not a fork of the shared workflow.
+  cover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Coverage gate (>=95%, includes the testcontainers integration suite)
+        run: make cover-check
