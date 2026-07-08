@@ -26,18 +26,22 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
-func main() {
-	if len(os.Args) < 2 {
+func main() { os.Exit(run(os.Args)) }
+
+// run dispatches one subcommand and returns the process exit code — extracted from main so the
+// dispatch + exit-code mapping is unit-testable (main is just os.Exit(run(os.Args))). A DIRECT
+// call per arm (not a func-value dispatch table) keeps apispec's main -> run -> serve ->
+// NewRouter static trace intact, so openapi.yaml still carries /live,/health,/metrics.
+// onShutdownOK wraps the long-running drains (serve/reconcile/backfill) so a clean SIGTERM is
+// exit 0; audit deliberately does NOT — an interrupted integrity check must exit nonzero.
+func run(argv []string) int {
+	if len(argv) < 2 {
 		usage()
-		os.Exit(2)
+		return 2
 	}
-	args := os.Args[2:]
-	// A DIRECT call per arm (not a func-value dispatch table) so the apispec generator can
-	// statically trace main -> serve -> NewRouter and keep /live,/health,/metrics in
-	// openapi.yaml. onShutdownOK wraps the long-running drain commands (serve/reconcile/
-	// backfill) so a clean SIGTERM is exit 0; audit deliberately does NOT (see its arm).
+	args := argv[2:]
 	var err error
-	switch os.Args[1] {
+	switch argv[1] {
 	case "serve":
 		err = onShutdownOK(serve(configFlag("serve", args)))
 	case "migrate":
@@ -49,21 +53,21 @@ func main() {
 	case "reconcile":
 		err = onShutdownOK(runReconcile(args))
 	case "audit":
-		// NO onShutdownOK — an interrupted audit is an INCOMPLETE integrity check and must
-		// exit nonzero, so a cron doesn't read an aborted verification as passed.
 		err = runAudit(args)
 	case "backfill":
 		err = onShutdownOK(runBackfill(args))
 	case "drill":
-		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", os.Args[1])
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", argv[1])
+		return 1
 	default:
 		usage()
-		os.Exit(2)
+		return 2
 	}
 	if err != nil {
-		fatal(err)
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
 	}
+	return 0
 }
 
 // onShutdownOK maps a clean-shutdown context.Canceled to a success exit — a SIGTERM to a
@@ -705,11 +709,6 @@ func shutdown(srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "error:", err)
-	os.Exit(1)
 }
 
 func usage() {
