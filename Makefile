@@ -1,4 +1,4 @@
-.PHONY: build docker test cover-check lint generate sqlc-generate openapi migrate setup-hooks run clean
+.PHONY: build docker test test-integration cover-check lint generate sqlc-generate openapi migrate setup-hooks run clean
 
 BINARY := file-backup-service
 GO := go
@@ -22,12 +22,18 @@ test:
 	$(GO) test $(GOFLAGS) -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -1
 
+# test-integration runs the build-tagged (`integration`) suite: the pgx adapters, migrate, and
+# the cmd subcommands against a throwaway Postgres container (testcontainers) — requires Docker.
+test-integration:
+	$(GO) test $(GOFLAGS) -tags integration ./...
+
 # cover-check gates total statement coverage at COVER_MIN (constitution §VII). It fails the
 # build when coverage drops below the bar, so CI and pre-commit catch untested code — the 95%
 # is met with real invariant/integration tests (pgmock/pgxmock/pgxpoolmock for the pgx
-# adapters, httptest for the sinks), never coverage padding.
+# adapters, httptest for the sinks, a testcontainers Postgres for the live-DB paths), never
+# coverage padding. Runs WITH `-tags integration` (needs Docker) so the DB/cmd paths count.
 cover-check:
-	$(GO) test $(GOFLAGS) -coverpkg=./... -coverprofile=coverage.out ./...
+	$(GO) test $(GOFLAGS) -tags integration -coverpkg=./... -coverprofile=coverage.out ./...
 	@total=$$($(GO) tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$$NF); print $$NF}'); \
 	awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { \
 	  printf "total coverage: %s%% (minimum %s%%)\n", t, m; \

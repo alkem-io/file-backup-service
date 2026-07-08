@@ -99,6 +99,15 @@ func runMigrate(cfgPath string) error {
 }
 
 func serve(cfgPath string) error {
+	ctx, stop := signalContext()
+	defer stop()
+	return serveCtx(ctx, cfgPath)
+}
+
+// serveCtx is serve parameterized on the context, so the worker loop can be driven to a clean
+// shutdown from a test (a cancellable ctx) rather than only a real signal. main -> serve ->
+// serveCtx -> startHTTP -> NewRouter keeps the apispec static trace intact.
+func serveCtx(ctx context.Context, cfgPath string) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -111,8 +120,6 @@ func serve(cfgPath string) error {
 		return err
 	}
 	defer syncLog()
-	ctx, stop := signalContext()
-	defer stop()
 
 	mx := metrics.New()
 
