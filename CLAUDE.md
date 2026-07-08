@@ -58,6 +58,7 @@ target restorable with nothing but bytes + a hash check.
 - Always run `golangci-lint run` before committing (config in `.golangci.yml`, inherited from file-service)
 - CI is the shared `alkem-io/github-workflows` reusable workflows (`go-ci.yml`, `container-pr.yml`, `container-release.yml`) — do not fork bespoke CI
 - Tests must defend real invariants — no coverage-padding tests
+- **Statement test coverage MUST stay above 95%**, gated by `make cover-check` (which fails the build when the total drops below the bar) — run it before committing, alongside `golangci-lint run`. This is *not* in tension with the no-padding rule above — the 95% is reached with real invariant/integration tests, never padding: cover the pgx DB adapters (outbox/ledger/corpus) and the consumer loop with **pgmock / pgxmock / pgxpoolmock** (assert the exact SQL, params, and row→domain scanning against a mocked pool), the object-store sinks with an httptest S3 stub, and the `cmd` subcommands through their entrypoints. A live Postgres/container is for fault-injection & restore-drill suites, not a prerequisite for the coverage bar. See constitution §VII.
 - Root-cause analysis is mandatory before any bug fix; document the cause with evidence
 - Verify latest dependency versions online (pkg.go.dev, GitHub releases) — never trust training data
 - Migrations are the single source of truth for the ledger schema; regenerate sqlc after changing them (`make sqlc-generate`)

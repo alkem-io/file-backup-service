@@ -61,6 +61,20 @@ Database interactions MUST use **sqlc** for query generation and **pgx**.
 - Tests MUST defend real invariants (idempotency, hash-verify, no-loss under
   fault) — no coverage-padding tests. Fault-injection and restore-drill tests
   are first-class.
+- **Statement test coverage MUST exceed 95%** (measured by `go test
+  -coverprofile` over `./...`). This bar and the no-padding rule above are
+  **complementary, not in tension**: the 95% MUST be reached with real
+  invariant, fault-injection, and integration tests — never with superficial
+  or assertion-free tests. The pgx DB adapters (outbox, ledger, corpus) MUST be
+  covered with **pgmock / pgxmock / pgxpoolmock** — asserting the exact SQL,
+  params, and row→domain scanning against a mocked pool/connection (the adapters
+  taking a pool interface the mock satisfies) — rather than left uncovered for
+  want of a live database; object-store sinks use an httptest S3 stub, and the
+  `cmd` wiring is exercised through the subcommand entrypoints. A live
+  Postgres/container is reserved for the fault-injection and restore-drill
+  suites, not a prerequisite for the coverage bar. The bar is gated by
+  `make cover-check`, which fails when total coverage drops below 95%; that gate
+  MUST run in CI and MUST NOT be waived per-package to accommodate untested glue.
 - All debugging MUST be driven by root-cause analysis; the cause MUST be
   documented with evidence before a fix is applied.
 
@@ -70,4 +84,14 @@ concerns and the feature's authoritative spec live in the workspace
 (`agents-hq/specs/008-continuous-file-backup/`). Amendments MUST be recorded
 here with rationale.
 
-**Version**: 1.0.0 (adapted from file-service) · **Ratified**: 2026-07-03
+**Version**: 1.1.0 (adapted from file-service) · **Ratified**: 2026-07-03 ·
+**Last amended**: 2026-07-08
+
+**Amendments**
+- 1.1.0 (2026-07-08): Principle VII gains a **>95% statement-coverage**
+  requirement, CI-enforced, reached via real invariant/integration tests
+  (pgmock/pgxmock/pgxpoolmock for the pgx adapters, an httptest S3 stub for the
+  sinks) — never coverage padding. Rationale: the load-bearing domain logic was
+  well-covered (~87%) but the DB adapters and `cmd` wiring sat near 0%, leaving
+  the outbox/ledger/consumer glue — where a silent data-loss regression is most
+  costly — unguarded by CI.
