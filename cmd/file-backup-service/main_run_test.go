@@ -44,9 +44,11 @@ func TestUsage(t *testing.T) {
 	}
 	old := os.Stderr
 	os.Stderr = w
+	// Restore + close via Cleanup so a panic in usage() can't leave os.Stderr pointed at the
+	// closed pipe for the rest of the package's tests (and r isn't leaked).
+	t.Cleanup(func() { os.Stderr = old; _ = r.Close() })
 	usage()
-	_ = w.Close()
-	os.Stderr = old
+	_ = w.Close() // close the write end so ReadAll sees EOF
 	out, _ := io.ReadAll(r)
 	got := string(out)
 	for _, want := range []string{"usage:", "file-backup-service", "serve", "migrate"} {
