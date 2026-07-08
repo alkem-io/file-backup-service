@@ -21,10 +21,10 @@ import (
 // ledger migrations that sqlc's schema points at — so sqlc has no schema to type it. The
 // column-covering Probe is the compensating control (a server-side schema drift fails at
 // startup, not mid-backfill).
-type FileRepo struct{ p *Pool }
+type FileRepo struct{ p PgxDB }
 
 // NewFileRepo binds a FileRepo to the alkemio pool.
-func NewFileRepo(p *Pool) *FileRepo { return &FileRepo{p: p} }
+func NewFileRepo(p PgxDB) *FileRepo { return &FileRepo{p: p} }
 
 // EachFile invokes fn for every non-temporary file (the backfill work-list), ordered by
 // id for a stable, resumable pass. It KEYSET-PAGES the `file` table (id > after ORDER BY

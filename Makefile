@@ -27,7 +27,7 @@ test:
 # is met with real invariant/integration tests (pgmock/pgxmock/pgxpoolmock for the pgx
 # adapters, httptest for the sinks), never coverage padding.
 cover-check:
-	$(GO) test $(GOFLAGS) -coverprofile=coverage.out ./...
+	$(GO) test $(GOFLAGS) -coverpkg=./... -coverprofile=coverage.out ./...
 	@total=$$($(GO) tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$$NF); print $$NF}'); \
 	awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { \
 	  printf "total coverage: %s%% (minimum %s%%)\n", t, m; \

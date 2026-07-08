@@ -19,13 +19,14 @@ import (
 // against. The startup Probe (which SELECTs every consumed column) is the compensating
 // control: a server-side schema drift fails loudly at deploy instead of at runtime.
 type OutboxRepo struct {
-	p             *Pool
+	p             PgxDB
 	maxAttempts   int // genuine-failure dead-letter threshold
 	maxDeliveries int // crash-loop dead-letter threshold (counted by the reaper)
 }
 
-// NewOutboxRepo binds an OutboxRepo to the alkemio pool with the dead-letter limits.
-func NewOutboxRepo(p *Pool, maxAttempts, maxDeliveries int) *OutboxRepo {
+// NewOutboxRepo binds an OutboxRepo to the alkemio pool with the dead-letter limits. It takes
+// the PgxDB interface (satisfied by *Pool and by pgxmock) so it is unit-testable without a DB.
+func NewOutboxRepo(p PgxDB, maxAttempts, maxDeliveries int) *OutboxRepo {
 	return &OutboxRepo{p: p, maxAttempts: maxAttempts, maxDeliveries: maxDeliveries}
 }
 

@@ -8,9 +8,25 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// PgxDB is the minimal pgx surface the adapters use — Query/Exec/QueryRow. Both *Pool (the
+// production pgxpool wrapper) and pgxmock's pool satisfy it, so the outbox/ledger/corpus
+// adapters can be unit-tested against a MOCKED pool (constitution §VII: cover the pgx adapters
+// with pgxmock, not a live DB). It is structurally identical to sqlc's generated queries.DBTX,
+// so a PgxDB also drives queries.New.
+type PgxDB interface {
+	// Exec runs a statement returning no rows (an UPDATE/INSERT).
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	// Query runs a query returning rows.
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	// QueryRow runs a query returning at most one row, scanned by the caller.
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
 
 // nullTime maps a scanned nullable TIMESTAMPTZ to a time.Time (zero when SQL NULL) — one
 // owner for the pgtype→domain breadcrumb mapping shared by the ledger + corpus readers.

@@ -21,8 +21,10 @@ type LedgerRepo struct {
 	q *queries.Queries
 }
 
-// NewLedgerRepo binds a LedgerRepo to the ledger pool.
-func NewLedgerRepo(p *Pool) *LedgerRepo { return &LedgerRepo{q: queries.New(p.Pool)} }
+// NewLedgerRepo binds a LedgerRepo to the ledger pool. It takes the PgxDB interface (satisfied
+// by *Pool and by pgxmock), which also drives sqlc's queries.New, so the ledger queries are
+// unit-testable against a mocked pool without a live DB.
+func NewLedgerRepo(p PgxDB) *LedgerRepo { return &LedgerRepo{q: queries.New(p)} }
 
 // statusRow is the per-target status shape marshaled into the jsonb array RecordBackup's
 // jsonb_to_recordset decodes — the json keys MUST match the query's t(target, state, bytes)
