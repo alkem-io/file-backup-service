@@ -152,9 +152,13 @@ export FBS_TARGET_OFFSITE_SECRETKEY=…
 | `audit` | — | — | ✅ | ✅ |
 | `restore` / `verify` | — | — | — | ✅ (the `--from` target) |
 | `migrate` | — | — | ✅ | — |
+| `drill` *(planned)* | — | — | — | ✅ |
 
 `reconcile`/`audit`/`restore`/`verify` run in a degraded/DR environment and
-deliberately don't require file-service or the outbox DB.
+deliberately don't require file-service or the outbox DB. `drill` (a scheduled
+restore drill — **not yet implemented**) will follow the same DR shape, exercising
+restore against the targets; its config needs are expected to mirror
+`restore`/`verify` (targets only) and will be confirmed when it lands.
 
 ---
 
