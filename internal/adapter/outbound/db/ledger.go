@@ -124,11 +124,7 @@ func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, af
 	}
 	out := make([]targetGap, len(rows))
 	for i, row := range rows {
-		stored := make(map[string]bool, len(row.Stored))
-		for _, t := range row.Stored {
-			stored[t] = true
-		}
-		out[i] = targetGap{externalID: row.ExternalID, stored: stored}
+		out[i] = targetGap{externalID: row.ExternalID, stored: sliceToSet(row.Stored)}
 	}
 	return out, nil
 }
@@ -187,11 +183,7 @@ func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[
 	if err != nil {
 		return nil, fmt.Errorf("list stored targets: %w", err)
 	}
-	out := make(map[string]bool, len(targets))
-	for _, t := range targets {
-		out[t] = true
-	}
-	return out, nil
+	return sliceToSet(targets), nil
 }
 
 // timestamptzOrNull maps a domain time.Time breadcrumb (zero => SQL NULL) to pgtype.Timestamptz.

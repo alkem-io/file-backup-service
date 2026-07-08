@@ -158,11 +158,12 @@ func serve(cfgPath string) error {
 	}
 
 	// Per-target circuit breaker (T017a): a persistently-down/hung target trips out of the
-	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered. serve goes
-	// through WithIsolation (stall-drop + circuit) like backfill/reconcile, so the isolation
-	// wiring has ONE owner and serve can't silently miss a field a future isolation knob adds.
-	breaker := cfg.NewCircuitBreaker()
-	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
+	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered. serve and
+	// backfill both build their runtime pipeline via isolatedPipeline, so the stall-drop +
+	// circuit wiring has ONE owner — a future isolation knob can't land in serve while backfill
+	// silently keeps running a differently-isolated pipeline. serve also keeps the breaker for
+	// the sampler's targets-down gauge.
+	pipeline, breaker := isolatedPipeline(cfg, fsClient, ledger, targets)
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
@@ -438,10 +439,10 @@ func runBackfill(args []string) error {
 		return err
 	}
 
-	// Same hung-target isolation as serve (stall-drop + circuit) — a bare pipeline would let a
-	// black-holing target wedge every object for the full perObjectTimeout, invisibly.
-	breaker := cfg.NewCircuitBreaker()
-	pipeline := domain.NewPipeline(fsClient, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker)
+	// Same hung-target isolation as serve (stall-drop + circuit) via the shared builder — a bare
+	// pipeline would let a black-holing target wedge every object for the full perObjectTimeout,
+	// invisibly. backfill doesn't need the breaker handle itself (no sampler).
+	pipeline, _ := isolatedPipeline(cfg, fsClient, ledger, targets)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed)
 	if err != nil {
@@ -642,6 +643,16 @@ func preflightTargets(ctx context.Context, logger *zap.Logger, targets []domain.
 		return fmt.Errorf("no target is usable at startup: %w", errors.Join(errs...))
 	}
 	return nil
+}
+
+// isolatedPipeline builds the runtime backup pipeline with the SAME per-target hung-target
+// isolation (stall-drop + circuit breaker) for serve and backfill — the one owner of that
+// wiring, so a future isolation knob can't be added to one command and silently missed by the
+// other (which would leave a hung target un-dropped on that path). It returns the breaker too,
+// which serve threads into the sampler's targets-down gauge; backfill discards it.
+func isolatedPipeline(cfg *config.Config, src domain.Source, ledger domain.Ledger, targets []domain.Target) (*domain.Pipeline, *domain.CircuitBreaker) {
+	breaker := cfg.NewCircuitBreaker()
+	return domain.NewPipeline(src, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker), breaker
 }
 
 func buildTargets(cfgs []config.Target) ([]domain.Target, error) {

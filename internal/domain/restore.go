@@ -56,18 +56,19 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 		return err
 	}
 	dest := filepath.Join(destDir, hash)
-	if _, err := os.Stat(dest); err == nil {
-		if f, oerr := os.Open(dest); oerr == nil { //nolint:gosec // primary-store path
-			// Bounded + ctx-cancellable: a large stale/corrupt file must not read
-			// unboundedly nor swallow the operator's SIGINT/SIGTERM.
-			overCap, verr := copyVerify(io.Discard, ctxReader{ctx, f}, hash)
-			_ = f.Close()
-			if verr == nil && !overCap {
-				return nil // already present and intact
-			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
+	// One os.Open (not os.Stat THEN os.Open): Open already reports non-existence, so a
+	// separate Stat is a wasted syscall AND a TOCTOU window. A present file is hash-verified;
+	// anything else (absent, or unopenable) falls through to restore from the backup copy.
+	if f, oerr := os.Open(dest); oerr == nil { //nolint:gosec // primary-store path
+		// Bounded + ctx-cancellable: a large stale/corrupt file must not read
+		// unboundedly nor swallow the operator's SIGINT/SIGTERM.
+		overCap, verr := copyVerify(io.Discard, ctxReader{ctx, f}, hash)
+		_ = f.Close()
+		if verr == nil && !overCap {
+			return nil // already present and intact
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		// present but corrupt/mismatched — overwrite with the good backup copy.
 	}

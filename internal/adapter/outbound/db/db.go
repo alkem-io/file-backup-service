@@ -21,6 +21,17 @@ func nullTime(t pgtype.Timestamptz) time.Time {
 	return time.Time{}
 }
 
+// sliceToSet builds a membership set from a slice of target names — the one owner of the
+// stored-target set-build, so StoredTargets (the dedup source of truth) and targetGapsPage
+// (the reconcile work-list) can't diverge on how a target-name list becomes a set.
+func sliceToSet(xs []string) map[string]bool {
+	set := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		set[x] = true
+	}
+	return set
+}
+
 // Pool is a thin pgxpool.Pool wrapper, so this package sets the pool's explicit
 // MaxConns in one place.
 type Pool struct {

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"sync"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -40,6 +41,13 @@ type Sink struct {
 	bucket string
 	prefix string
 	opts   minio.PutObjectOptions // constant for the sink's life (PartSize + SSE)
+
+	// bucketMu guards a one-shot, cached bucket-existence verdict (see confirmBucket): a 404
+	// from StatObject can't tell a missing OBJECT from a missing BUCKET, so Exists confirms the
+	// bucket once before ever reporting "absent".
+	bucketMu      sync.Mutex
+	bucketChecked bool  // BucketExists returned a DEFINITIVE answer (present or gone)
+	bucketGone    error // non-nil once the bucket is confirmed gone; nil = present or unchecked
 }
 
 // New constructs an S3 Sink.
@@ -91,21 +99,53 @@ func (s *Sink) Preflight(ctx context.Context) error {
 	return nil
 }
 
-// Exists reports whether the object is present. Only a definite 404/NoSuchKey is
-// "absent"; a 403/AccessDenied (expected on a PutObject-only WORM credential, and
-// also what a real credential/endpoint fault returns) is surfaced as an ERROR, not
-// "absent", so a future reconcile never treats a permission fault as a gap to
-// refill. Dedup is answered by the ledger, not this method.
+// Exists reports whether the object is present. A 404 is "absent" ONLY once the bucket is
+// confirmed present — a StatObject is a HEAD (no response body), so minio-go maps EVERY 404 to
+// NoSuchKey, unable to tell a missing OBJECT from a missing/deleted/typo'd BUCKET. Without the
+// bucket check, a gone bucket would read as "every object absent", and audit — which skips the
+// target write-preflight — would report the whole sample as silent LOSS ("N objects missing")
+// instead of a bucket-level fault, paging the operator toward the wrong investigation. A gone
+// or unreachable bucket now surfaces as an ERROR (audit → Unverifiable, not Missing). A
+// 403/AccessDenied (expected on a PutObject-only WORM credential, and also what a real
+// credential/endpoint fault returns) is likewise an ERROR, not "absent", so reconcile never
+// treats a permission fault as a gap to refill. Dedup is answered by the ledger, not this method.
 func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 	_, err := s.client.StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
-	if err != nil {
-		resp := minio.ToErrorResponse(err)
-		if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
-			return false, nil
-		}
-		return false, fmt.Errorf("stat %s: %w", s.key(hash), err)
+	if err == nil {
+		return true, nil
 	}
-	return true, nil
+	resp := minio.ToErrorResponse(err)
+	if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+		if berr := s.confirmBucket(ctx); berr != nil {
+			return false, berr // the "object" 404 is really a gone/unreachable bucket
+		}
+		return false, nil // bucket present → the object is genuinely absent
+	}
+	return false, fmt.Errorf("stat %s: %w", s.key(hash), err)
+}
+
+// confirmBucket verifies the bucket exists, so Exists never mistakes a missing bucket for a
+// missing object. The verdict is cached: BucketExists runs at most ONCE per sink (on the first
+// 404), then every later probe reads the cached result — so a full audit costs one bucket HEAD,
+// not one per object. A DEFINITIVE answer (present or gone) is cached; a transient error is NOT
+// (the next probe re-checks), fail-closed so an integrity check can't pass a bucket it couldn't
+// confirm. The lock is held across the one network call so 16 concurrent audit probes collapse
+// to a single BucketExists rather than a thundering herd.
+func (s *Sink) confirmBucket(ctx context.Context) error {
+	s.bucketMu.Lock()
+	defer s.bucketMu.Unlock()
+	if s.bucketChecked {
+		return s.bucketGone
+	}
+	ok, err := s.client.BucketExists(ctx, s.bucket)
+	if err != nil {
+		return fmt.Errorf("bucket %q existence check: %w", s.bucket, err) // transient — don't cache; re-check next probe
+	}
+	s.bucketChecked = true
+	if !ok {
+		s.bucketGone = fmt.Errorf("bucket %q does not exist (deleted/renamed/misconfigured?)", s.bucket)
+	}
+	return s.bucketGone
 }
 
 // putStream uploads r to key with SSE, size=-1 (streamed to EOF) so a commit is gated
