@@ -23,10 +23,13 @@ jobs:
   # run the integration tag, so this is the additive gate, not a fork of the shared workflow.
   cover:
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # bound a hung testcontainers/Docker wait (else the 6h default ceiling)
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # don't leave GITHUB_TOKEN available to `make cover-check`
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"io"
+	"os"
+	"strings"
+	"testing"
+)
 
 // TestRunDispatch covers the run() exit-code mapping (extracted from main so it's testable):
 // no subcommand and an unknown one print usage and exit 2; drill exits 1 (not implemented); a
@@ -30,5 +35,23 @@ func TestRunDispatch(t *testing.T) {
 	}
 }
 
-// TestUsage exercises the usage banner (prints to stderr).
-func TestUsage(_ *testing.T) { usage() }
+// TestUsage asserts the usage banner is written to stderr and lists the subcommands — a real
+// output assertion, not a coverage-only call (constitution §VII: no padding).
+func TestUsage(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	usage()
+	_ = w.Close()
+	os.Stderr = old
+	out, _ := io.ReadAll(r)
+	got := string(out)
+	for _, want := range []string{"usage:", "file-backup-service", "serve", "migrate"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("usage() stderr = %q, want it to contain %q", got, want)
+		}
+	}
+}
