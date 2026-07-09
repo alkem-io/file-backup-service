@@ -32,9 +32,27 @@ test-integration:
 # is met with real invariant/integration tests (pgmock/pgxmock/pgxpoolmock for the pgx
 # adapters, httptest for the sinks, a testcontainers Postgres for the live-DB paths), never
 # coverage padding. Runs WITH `-tags integration` (needs Docker) so the DB/cmd paths count.
+#
+# Coverage is collected via GOCOVERDIR (`-test.gocoverdir`) and merged with `go tool covdata`,
+# NOT a single `-coverprofile` text file: with `-coverpkg=./...` across MANY test binaries, the
+# legacy text-profile merge feeds `go tool cover -func` DUPLICATE blocks (one per binary that
+# compiled the package), which it double-counts — badly under-reporting (a 1-statement function
+# reads as 50%). covdata's binary format merges the per-binary streams into the correct UNION.
+# COVER_EXCLUDE drops NON-hand-written code from the coverage metric: the sqlc-GENERATED query
+# layer (`db/queries`, "DO NOT EDIT") and the integration test HARNESS (`testsupport`). §VII
+# measures OUR tests of OUR code — counting the generator's output or test scaffolding dilutes the
+# bar and would only reward padding tests of generated code (which §VII forbids). The generated
+# SQL is exercised for real by the testcontainers integration suite regardless; it just doesn't
+# count toward the denominator.
+COVER_EXCLUDE := internal/adapter/outbound/db/queries/|internal/testsupport/
+COVERDIR := coverage.covdir
 cover-check:
-	$(GO) test $(GOFLAGS) -tags integration -coverpkg=./... -coverprofile=coverage.out ./...
-	@total=$$($(GO) tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$$NF); print $$NF}'); \
+	rm -rf $(COVERDIR)
+	mkdir -p $(COVERDIR)
+	$(GO) test $(GOFLAGS) -tags integration -coverpkg=./... ./... -args -test.gocoverdir=$(CURDIR)/$(COVERDIR)
+	$(GO) tool covdata textfmt -i=$(COVERDIR) -o=coverage.out
+	@grep -vE '$(COVER_EXCLUDE)' coverage.out > coverage.product.out
+	@total=$$($(GO) tool cover -func=coverage.product.out | awk '/^total:/ {gsub(/%/,"",$$NF); print $$NF}'); \
 	awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { \
 	  printf "total coverage: %s%% (minimum %s%%)\n", t, m; \
 	  if (t+0 < m+0) { printf "FAIL: coverage %s%% is below the required %s%%\n", t, m; exit 1 } \
@@ -63,4 +81,4 @@ run:
 	$(GO) run ./cmd/file-backup-service/ serve
 
 clean:
-	rm -rf bin/ coverage.out
+	rm -rf bin/ coverage.out coverage.product.out $(COVERDIR)

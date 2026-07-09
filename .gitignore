@@ -6,6 +6,8 @@ bin/
 
 # Coverage
 coverage.out
+coverage.product.out
+coverage.covdir/
 
 # Environment
 .env
