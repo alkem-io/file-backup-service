@@ -1,11 +1,14 @@
-// Package config loads the file-backup-service worker configuration: a YAML base
-// (structure, incl. the symmetric target list) overlaid by 12-factor environment
-// variables. Env wins; secrets (DB passwords, S3 keys) come from env only.
+// Package config loads the file-backup-service worker configuration: an OPTIONAL YAML base
+// overlaid by 12-factor environment variables. Env wins, and a config file is NOT required — the
+// entire config, INCLUDING the target list, can be supplied by env. Secrets (DB passwords, S3
+// keys) come from env only.
 //
-//	Scalars:     FBS_FILESERVICEBASE, FBS_CONCURRENCY, FBS_METRICSPORT, ...
-//	DB parts:    FBS_ALKEMIODB_HOST/PORT/USER/PASSWORD/DBNAME/SSLMODE, FBS_LEDGERDB_*
-//	Per target:  FBS_TARGET_<NAME>_ACCESSKEY / _SECRETKEY / _BUCKET / ...
-//	             (<NAME> = target name upcased, non-alphanumerics -> '_')
+//	Scalars:  FBS_FILESERVICEBASE, FBS_CONCURRENCY, FBS_METRICSPORT, ...
+//	DB parts: FBS_ALKEMIODB_HOST/PORT/USER/PASSWORD/DBNAME/SSLMODE, FBS_LEDGERDB_*
+//	Targets:  FBS_TARGETS=<comma-list of names> defines the LIST; each target's fields come from
+//	          FBS_TARGET_<NAME>_<FIELD> — TYPE / PATH / ENDPOINT / BUCKET / REGION / ACCESSKEY /
+//	          SECRETKEY / USESSL / SSE / ... (<NAME> = name upcased, non-alphanumerics -> '_').
+//	          Without FBS_TARGETS the YAML target list stands; with it, it is authoritative.
 package config
 
 import (
@@ -215,8 +218,42 @@ func (c *Config) applyEnv() error {
 	add(setInt(&c.DBTimeoutSec, envPrefix+"DBTIMEOUTSEC"))
 	add(applyDBEnv(&c.AlkemioDB, envPrefix+"ALKEMIODB_"))
 	add(applyDBEnv(&c.LedgerDB, envPrefix+"LEDGERDB_"))
+	c.seedTargetsFromEnv() // define the target LIST from env (full 12-factor) before overlaying fields
 	add(c.applyTargetEnv())
 	return errors.Join(errs...)
+}
+
+// seedTargetsFromEnv lets the target LIST itself be defined by env — full 12-factor, no config
+// file required. FBS_TARGETS is a comma-separated list of target NAMES; each becomes a target
+// whose fields are then supplied by applyTargetEnv from FBS_TARGET_<NAME>_* (TYPE / PATH / BUCKET
+// / ENDPOINT / …). When set it is authoritative: a name that also appears in the YAML keeps that
+// entry as a base (env overlays it), any other name is created fresh, and YAML targets NOT listed
+// are dropped. Unset ⇒ the YAML target list stands (backward compatible). Order + de-dup follow
+// FBS_TARGETS; blank names are skipped.
+func (c *Config) seedTargetsFromEnv() {
+	raw := os.Getenv(envPrefix + "TARGETS")
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	base := make(map[string]Target, len(c.Targets))
+	for _, t := range c.Targets {
+		base[t.Name] = t
+	}
+	out := make([]Target, 0, len(base)+1)
+	seen := make(map[string]bool)
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		if t, ok := base[name]; ok {
+			out = append(out, t) // keep the YAML-declared base; applyTargetEnv overlays it
+		} else {
+			out = append(out, Target{Name: name})
+		}
+	}
+	c.Targets = out
 }
 
 func applyDBEnv(d *DBConfig, p string) error {
@@ -235,6 +272,7 @@ func (c *Config) applyTargetEnv() error {
 	errs := make([]error, 0, 4*len(c.Targets)) // 4 setBool calls per target (useSSL/sse/insecure/worm)
 	for i := range c.Targets {
 		p := envPrefix + "TARGET_" + envToken(c.Targets[i].Name) + "_"
+		setStr(&c.Targets[i].Type, p+"TYPE")
 		setStr(&c.Targets[i].Endpoint, p+"ENDPOINT")
 		setStr(&c.Targets[i].Region, p+"REGION")
 		setStr(&c.Targets[i].Bucket, p+"BUCKET")

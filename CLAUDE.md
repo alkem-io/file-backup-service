@@ -65,14 +65,18 @@ target restorable with nothing but bytes + a hash check.
 - Never a delete path to the primary store or the immutable target; never GC by default (retain-all)
 - Use `actorId` internally, never `userId`
 
-## Configuration (YAML base + env overrides)
+## Configuration (env-first; optional YAML base)
 
-A **YAML** file (`config.yaml`; see `config.example.yaml`) defines the structure —
-including the **symmetric** target list (every object goes to every target, "done"
-requires all). **Environment variables (`FBS_*`) override any scalar and inject
-secrets**; env wins (12-factor), matching the house style (`file-service` is
-env-configured from `alkemio-config` + secrets). Secrets (DB passwords, S3 keys)
-come from env only. `internal/config`.
+Fully **12-factor**: every value — including the **symmetric** target list (every
+object goes to every target, "done" requires all) — is settable via
+**environment variables (`FBS_*`)**, so a config file is **optional**. An
+optional **YAML** file (`config.yaml`; see `config.example.yaml`) may supply the
+same structure as a base; env wins over it. The **target list** comes from
+`FBS_TARGETS` (comma-separated names) with each target's fields from
+`FBS_TARGET_<NAME>_<FIELD>` (`TYPE`/`PATH`/`ENDPOINT`/`BUCKET`/…); when set,
+`FBS_TARGETS` is authoritative over any YAML list. Matches the house style
+(`file-service` is env-configured from `alkemio-config` + secrets). Secrets (DB
+passwords, S3 keys) come from env only. `internal/config`.
 
 - `fileServiceBase` / `FBS_FILESERVICEBASE` — base URL for `GET /internal/file/{id}/content`
 - `alkemioDB` (host/port/user/password/dbName/sslMode → a libpq DSN) — the outbox, scoped SELECT/UPDATE role. Env: `FBS_ALKEMIODB_HOST` (reuse the shared `DATABASE_HOST`), `FBS_ALKEMIODB_PASSWORD`, …
