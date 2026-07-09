@@ -23,71 +23,68 @@ func (s *immSink) CheckImmutability(context.Context) (bool, bool, error) {
 func wormTarget(sink Sink) Target { return Target{Sink: sink, Worm: true} }
 
 func TestCheckImmutabilitySkipsNonWorm(t *testing.T) {
-	// A non-Worm target carries NO result even if its sink could report lock config.
-	res := CheckImmutability(context.Background(), []Target{
+	rep := CheckImmutability(context.Background(), []Target{
 		{Sink: &immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}}, // not Worm
 	})
-	if len(res) != 0 {
-		t.Fatalf("a non-Worm target must not be immutability-checked, got %+v", res)
+	if len(rep.Targets) != 0 {
+		t.Fatalf("a non-Worm target must not be immutability-checked, got %+v", rep.Targets)
 	}
 }
 
 func TestCheckImmutabilityOKAndDrift(t *testing.T) {
-	res := CheckImmutability(context.Background(), []Target{
+	rep := CheckImmutability(context.Background(), []Target{
 		wormTarget(&immSink{stubSink: stubSink{name: "good"}, lock: true, versioning: true}),
 		wormTarget(&immSink{stubSink: stubSink{name: "nolock"}, lock: false, versioning: true}),
 		wormTarget(&immSink{stubSink: stubSink{name: "nover"}, lock: true, versioning: false}),
 	})
-	by := map[string]ImmutabilityResult{}
-	for _, r := range res {
-		by[r.Target] = r
+	by := byTarget(rep)
+	if v := by["good"]; v.Status != StatusVerified || v.Failed() {
+		t.Fatalf("good: want Verified+pass, got %+v", v)
 	}
-	if r := by["good"]; r.Unverifiable || !r.OK || r.Failed() {
-		t.Fatalf("good: want verified+ok, got %+v", r)
+	if v := by["nolock"]; v.Status != StatusDrift || !v.Failed() {
+		t.Fatalf("nolock: object-lock off must be DRIFT+fail, got %+v", v)
 	}
-	if r := by["nolock"]; r.Unverifiable || r.OK || !r.Failed() {
-		t.Fatalf("nolock: object-lock off must be drift, got %+v", r)
+	if v := by["nover"]; v.Status != StatusDrift || !v.Failed() {
+		t.Fatalf("nover: versioning off must be DRIFT+fail, got %+v", v)
 	}
-	if r := by["nover"]; r.Unverifiable || r.OK || !r.Failed() {
-		t.Fatalf("nover: versioning off must be drift, got %+v", r)
-	}
-	if err := ImmutabilityFailErr(res); err == nil {
+	if rep.FailErr() == nil {
 		t.Fatal("a set with drift must produce a non-nil verdict")
 	}
 }
 
-func TestCheckImmutabilityReadDenyingIsTransientUnverifiable(t *testing.T) {
-	// A read-denying (PutObject-only) WORM credential 403s the config GET — UNVERIFIABLE (NOT drift),
-	// and TRANSIENT (Structural=false): the sampler keeps the prior gauge value rather than clearing.
-	res := CheckImmutability(context.Background(), []Target{
+func TestCheckImmutabilityReadDenyingIsUnverifiable(t *testing.T) {
+	// A read-denying (PutObject-only) WORM credential 403s the config GET — Unverifiable (NOT drift,
+	// NOT structural NoData), and being worm it does NOT fail the audit.
+	rep := CheckImmutability(context.Background(), []Target{
 		wormTarget(&immSink{stubSink: stubSink{name: "worm403"}, err: errors.New("AccessDenied")}),
 	})
-	if len(res) != 1 || !res[0].Unverifiable || res[0].Structural || res[0].Failed() {
-		t.Fatalf("a read-denying WORM target must be transient-unverifiable, not failed/structural: %+v", res)
+	if v := rep.Targets[0]; v.Status != StatusUnverifiable || v.Failed() {
+		t.Fatalf("a read-denying WORM target must be Unverifiable and not fail: %+v", v)
 	}
-	if err := ImmutabilityFailErr(res); err != nil {
-		t.Fatalf("an unverifiable target must not fail the verdict, got %v", err)
+	if err := rep.FailErr(); err != nil {
+		t.Fatalf("an unverifiable worm target must not fail the verdict, got %v", err)
 	}
 }
 
-func TestCheckImmutabilityNoCapabilityIsStructural(t *testing.T) {
+func TestCheckImmutabilityNoCapabilityIsNoData(t *testing.T) {
 	// A Worm target whose sink can't report object-lock AT ALL (a filesystem target — stubSink
-	// implements no immutabilityChecker) is STRUCTURAL-unverifiable: it can never carry a signal.
-	res := CheckImmutability(context.Background(), []Target{wormTarget(stubSink{name: "fsworm"})})
-	if len(res) != 1 || !res[0].Unverifiable || !res[0].Structural || res[0].Failed() {
-		t.Fatalf("a non-s3 WORM target must be structural-unverifiable: %+v", res)
+	// implements no immutabilityChecker) is NoData (structural: it can never carry a signal).
+	rep := CheckImmutability(context.Background(), []Target{wormTarget(stubSink{name: "fsworm"})})
+	if v := rep.Targets[0]; v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("a non-s3 WORM target must be NoData (benign): %+v", v)
 	}
 }
 
-// fakeImmGauge records SetImmutabilityOK + ClearImmutabilityOK calls so the sampler's
-// keep-prior-on-transient / clear-on-structural POLICY is testable without a live registry.
+// fakeImmGauge records the three gauge calls so the sampler's derive-from-Status policy is testable
+// without a live registry.
 type fakeImmGauge struct {
 	set     map[string]bool
 	cleared map[string]bool
+	unverif map[string]bool
 }
 
 func newFakeImmGauge() *fakeImmGauge {
-	return &fakeImmGauge{set: map[string]bool{}, cleared: map[string]bool{}}
+	return &fakeImmGauge{set: map[string]bool{}, cleared: map[string]bool{}, unverif: map[string]bool{}}
 }
 func (g *fakeImmGauge) SetImmutabilityOK(target string, ok bool) {
 	g.set[target] = ok
@@ -97,43 +94,58 @@ func (g *fakeImmGauge) ClearImmutabilityOK(target string) {
 	g.cleared[target] = true
 	delete(g.set, target)
 }
+func (g *fakeImmGauge) SetImmutabilityUnverifiable(target string, unverifiable bool) {
+	g.unverif[target] = unverifiable
+}
 
 func TestImmutabilitySamplerPolicy(t *testing.T) {
 	g := newFakeImmGauge()
 	s := NewImmutabilitySampler([]Target{
 		wormTarget(&immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true}),
 		wormTarget(&immSink{stubSink: stubSink{name: "drift"}, lock: false, versioning: true}),
-		wormTarget(&immSink{stubSink: stubSink{name: "denied"}, err: errors.New("AccessDenied")}), // transient
-		wormTarget(stubSink{name: "nocap"}),                                                       // structural
+		wormTarget(&immSink{stubSink: stubSink{name: "denied"}, err: errors.New("AccessDenied")}), // Unverifiable
+		wormTarget(stubSink{name: "nocap"}),                                                       // NoData
 		{Sink: &immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}},         // not Worm
 	}, g)
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("Sample: %v", err)
 	}
 	if v, ok := g.set["ok"]; !ok || !v {
-		t.Fatalf("verifiable-ok must set gauge true, got %v/%v", v, ok)
+		t.Fatalf("verified must set gauge true, got %v/%v", v, ok)
+	}
+	if g.unverif["ok"] {
+		t.Fatal("a verified target must clear its unverifiable signal")
 	}
 	if v, ok := g.set["drift"]; !ok || v {
-		t.Fatalf("verifiable-drift must set gauge false, got %v/%v", v, ok)
+		t.Fatalf("drift must set gauge false, got %v/%v", v, ok)
 	}
+	// denied = Unverifiable: DROP the stale-green _ok series AND raise the distinct signal (the fix
+	// for stale-green masking — a rotated-to-write-only credential can't freeze the gauge at 1).
 	if _, ok := g.set["denied"]; ok {
-		t.Fatal("a read-denying (transient-unverifiable) target must NOT emit a series")
+		t.Fatal("an unverifiable target must NOT keep an _ok series")
 	}
-	if g.cleared["denied"] {
-		t.Fatal("a TRANSIENT-unverifiable target must NOT be cleared (keep prior — don't clobber a healthy-but-slow target)")
+	if !g.cleared["denied"] {
+		t.Fatal("an unverifiable target must CLEAR its _ok series (no stale-green)")
 	}
+	if !g.unverif["denied"] {
+		t.Fatal("an unverifiable target must RAISE the distinct unverifiable signal")
+	}
+	// nocap = structural NoData: drop the _ok series but do NOT alert (it can never carry a signal).
 	if !g.cleared["nocap"] {
-		t.Fatal("a STRUCTURAL-unverifiable target (no capability) must be cleared (it can never carry a signal)")
+		t.Fatal("a structural-NoData target must clear its _ok series")
+	}
+	if g.unverif["nocap"] {
+		t.Fatal("a structural-NoData target must NOT raise the unverifiable signal (it's expected)")
 	}
 	if _, ok := g.set["plain"]; ok {
 		t.Fatal("a non-Worm target must not be sampled")
 	}
 }
 
-// TestImmutabilitySamplerKeepsPriorOnTransient (review Cluster 4): a target that was verifiable-green
-// then merely TIMES OUT / read-denies transiently must KEEP its prior series — NOT go no-signal
-// (which would hide a real drift behind an absent gauge).
-func TestImmutabilitySamplerKeepsPriorOnTransient(t *testing.T) {
+// TestImmutabilitySamplerDropsStaleGreenOnTransient (Pillar 1): a target that was verifiable-green
+// then turns transiently unverifiable must NOT stay frozen stale-green — the _ok series is DROPPED
+// and the distinct unverifiable signal is raised, so a later real drift can't be masked.
+func TestImmutabilitySamplerDropsStaleGreenOnTransient(t *testing.T) {
 	g := newFakeImmGauge()
 	sink := &immSink{stubSink: stubSink{name: "flip"}, lock: true, versioning: true}
 	s := NewImmutabilitySampler([]Target{wormTarget(sink)}, g)
@@ -143,14 +155,15 @@ func TestImmutabilitySamplerKeepsPriorOnTransient(t *testing.T) {
 	if v, present := g.set["flip"]; !present || !v {
 		t.Fatalf("pass 1 must set the series green, got %v/%v", v, present)
 	}
-	// Pass 2: the target now transiently can't read (a slow/read-denied WORM). The series must be
-	// KEPT (not set, not cleared) — the prior green value stands.
-	sink.err = errors.New("timeout")
+	sink.err = errors.New("timeout") // pass 2: now transiently unreadable
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("pass 2: %v", err)
 	}
-	if g.cleared["flip"] {
-		t.Fatal("a transient-unverifiable pass must NOT clear a formerly-green series (Cluster 4 over-clear)")
+	if !g.cleared["flip"] {
+		t.Fatal("a transient-unverifiable pass must DROP the formerly-green series (no stale-green)")
+	}
+	if !g.unverif["flip"] {
+		t.Fatal("dropping the green series must raise the distinct unverifiable signal (not go silent)")
 	}
 }
 
@@ -164,19 +177,21 @@ func TestImmutabilitySamplerCancelled(t *testing.T) {
 	}
 }
 
-// TestCheckImmutabilityBoundsHangingProbe: a probe that ignores ctx (a black-holing backend) must
-// be abandoned at the per-probe deadline and reported unverifiable, not hang the sampler.
+// TestCheckImmutabilityBoundsHangingProbe: a probe that ignores ctx (a black-holing backend) must be
+// abandoned at the per-target auditProbeTimeout and reported Unverifiable, not hang the sampler.
 func TestCheckImmutabilityBoundsHangingProbe(t *testing.T) {
+	old := auditProbeTimeout
+	auditProbeTimeout = 50 * time.Millisecond
+	defer func() { auditProbeTimeout = old }()
+
 	h := &hangingImmSink{stubSink: stubSink{name: "hang"}, release: make(chan struct{})}
 	t.Cleanup(func() { close(h.release) })
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	done := make(chan []ImmutabilityResult, 1)
-	go func() { done <- CheckImmutability(ctx, []Target{wormTarget(h)}) }()
+	done := make(chan VerdictReport, 1)
+	go func() { done <- CheckImmutability(context.Background(), []Target{wormTarget(h)}) }()
 	select {
-	case res := <-done:
-		if len(res) != 1 || !res[0].Unverifiable {
-			t.Fatalf("a hung immutability probe must be abandoned as unverifiable, got %+v", res)
+	case rep := <-done:
+		if v := rep.Targets[0]; v.Status != StatusUnverifiable {
+			t.Fatalf("a hung immutability probe must be abandoned as Unverifiable, got %+v", v)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("CheckImmutability HUNG on a ctx-ignoring probe")

@@ -3,14 +3,11 @@
 package metrics
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
@@ -47,7 +45,13 @@ type Metrics struct {
 	// series is NEVER emitted (so the `== 0` alert can't false-fire on an inherently
 	// unverifiable PutObject-only credential — the never-verified/audit signals cover it).
 	immutabilityOK *prometheus.GaugeVec
-	byTarget       sync.Map // target name -> *targetCounters (resolved once, per target)
+	// immutabilityUnverifiable is the DISTINCT unverifiable signal (Pillar 1): per Worm target the
+	// worker SHOULD be able to read, 1 = it has been unverifiable this pass (a credential rotated to
+	// write-only, a persistent read-deny, a wedged endpoint). It exists so the _ok series can be
+	// DROPPED when a target turns unreadable — avoiding a frozen stale-green that masks a later real
+	// drift — WITHOUT going silent: alert on `filebackup_immutability_unverifiable == 1` sustained.
+	immutabilityUnverifiable *prometheus.GaugeVec
+	byTarget                 sync.Map // target name -> *targetCounters (resolved once, per target)
 }
 
 // New builds a Metrics with its own registry.
@@ -110,7 +114,11 @@ func New() *Metrics {
 		}),
 		immutabilityOK: f.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "filebackup_immutability_ok",
-			Help: "Per WORM/immutable target: 1 = object-lock + versioning still configured, 0 = drift detected. Emitted ONLY for targets whose immutability could actually be read (an S3 target whose credential can query the lock/versioning config); a read-denying (PutObject-only) WORM target is unverifiable so its series is absent — alert on == 0.",
+			Help: "Per WORM/immutable target: 1 = object-lock + versioning still configured, 0 = drift detected. Emitted ONLY for a target whose immutability could actually be READ this pass; a target that turns unverifiable has its series DROPPED (not frozen stale-green) and raises filebackup_immutability_unverifiable instead — alert on == 0.",
+		}, []string{"target"}),
+		immutabilityUnverifiable: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "filebackup_immutability_unverifiable",
+			Help: "Per WORM target the worker SHOULD be able to read: 1 = its object-lock/versioning could NOT be read this pass (a credential rotated to write-only, a persistent read-deny, a wedged endpoint). Set when the _ok series is dropped so the drop is alertable, not silent — alert on == 1 sustained. A structurally-unreadable target (a filesystem WORM with no bucket object-lock) does NOT set this (it is expected, not an anomaly).",
 		}, []string{"target"}),
 	}
 }
@@ -123,11 +131,24 @@ func (m *Metrics) SetImmutabilityOK(target string, ok bool) {
 	m.immutabilityOK.WithLabelValues(target).Set(b2f(ok))
 }
 
-// ClearImmutabilityOK removes target's drift series (used when it becomes unverifiable), so a
-// formerly-green target that turns unreadable drops to NO series rather than freezing stale at 1.
-// Deleting an absent series is a no-op, so an always-unverifiable target simply never appears.
+// ClearImmutabilityOK removes target's drift series (used when it becomes unverifiable or is
+// structurally unreadable), so a formerly-green target that turns unreadable drops to NO series
+// rather than freezing stale at 1. Deleting an absent series is a no-op, so an always-unverifiable
+// target simply never appears.
 func (m *Metrics) ClearImmutabilityOK(target string) {
 	m.immutabilityOK.DeleteLabelValues(target)
+}
+
+// SetImmutabilityUnverifiable raises (true → 1) or drops (false → delete) target's distinct
+// unverifiable signal. It is raised when a target the worker SHOULD be able to read turns
+// unreadable — so dropping the stale-green _ok series does not go silent — and dropped again once the
+// target verifies or is structurally-unreadable-by-design. Deleting an absent series is a no-op.
+func (m *Metrics) SetImmutabilityUnverifiable(target string, unverifiable bool) {
+	if unverifiable {
+		m.immutabilityUnverifiable.WithLabelValues(target).Set(1)
+		return
+	}
+	m.immutabilityUnverifiable.DeleteLabelValues(target)
 }
 
 // b2f maps a bool to the Prometheus 1/0 gauge convention.
@@ -213,24 +234,31 @@ func (d *DrillMetrics) WriteTextfile(path string) error {
 }
 
 // readPriorLastSuccess parses the existing textfile for the last-success gauge's value, so a
-// failing run can re-emit it unchanged. A missing/unparseable file yields 0 (nothing to carry).
+// failing run can re-emit it unchanged. It uses expfmt.TextParser — the SAME exposition-format
+// parser Prometheus itself uses — rather than a fragile hand-rolled 2-field split that a HELP/TYPE
+// comment, a label set, or a scientific-notation value could defeat. A missing/unparseable file, or
+// an absent metric, yields 0 (nothing to carry).
 func readPriorLastSuccess(path string) float64 {
 	f, err := os.Open(path) //nolint:gosec // operator-configured metrics textfile path
 	if err != nil {
 		return 0
 	}
 	defer func() { _ = f.Close() }()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, drillLastSuccessMetric) {
-			continue
-		}
-		fields := strings.Fields(line) // "<name> <value>"
-		if len(fields) == 2 && fields[0] == drillLastSuccessMetric {
-			if v, perr := strconv.ParseFloat(fields[1], 64); perr == nil {
-				return v
-			}
+	// NewTextParser (not a zero-value TextParser): a zero-value parser has an UnsetValidation name
+	// scheme, whose IsValidMetricName PANICS in prometheus/common v0.66.1 — which would crash any
+	// failing drill run that reads a prior textfile. Use the library's default name-validation scheme.
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	mfs, err := parser.TextToMetricFamilies(f)
+	if err != nil {
+		return 0
+	}
+	mf, ok := mfs[drillLastSuccessMetric]
+	if !ok {
+		return 0
+	}
+	for _, m := range mf.GetMetric() {
+		if g := m.GetGauge(); g != nil {
+			return g.GetValue()
 		}
 	}
 	return 0

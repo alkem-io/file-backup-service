@@ -203,6 +203,34 @@ func TestSetAndClearImmutabilityOK(t *testing.T) {
 	}
 }
 
+// TestSetImmutabilityUnverifiable: the DISTINCT unverifiable signal is a per-target gauge raised to
+// 1 when a readable WORM target turns unreadable (so the dropped stale-green _ok series is not
+// silent), and DELETED again once it verifies. It is a separate GaugeVec from immutabilityOK — set
+// true → the series is present with value 1; set false → the series is dropped (CollectAndCount falls).
+func TestSetImmutabilityUnverifiable(t *testing.T) {
+	m := New()
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 0 {
+		t.Fatalf("no target should be unverifiable initially, got %d series", got)
+	}
+	m.SetImmutabilityUnverifiable("t", true)
+	if got := testutil.ToFloat64(m.immutabilityUnverifiable.WithLabelValues("t")); got != 1 {
+		t.Errorf("unverifiable gauge for t = %v, want 1", got)
+	}
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 1 {
+		t.Errorf("unverifiable series = %d, want exactly 1", got)
+	}
+	// Setting false drops the series (not a 0 value) so a recovered target goes silent, not stale-red.
+	m.SetImmutabilityUnverifiable("t", false)
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 0 {
+		t.Errorf("after clearing, unverifiable series = %d, want 0 (the series is dropped)", got)
+	}
+	// Dropping an absent series is a harmless no-op.
+	m.SetImmutabilityUnverifiable("never-set", false)
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 0 {
+		t.Errorf("dropping an absent series must be a no-op, got %d series", got)
+	}
+}
+
 // TestDrillMetricsSetAndTextfile: a full-pass drill sets pass=1 and a last-success timestamp; the
 // textfile export writes valid exposition with both drill gauges (and NO go_*/process_* series,
 // so it can't collide with the worker's own /metrics when the node exporter merges them).

@@ -96,14 +96,18 @@ func (s cancelOnExistsSink) Exists(context.Context, string) (bool, error) {
 }
 
 // TestAuditTargetCancelledMidPage: if cancellation lands after StoredExternalIDsPage but during
-// the concurrent Exists probes, auditTarget must return the ctx error — the in-flight tainted
-// probes must NOT be tallied as a clean pass (which would hide silent loss behind a false green).
+// the concurrent Exists probes, auditTarget must NOT tally the in-flight tainted probes as a clean
+// (Verified) pass — the cancelled sweep classifies as benign NoData (the cmd's top-level ctx.Err()
+// fold surfaces the abort), never a false green that would hide silent loss.
 func TestAuditTargetCancelledMidPage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sink := cancelOnExistsSink{stubSink: stubSink{name: "t"}, cancel: cancel}
-	_, err := auditTarget(ctx, onePageLedger{}, Target{Sink: sink}, 0, "")
-	if err == nil {
-		t.Fatal("a cancellation mid-page must abort the audit target with an error, not read as a clean pass")
+	v := auditTarget(ctx, onePageLedger{}, Target{Sink: sink}, 0, "")
+	if v.Status == StatusVerified {
+		t.Fatalf("a cancellation mid-page must NOT read as a Verified pass, got %+v", v)
+	}
+	if v.Status != StatusNoData {
+		t.Fatalf("a cancelled sweep must classify benign NoData at the domain level, got %+v", v)
 	}
 }
