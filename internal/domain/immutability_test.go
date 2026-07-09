@@ -8,14 +8,15 @@ import (
 )
 
 // immSink is a stubSink that reports a fixed object-lock/versioning verdict (or an error, e.g. a
-// read-denying WORM credential 403), satisfying the immutabilityChecker capability.
+// read-denying WORM credential 403). A POINTER receiver so a test can flip its verdict between
+// sampler passes without a second type.
 type immSink struct {
 	stubSink
 	lock, versioning bool
 	err              error
 }
 
-func (s immSink) CheckImmutability(context.Context) (bool, bool, error) {
+func (s *immSink) CheckImmutability(context.Context) (bool, bool, error) {
 	return s.lock, s.versioning, s.err
 }
 
@@ -24,7 +25,7 @@ func wormTarget(sink Sink) Target { return Target{Sink: sink, Worm: true} }
 func TestCheckImmutabilitySkipsNonWorm(t *testing.T) {
 	// A non-Worm target carries NO result even if its sink could report lock config.
 	res := CheckImmutability(context.Background(), []Target{
-		{Sink: immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}}, // not Worm
+		{Sink: &immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}}, // not Worm
 	})
 	if len(res) != 0 {
 		t.Fatalf("a non-Worm target must not be immutability-checked, got %+v", res)
@@ -33,21 +34,21 @@ func TestCheckImmutabilitySkipsNonWorm(t *testing.T) {
 
 func TestCheckImmutabilityOKAndDrift(t *testing.T) {
 	res := CheckImmutability(context.Background(), []Target{
-		wormTarget(immSink{stubSink: stubSink{name: "good"}, lock: true, versioning: true}),
-		wormTarget(immSink{stubSink: stubSink{name: "nolock"}, lock: false, versioning: true}),
-		wormTarget(immSink{stubSink: stubSink{name: "nover"}, lock: true, versioning: false}),
+		wormTarget(&immSink{stubSink: stubSink{name: "good"}, lock: true, versioning: true}),
+		wormTarget(&immSink{stubSink: stubSink{name: "nolock"}, lock: false, versioning: true}),
+		wormTarget(&immSink{stubSink: stubSink{name: "nover"}, lock: true, versioning: false}),
 	})
 	by := map[string]ImmutabilityResult{}
 	for _, r := range res {
 		by[r.Target] = r
 	}
-	if r := by["good"]; !r.Checked || !r.OK || r.Failed() || r.Unverifiable {
-		t.Fatalf("good: want checked+ok, got %+v", r)
+	if r := by["good"]; r.Unverifiable || !r.OK || r.Failed() {
+		t.Fatalf("good: want verified+ok, got %+v", r)
 	}
-	if r := by["nolock"]; !r.Checked || r.OK || !r.Failed() {
+	if r := by["nolock"]; r.Unverifiable || r.OK || !r.Failed() {
 		t.Fatalf("nolock: object-lock off must be drift, got %+v", r)
 	}
-	if r := by["nover"]; !r.Checked || r.OK || !r.Failed() {
+	if r := by["nover"]; r.Unverifiable || r.OK || !r.Failed() {
 		t.Fatalf("nover: versioning off must be drift, got %+v", r)
 	}
 	if err := ImmutabilityFailErr(res); err == nil {
@@ -55,31 +56,31 @@ func TestCheckImmutabilityOKAndDrift(t *testing.T) {
 	}
 }
 
-func TestCheckImmutabilityReadDenyingIsUnverifiable(t *testing.T) {
-	// A read-denying (PutObject-only) WORM credential 403s the config GET — that is UNVERIFIABLE,
-	// NOT drift: it must never fail the audit / drive the gauge to 0.
+func TestCheckImmutabilityReadDenyingIsTransientUnverifiable(t *testing.T) {
+	// A read-denying (PutObject-only) WORM credential 403s the config GET — UNVERIFIABLE (NOT drift),
+	// and TRANSIENT (Structural=false): the sampler keeps the prior gauge value rather than clearing.
 	res := CheckImmutability(context.Background(), []Target{
-		wormTarget(immSink{stubSink: stubSink{name: "worm403"}, err: errors.New("AccessDenied")}),
+		wormTarget(&immSink{stubSink: stubSink{name: "worm403"}, err: errors.New("AccessDenied")}),
 	})
-	if len(res) != 1 || !res[0].Unverifiable || res[0].Failed() {
-		t.Fatalf("a read-denying WORM target must be unverifiable, not failed: %+v", res)
+	if len(res) != 1 || !res[0].Unverifiable || res[0].Structural || res[0].Failed() {
+		t.Fatalf("a read-denying WORM target must be transient-unverifiable, not failed/structural: %+v", res)
 	}
 	if err := ImmutabilityFailErr(res); err != nil {
 		t.Fatalf("an unverifiable target must not fail the verdict, got %v", err)
 	}
 }
 
-func TestCheckImmutabilityNoCapabilityIsUnverifiable(t *testing.T) {
-	// A Worm target whose sink can't report object-lock at all (a filesystem target — stubSink
-	// implements no immutabilityChecker) is unverifiable, not drift.
+func TestCheckImmutabilityNoCapabilityIsStructural(t *testing.T) {
+	// A Worm target whose sink can't report object-lock AT ALL (a filesystem target — stubSink
+	// implements no immutabilityChecker) is STRUCTURAL-unverifiable: it can never carry a signal.
 	res := CheckImmutability(context.Background(), []Target{wormTarget(stubSink{name: "fsworm"})})
-	if len(res) != 1 || !res[0].Unverifiable || res[0].Failed() {
-		t.Fatalf("a non-s3 WORM target must be unverifiable: %+v", res)
+	if len(res) != 1 || !res[0].Unverifiable || !res[0].Structural || res[0].Failed() {
+		t.Fatalf("a non-s3 WORM target must be structural-unverifiable: %+v", res)
 	}
 }
 
 // fakeImmGauge records SetImmutabilityOK + ClearImmutabilityOK calls so the sampler's
-// emit-verifiable / clear-unverifiable POLICY is testable without a live registry.
+// keep-prior-on-transient / clear-on-structural POLICY is testable without a live registry.
 type fakeImmGauge struct {
 	set     map[string]bool
 	cleared map[string]bool
@@ -97,78 +98,67 @@ func (g *fakeImmGauge) ClearImmutabilityOK(target string) {
 	delete(g.set, target)
 }
 
-func TestImmutabilitySamplerEmitsOnlyVerifiable(t *testing.T) {
+func TestImmutabilitySamplerPolicy(t *testing.T) {
 	g := newFakeImmGauge()
 	s := NewImmutabilitySampler([]Target{
-		wormTarget(immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true}),
-		wormTarget(immSink{stubSink: stubSink{name: "drift"}, lock: false, versioning: true}),
-		wormTarget(immSink{stubSink: stubSink{name: "denied"}, err: errors.New("AccessDenied")}),
-		{Sink: immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}}, // not Worm
+		wormTarget(&immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true}),
+		wormTarget(&immSink{stubSink: stubSink{name: "drift"}, lock: false, versioning: true}),
+		wormTarget(&immSink{stubSink: stubSink{name: "denied"}, err: errors.New("AccessDenied")}), // transient
+		wormTarget(stubSink{name: "nocap"}),                                                       // structural
+		{Sink: &immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}},         // not Worm
 	}, g)
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("Sample: %v", err)
 	}
 	if v, ok := g.set["ok"]; !ok || !v {
-		t.Fatalf("verifiable-ok target must set gauge true, got %v/%v", v, ok)
+		t.Fatalf("verifiable-ok must set gauge true, got %v/%v", v, ok)
 	}
 	if v, ok := g.set["drift"]; !ok || v {
-		t.Fatalf("verifiable-drift target must set gauge false, got %v/%v", v, ok)
+		t.Fatalf("verifiable-drift must set gauge false, got %v/%v", v, ok)
 	}
 	if _, ok := g.set["denied"]; ok {
-		t.Fatal("a read-denying (unverifiable) target must NOT emit a gauge series (else `== 0` false-fires)")
+		t.Fatal("a read-denying (transient-unverifiable) target must NOT emit a series")
 	}
-	if !g.cleared["denied"] {
-		t.Fatal("an unverifiable target must CLEAR its series (else a formerly-green target stays stale-green)")
+	if g.cleared["denied"] {
+		t.Fatal("a TRANSIENT-unverifiable target must NOT be cleared (keep prior — don't clobber a healthy-but-slow target)")
+	}
+	if !g.cleared["nocap"] {
+		t.Fatal("a STRUCTURAL-unverifiable target (no capability) must be cleared (it can never carry a signal)")
 	}
 	if _, ok := g.set["plain"]; ok {
 		t.Fatal("a non-Worm target must not be sampled")
 	}
 }
 
-// TestImmutabilitySamplerClearsStaleGreen: a target that was verifiable-green then becomes
-// unverifiable must have its series CLEARED on the next pass — not frozen at 1 (which would mask
-// a real drift behind a stale-green gauge).
-func TestImmutabilitySamplerClearsStaleGreen(t *testing.T) {
+// TestImmutabilitySamplerKeepsPriorOnTransient (review Cluster 4): a target that was verifiable-green
+// then merely TIMES OUT / read-denies transiently must KEEP its prior series — NOT go no-signal
+// (which would hide a real drift behind an absent gauge).
+func TestImmutabilitySamplerKeepsPriorOnTransient(t *testing.T) {
 	g := newFakeImmGauge()
-	// Pass 1: verifiable + ok → series set to true.
-	ok := &toggleImmSink{stubSink: stubSink{name: "flip"}, lock: true, versioning: true}
-	s := NewImmutabilitySampler([]Target{wormTarget(ok)}, g)
+	sink := &immSink{stubSink: stubSink{name: "flip"}, lock: true, versioning: true}
+	s := NewImmutabilitySampler([]Target{wormTarget(sink)}, g)
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("pass 1: %v", err)
 	}
 	if v, present := g.set["flip"]; !present || !v {
 		t.Fatalf("pass 1 must set the series green, got %v/%v", v, present)
 	}
-	// Pass 2: the target's credential now can't read (unverifiable) → the series must be cleared.
-	ok.err = errors.New("AccessDenied")
+	// Pass 2: the target now transiently can't read (a slow/read-denied WORM). The series must be
+	// KEPT (not set, not cleared) — the prior green value stands.
+	sink.err = errors.New("timeout")
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("pass 2: %v", err)
 	}
-	if _, present := g.set["flip"]; present {
-		t.Fatal("a now-unverifiable target must NOT keep its green series")
+	if g.cleared["flip"] {
+		t.Fatal("a transient-unverifiable pass must NOT clear a formerly-green series (Cluster 4 over-clear)")
 	}
-	if !g.cleared["flip"] {
-		t.Fatal("a now-unverifiable target's series must be cleared")
-	}
-}
-
-// toggleImmSink is an immSink whose verdict can be flipped between passes (its err set to make it
-// unverifiable).
-type toggleImmSink struct {
-	stubSink
-	lock, versioning bool
-	err              error
-}
-
-func (s *toggleImmSink) CheckImmutability(context.Context) (bool, bool, error) {
-	return s.lock, s.versioning, s.err
 }
 
 func TestImmutabilitySamplerCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	g := &fakeImmGauge{set: map[string]bool{}}
-	s := NewImmutabilitySampler([]Target{wormTarget(immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true})}, g)
+	g := newFakeImmGauge()
+	s := NewImmutabilitySampler([]Target{wormTarget(&immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true})}, g)
 	if err := s.Sample(ctx); err == nil {
 		t.Fatal("a cancelled sample must return the ctx error")
 	}

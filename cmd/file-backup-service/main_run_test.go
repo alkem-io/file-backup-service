@@ -27,7 +27,7 @@ func TestRunDispatch(t *testing.T) {
 		{"audit-bad-config", []string{"file-backup-service", "audit", "--config", bad}, 1},
 		{"backfill-bad-config", []string{"file-backup-service", "backfill", "--config", bad}, 1},
 		{"restore-all-bad-config", []string{"file-backup-service", "restore", "all", "--config", bad}, 1},
-		{"restore-version-bad-config", []string{"file-backup-service", "restore", "version", "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", "--at", "2026-07-01T00:00:00Z", "--config", bad}, 1},
+		{"restore-current-bad-config", []string{"file-backup-service", "restore", "current", "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", "--at", "2026-07-01T00:00:00Z", "--config", bad}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -168,45 +168,59 @@ export FBS_TARGET_OFFSITE_SECRETKEY=…
 | `audit` | — | — | ✅ | ✅ |
 | `restore object` / `verify` | — | — | — | ✅ (the `--from` target) |
 | `restore all` | — | — | ✅ (enumerate) | ✅ (the `--from` target) |
-| `restore version` | — | ✅ (unless `--hash`) | — | ✅ (the `--from` target) |
+| `restore current` | — | ✅ (unless `--hash`) | — | ✅ (the `--from` target) |
 | `drill` | — | — | ✅ (sample) | ✅ (the `--from` target) |
 | `migrate` | — | — | ✅ | — |
 
 `reconcile`/`audit`/`restore`/`verify`/`drill` run in a degraded/DR environment and
 deliberately don't require file-service or the outbox DB. `restore all` and `drill`
-read the **ledger** to enumerate/sample objects; `restore version` needs the
+read the **ledger** to enumerate/sample objects; `restore current` needs the
 **alkemio DB** to resolve a `--file-id` to its content hash — unless you pass an
 explicit `--hash` (a hash recovered from a DB point-in-time restore), which skips
 the lookup and needs only the target.
+
+**Read source (`--from`) must be readable.** For any read op (`restore`/`drill`) the
+`--from` target must be one the worker can **read**. A **WORM/PutObject-only** target
+(`worm: true`) is write-only and is **rejected loud** — whether named explicitly or
+picked as the default. With `--from` omitted, the default is the **first readable
+(non-WORM)** target. (Note: the infra-ops restore-drill CronJob ships `--from offsite`
+where `offsite` is the WORM copy — on un-suspend, point it at a readable target; the
+WORM copy's integrity is covered by `filebackup_immutability_ok` + `audit`.)
 
 ### Subcommand flags (DR + ops)
 
 | Subcommand | Flags |
 |---|---|
 | `restore object` (or bare `restore`) | `--hash <externalID>` `--from <target>` `--to <dir>` (default `/storage`) |
-| `restore all` | `--from <target>` (default: first target) `--to <dir>` `--concurrency N` (default: `concurrency`) |
-| `restore version` | `--file-id <uuid>` `--at <RFC3339>` `[--hash <externalID>]` `[--from <target>]` `[--to <dir>]` |
+| `restore all` | `--from <target>` (default: first readable target) `--to <dir>` `--concurrency N` (default: `concurrency`) |
+| `restore current` | `--file-id <uuid>` `--at <RFC3339>` `[--hash <externalID>]` `[--from <target>]` `[--to <dir>]` |
 | `verify` | `--hash <externalID>` `--from <target>` |
 | `audit` | `--sample N` (0 = all) `--inventory` (also run target→ledger + report WORM drift) |
 | `reconcile` | `--rate N` (repairs/sec, 0 = unlimited) |
 | `backfill` | `--rate N` (backups/sec, 0 = unlimited) |
-| `drill` | `--from <target>` (default: first target) `--sample N` (default 20, 0 = all) `--to <scratchdir>` (default: `scratchDir`, else OS temp) `--metrics-file <path>` (also `FBS_DRILL_METRICS_FILE`) |
+| `drill` | `--from <target>` (default: first readable target) `--sample N` (default 20, 0 = all) `--to <scratchdir>` (default: `scratchDir`, else OS temp) `--metrics-file <path>` (also `FBS_DRILL_METRICS_FILE`) |
 
-**Restoring a past version.** `restore version` maps `--file-id` + `--at` to the
-content hash to restore, comparing against the file's **last-modified** time
-(`file.updatedDate`, read directly — *not* coalesced to `createdDate`, so an
-in-place replace is dated correctly). The live `file` table holds only each file's
-*current* version, so the command **fails loud** rather than ever guessing:
+**Restoring by point-in-time (`restore current`).** The live `file` table holds only
+each file's **current** version — there is **no version history** — so this restores
+the CURRENT backed-up version, *guarded* by `--at`: it succeeds only if the current
+version was already the one in effect at `--at`. It compares the file's **last-modified**
+time (`file.updatedDate`, read directly — *not* coalesced to `createdDate`, so an
+in-place replace is dated correctly) and **fails loud** rather than ever guessing:
 - current version last-modified **at/before** `--at` → it IS the version as of
   `--at` → restored;
 - last-modified **after** `--at` (a replacement happened since) → **error** (the
-  historical version isn't in the live table);
+  version at `--at` isn't in the live table);
 - `updatedDate` is **NULL** (version time unknowable) → **error** (won't risk
   returning the wrong version).
 
-In the error cases, recover `file.externalID` as of `--at` from a **DB point-in-time
-restore / backup** and pass it via `--hash` (which restores it directly, needing only
-the target). See `contracts/restore-and-ops.md`.
+To recover a genuinely HISTORICAL version, recover `file.externalID` as of `--at` from
+a **DB point-in-time restore / backup** and pass it via `--hash` (which restores it
+directly, needing only the target). See `contracts/restore-and-ops.md`.
+
+**`restore all` completeness.** It restores only what the `--from` source holds, so
+before restoring it prints each configured target's stored-object count (marking the
+source) — an operator can see cross-target disparity before trusting a single-source
+restore.
 
 **Restore-drill metrics.** `drill` exits nonzero if any sampled object fails to
 restore + hash-verify (so a failing Job trips `kube_job_status_failed`). Because the

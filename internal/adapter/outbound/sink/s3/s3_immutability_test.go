@@ -24,31 +24,33 @@ type wormStub struct {
 	listErr          int    // non-zero HTTP status to fail the list-objects call
 	listKeys         []string
 	manifest         []byte
-	getFail          bool // fail the object GET (the manifest fetch)
+	pointerName      string // if set, GET of _manifest/LATEST returns this (the pointer fast-path)
+	getFail          bool   // fail the object GET (the manifest fetch)
+}
+
+func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
+	switch s.lockStatus {
+	case http.StatusOK:
+		lock := ""
+		if s.lockEnabled {
+			lock = "Enabled"
+		}
+		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled></ObjectLockConfiguration>`, lock)
+	case http.StatusNotFound:
+		// object-lock is NOT configured — the definitive DRIFT signal (a WORM bucket that lost its
+		// lock config), returned with the real S3 error code so the sink can distinguish it.
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `<Error><Code>ObjectLockConfigurationNotFoundError</Code><Message>Object Lock configuration does not exist for this bucket</Message></Error>`)
+	default:
+		w.WriteHeader(s.lockStatus) // e.g. 403 AccessDenied — a read-denying credential
+	}
 }
 
 func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	switch {
 	case r.Method == http.MethodGet && q.Has("object-lock"):
-		switch s.lockStatus {
-		case http.StatusOK:
-			// fall through to the enabled/disabled body below
-		case http.StatusNotFound:
-			// object-lock is NOT configured — the definitive DRIFT signal (a WORM bucket that lost
-			// its lock config), returned with the real S3 error code so the sink can distinguish it.
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = io.WriteString(w, `<Error><Code>ObjectLockConfigurationNotFoundError</Code><Message>Object Lock configuration does not exist for this bucket</Message></Error>`)
-			return
-		default:
-			w.WriteHeader(s.lockStatus) // e.g. 403 AccessDenied — a read-denying credential
-			return
-		}
-		lock := ""
-		if s.lockEnabled {
-			lock = "Enabled"
-		}
-		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled></ObjectLockConfiguration>`, lock)
+		s.serveObjectLock(w)
 	case r.Method == http.MethodGet && q.Has("versioning"):
 		if s.versioningErr != 0 {
 			w.WriteHeader(s.versioningErr)
@@ -67,7 +69,7 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		b.WriteString(`</ListBucketResult>`)
 		_, _ = io.WriteString(w, b.String())
-	case r.Method == http.MethodGet: // object GET (the manifest)
+	case r.Method == http.MethodGet: // object GET
 		if s.getFail {
 			w.WriteHeader(http.StatusForbidden)
 			return
@@ -75,6 +77,10 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// minio's GetObject parses Last-Modified; httptest omits it by default.
 		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
 		w.Header().Set("Content-Type", "application/octet-stream")
+		if strings.HasSuffix(r.URL.Path, "/LATEST") { // the pointer fast-path
+			_, _ = io.WriteString(w, s.pointerName)
+			return
+		}
 		_, _ = w.Write(s.manifest)
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -197,6 +203,23 @@ func TestLatestManifestNoneIsNotExist(t *testing.T) {
 	_, err := sink.LatestManifest(context.Background())
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("no manifest must be a wrapped os.ErrNotExist (→ unverifiable, not a failure), got %v", err)
+	}
+}
+
+// TestLatestManifestUsesPointer: the fast path reads _manifest/LATEST for the newest name and GETs
+// that manifest — NO list-objects scan needed.
+func TestLatestManifestUsesPointer(t *testing.T) {
+	body := []byte(`{"externalID":"abc"}` + "\n")
+	stub := &wormStub{pointerName: "2026-06-01T000000.000000000Z.jsonl", manifest: body, listErr: http.StatusInternalServerError}
+	sink := newWormSink(t, stub)
+	rc, err := sink.LatestManifest(context.Background())
+	if err != nil { // listErr=500 would surface only if it fell back to a scan — the pointer must avoid that
+		t.Fatalf("LatestManifest via pointer must not scan, got %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("pointer manifest content mismatch: %q err=%v", got, err)
 	}
 }
 

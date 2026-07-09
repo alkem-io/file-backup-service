@@ -40,7 +40,7 @@ func TestDrillAllPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Checked != 5 || out.Passed != 5 || out.Failed != 0 || !out.Pass() {
+	if out.Checked != 5 || out.Passed() != 5 || out.Failed != 0 || !out.Pass() {
 		t.Fatalf("want checked=5 passed=5 failed=0 pass, got %+v", out)
 	}
 	// The drill removes each restored file — scratch must be empty after (bounded disk).
@@ -61,7 +61,7 @@ func TestDrillDetectsCorruptObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Failed != 1 || out.Passed != 2 || out.Pass() {
+	if out.Failed != 1 || out.Passed() != 2 || out.Pass() {
 		t.Fatalf("want failed=1 passed=2 !pass, got %+v", out)
 	}
 	if len(out.Failures) != 1 || out.Failures[0].Hash != hashes[1] {
@@ -95,6 +95,15 @@ func TestDrillHonoursSample(t *testing.T) {
 	}
 	if out.Checked != 5 {
 		t.Fatalf("a --sample of 5 must drill exactly 5 objects, got %d", out.Checked)
+	}
+}
+
+// TestDrillSampleLedgerError: a ledger error while sampling the objects to drill aborts the drill
+// with that error (it can't prove anything without a work-list).
+func TestDrillSampleLedgerError(t *testing.T) {
+	led := errStoredLedger{newFakeLedger()}
+	if _, err := Drill(context.Background(), led, newMemSink("t"), "t", t.TempDir(), 3, time.Minute); err == nil {
+		t.Fatal("a ledger sampling error must abort the drill")
 	}
 }
 
@@ -140,5 +149,26 @@ func TestDrillCancelDuringObjectIsInterruptNotFailure(t *testing.T) {
 	}
 	if out.Failed != 0 {
 		t.Fatalf("a cancellation must NOT be counted as a failed object, got Failed=%d", out.Failed)
+	}
+}
+
+// panicFetchSink panics on Fetch — a poison object that must be contained as ONE failure, not crash
+// the drill.
+type panicFetchSink struct{ memSink }
+
+func (*panicFetchSink) Fetch(context.Context, string) (io.ReadCloser, error) { panic("boom") }
+
+// TestDrillContainsPanic: a per-object panic (a poison object / driver bug) is contained as one
+// GENUINE failure, not a crash — the drill (via runBoundedPaced + recover) keeps going and reports it.
+func TestDrillContainsPanic(t *testing.T) {
+	led := newFakeLedger()
+	hashes := seedDrillCorpus(t, led, newMemSink("t"), 1)
+	sink := &panicFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{hashes[0]: []byte("x")}}}
+	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 0, time.Minute)
+	if err != nil {
+		t.Fatalf("a contained panic must not abort the drill, got %v", err)
+	}
+	if out.Checked != 1 || out.Failed != 1 || out.Pass() {
+		t.Fatalf("a panicking object must be one contained failure, got %+v", out)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -19,11 +20,14 @@ type DrillFailure struct {
 // objects the ledger records stored on the drilled target (FR-024/SC-009/T033).
 type DrillOutcome struct {
 	Target   string
-	Checked  int // objects drilled (up to the sample)
-	Passed   int // restored to scratch AND hashed to their key
-	Failed   int // restore/verify failed (a real DR problem)
+	Checked  int // objects drilled (pass + GENUINE fail); a cancellation is NOT counted
+	Failed   int // GENUINE restore/verify failures (a real DR problem)
 	Failures []DrillFailure
 }
+
+// Passed is the count of objects that restored + hash-matched — derived (Checked − Failed), not
+// stored, so it can't drift out of lock-step with the two counters that are actually recorded.
+func (o DrillOutcome) Passed() int { return o.Checked - o.Failed }
 
 // Pass reports whether the drill PROVED the restore procedure: at least one object was drilled AND
 // none failed. A 0-checked drill is NOT a pass — it proved nothing, and a 0-count is itself a
@@ -35,67 +39,71 @@ func (o DrillOutcome) Pass() bool { return o.Checked > 0 && o.Failed == 0 }
 // so successive weekly drills cover different objects — sample<=0 drills every stored object) and,
 // for each, restores it to scratchDir (reusing RestoreObject, so the drill exercises the exact
 // operator restore path: hash-arbiter decode → SHA3-256 verify → durable write) and then removes
-// the restored file to bound scratch disk. A per-object failure is recorded and the drill
-// continues, so one bad object surfaces every other problem in the same run. Each object is
-// bounded by perObjectTimeout (a hung source/sink fails that object, not the drill). Returns the
-// outcome; a ctx cancellation stops the drill and is returned so the caller can distinguish an
-// interrupted drill from a clean pass.
+// the restored file to bound scratch disk. It runs through the shared runBoundedPaced scaffold
+// (concurrency 1) so it inherits the sweep's cancellation propagation + the STREAMING id source
+// (sample=0 doesn't buffer the whole corpus). A per-object panic is contained as one failure; a
+// per-object failure is recorded and the drill continues, surfacing every other problem in the same
+// run. Each object is bounded by perObjectTimeout. Returns the outcome; a non-nil error is an
+// enumeration failure OR a cancellation (an interrupted drill — the caller must not read it green).
 func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir string, sample int, perObjectTimeout time.Duration) (DrillOutcome, error) {
 	perObjectTimeout = normalizePerObjectTimeout(perObjectTimeout)
 	out := DrillOutcome{Target: targetName}
-	hashes, err := sampleStored(ctx, led, targetName, sample)
-	if err != nil {
-		return out, err
+	var mu sync.Mutex
+	err := runBoundedPaced(ctx, 1, 0,
+		func(yield func(string) error) error { return streamSampledStored(ctx, led, targetName, sample, yield) },
+		func(h string) { drillOne(ctx, src, h, scratchDir, perObjectTimeout, &out, &mu) })
+	// A cancellation that landed DURING a work goroutine (after enumeration already dispatched the
+	// last object) leaves runBoundedPaced's return nil — but the drill was still INTERRUPTED and
+	// proved less than it sampled. Surface ctx.Err() so an aborted integrity check can't read green
+	// (unlike restore-all, an interrupted drill must exit nonzero — the drilled object went uncounted).
+	if err == nil {
+		err = ctx.Err()
 	}
-	for _, h := range hashes {
-		if err := ctx.Err(); err != nil {
-			return out, err // interrupted before this object — the partial outcome rides along
-		}
-		derr := drillOne(ctx, src, h, scratchDir, perObjectTimeout)
-		// A cancellation DURING this object (parent ctx now cancelled) is an INTERRUPTION, not a
-		// failed object: abort the drill (returning the ctx error) rather than counting a spurious
-		// Failed + reporting RED. A per-object TIMEOUT (parent ctx still live) or a verify mismatch
-		// IS a real failure and falls through to Failed below.
-		if derr != nil && ctx.Err() != nil {
-			return out, ctx.Err()
-		}
-		out.Checked++
-		if derr != nil {
-			out.Failed++
-			out.Failures = append(out.Failures, DrillFailure{Hash: h, Err: derr})
-			continue
-		}
-		out.Passed++
-	}
-	return out, nil
+	return out, err
 }
 
-// drillOne restores one object to scratchDir under a per-object deadline, then removes the
-// restored file so the drill's scratch footprint stays bounded to one object at a time. A
-// restore error (a source read fault, a decode/hash mismatch) is the failure the drill exists
-// to catch. The cleanup is best-effort — a failed remove is not itself a drill failure (the
-// caller RemoveAll's the whole scratch dir at the end).
-func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectTimeout time.Duration) error {
+// drillOne restores one object to scratchDir under a per-object deadline, removes the restored file
+// (bounding scratch disk to one object at a time), and folds the outcome into out under mu. A panic
+// is contained as one GENUINE failure (Checked+Failed), so a poison object can't crash the pass. A
+// cancellation aborting this object in flight (parent ctx cancelled — a SIGTERM) is NOT counted:
+// it's an interruption the sweep surfaces as its returned error, not a failed object + RED gauge.
+func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectTimeout time.Duration, out *DrillOutcome, mu *sync.Mutex) {
+	defer func() {
+		if r := recover(); r != nil {
+			mu.Lock()
+			out.Checked++
+			out.Failed++
+			out.Failures = append(out.Failures, DrillFailure{Hash: hash, Err: PanicErr("drill "+hash, r)})
+			mu.Unlock()
+		}
+	}()
 	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
 	defer cancel()
-	if err := RestoreObject(octx, src, hash, scratchDir); err != nil {
-		return err
+	err := RestoreObject(octx, src, hash, scratchDir)
+	_ = os.Remove(filepath.Join(scratchDir, hash)) // best-effort; the caller RemoveAll's the whole dir
+	mu.Lock()
+	defer mu.Unlock()
+	if cancelledInFlight(ctx, err) {
+		return // interrupted mid-object — the sweep's cancellation error surfaces it, not a Failed count
 	}
-	_ = os.Remove(filepath.Join(scratchDir, hash))
-	return nil
+	out.Checked++
+	if err != nil {
+		out.Failed++
+		out.Failures = append(out.Failures, DrillFailure{Hash: hash, Err: err})
+	}
 }
 
-// sampleStored returns up to `sample` externalIDs the ledger records stored on target, drawn from
-// a RANDOM keyset band (sample<=0 = all) via the shared keysetSample driver — so a weekly drill
-// checks a different slice of the corpus each run instead of always the lowest-prefix band. A
-// high random start wraps once to the beginning, so the sample is never silently under-filled.
-func sampleStored(ctx context.Context, led Ledger, target string, sample int) ([]string, error) {
+// streamSampledStored yields up to `sample` externalIDs the ledger records stored on target, drawn
+// from a RANDOM keyset band (sample<=0 = all) via the shared keysetSample driver — so a weekly
+// drill checks a different slice of the corpus each run, and a full drill (sample=0) STREAMS the
+// ids to the sweep rather than buffering the whole corpus in memory. A high random start wraps once
+// to the beginning, so the sample is never silently under-filled.
+func streamSampledStored(ctx context.Context, led Ledger, target string, sample int, yield func(string) error) error {
 	startAfter := ""
 	if sample > 0 {
 		startAfter = randKeysetStart()
 	}
-	var out []string
-	err := keysetSample(ctx, sample, startAfter,
+	return keysetSample(ctx, sample, startAfter,
 		func(after string, limit int) ([]string, error) {
 			page, err := led.StoredExternalIDsPage(ctx, target, after, limit)
 			if err != nil {
@@ -103,9 +111,12 @@ func sampleStored(ctx context.Context, led Ledger, target string, sample int) ([
 			}
 			return page, nil
 		},
-		func(page []string) error { out = append(out, page...); return nil })
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+		func(page []string) error {
+			for _, h := range page {
+				if err := yield(h); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 }

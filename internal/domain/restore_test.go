@@ -231,6 +231,29 @@ func TestRestoreAllCancelledReturnsCtxError(t *testing.T) {
 	}
 }
 
+// TestRestoreAllCountsCancelNotFailure (review Cluster 1): a cancellation that lands WHILE an object
+// restores is counted as Cancelled, NOT Failed — so a clean SIGTERM doesn't manufacture a false
+// "restore failed" verdict.
+func TestRestoreAllCountsCancelNotFailure(t *testing.T) {
+	led := newFakeLedger()
+	content := []byte("restore me")
+	h, _ := sum(bytes.NewReader(content))
+	base := newMemSink("t")
+	base.store[h] = content
+	_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel the parent ctx the moment the object's Fetch begins → the in-flight restore is aborted.
+	sink := &cancelOnFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{h: content}}, cancel: cancel}
+	st, _ := RestoreAll(ctx, led, sink, "t", t.TempDir(), 1, time.Minute)
+	if st.Failed != 0 {
+		t.Fatalf("an in-flight cancellation must NOT be counted as a genuine failure, got Failed=%d", st.Failed)
+	}
+	if st.Cancelled == 0 && st.Restored == 0 {
+		t.Fatalf("the object should be counted cancelled (or restored if it beat the cancel), got %+v", st)
+	}
+}
+
 // ioErrSink serves prefix bytes then a transient I/O error — modelling an S3 reset/timeout
 // mid-stream. prefix must begin with the zstd magic so decodeStream takes the zstd path.
 type ioErrSink struct {

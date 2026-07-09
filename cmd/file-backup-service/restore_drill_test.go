@@ -14,30 +14,56 @@ import (
 
 // ---- restore all SIGTERM verdict (review #3) ------------------------------
 
-// TestRestoreAllVerdict: a clean SIGTERM must NOT be reported as a restore failure. An
-// enumeration-cancel (rerr=Canceled) → nil; a post-enumeration cancel with in-flight cancels
-// counted as Failed (ctxErr!=nil) → nil; only failures on an un-cancelled run → error.
+// TestRestoreAllVerdict (review Cluster 1): GENUINE failures (st.Failed — RestoreAll separates
+// cancellations into st.Cancelled) exit NONZERO even when a SIGTERM coincides; a purely-cancelled
+// run exits clean.
 func TestRestoreAllVerdict(t *testing.T) {
-	// enumeration cancelled → clean.
-	if err := restoreAllVerdict(domain.RestoreAllStats{Failed: 3}, context.Canceled, context.Canceled); err != nil {
-		t.Fatalf("a cancelled enumeration must map to a clean exit, got %v", err)
+	// genuine failures + a coincident SIGTERM enumeration-cancel → STILL nonzero (Cluster 1).
+	if err := restoreAllVerdict(domain.RestoreAllStats{Failed: 1, Cancelled: 2}, context.Canceled); err == nil {
+		t.Fatal("a genuine failure that coincides with a SIGTERM must still exit nonzero")
 	}
-	// enumeration ok, but SIGTERM cancelled in-flight objects (counted Failed) → clean.
-	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 2, Failed: 4}, nil, context.Canceled); err != nil {
-		t.Fatalf("a clean SIGTERM's in-flight cancels must not be a failure, got %v", err)
+	// purely cancelled (no genuine failures) → clean, resumable.
+	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 2, Cancelled: 4}, context.Canceled); err != nil {
+		t.Fatalf("a purely-cancelled run must exit cleanly (resumable), got %v", err)
 	}
 	// enumeration error (not a cancel) → surfaced.
-	if err := restoreAllVerdict(domain.RestoreAllStats{}, errors.New("ledger down"), nil); err == nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{}, errors.New("ledger down")); err == nil {
 		t.Fatal("a genuine enumeration error must surface")
 	}
 	// genuine failures on an un-cancelled run → error (and NOT the old hardcoded hash-mismatch text).
-	err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5, Failed: 1}, nil, nil)
+	err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5, Failed: 1}, nil)
 	if err == nil || strings.Contains(err.Error(), "hash-mismatch / unreadable source") {
 		t.Fatalf("un-cancelled failures must error with a generic message, got %v", err)
 	}
 	// a clean, complete run → nil.
-	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5}, nil, nil); err != nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5}, nil); err != nil {
 		t.Fatalf("a clean run must return nil, got %v", err)
+	}
+}
+
+// TestPickReadableTarget (review Cluster 5): the default source SKIPS WORM (write-only) targets;
+// an explicit WORM --from is rejected loud; an all-WORM config has no readable source.
+func TestPickReadableTarget(t *testing.T) {
+	worm := domain.Target{Sink: &fakeSink{name: "offsite"}, Worm: true}
+	readable := domain.Target{Sink: &fakeSink{name: "local"}}
+	// default (--from "") skips the WORM target, picks the readable one.
+	if _, name, err := pickReadableTarget([]domain.Target{worm, readable}, ""); err != nil || name != "local" {
+		t.Fatalf("default must pick the readable target, got %q err=%v", name, err)
+	}
+	// explicit WORM --from → rejected.
+	if _, _, err := pickReadableTarget([]domain.Target{worm, readable}, "offsite"); err == nil ||
+		!strings.Contains(err.Error(), "write-only") {
+		t.Fatalf("an explicit WORM --from must be rejected, got %v", err)
+	}
+	// all-WORM config → no readable source.
+	if _, _, err := pickReadableTarget([]domain.Target{worm}, ""); err == nil ||
+		!strings.Contains(err.Error(), "no readable") {
+		t.Fatalf("an all-WORM config must fail loud, got %v", err)
+	}
+	// unknown --from → not found.
+	if _, _, err := pickReadableTarget([]domain.Target{readable}, "nope"); err == nil ||
+		!strings.Contains(err.Error(), "not found") {
+		t.Fatalf("an unknown --from must be not-found, got %v", err)
 	}
 }
 
@@ -70,7 +96,7 @@ func TestRunRestoreVersionHashOverride(t *testing.T) {
 	content := []byte("a past version recovered via PITR")
 	h := storeObject(t, cfgPath, content)
 	to := t.TempDir()
-	err := runRestoreVersion([]string{
+	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
 		"--at", "2026-07-01T00:00:00Z", "--hash", h, "--from", "local", "--to", to,
 	})
@@ -85,17 +111,17 @@ func TestRunRestoreVersionHashOverride(t *testing.T) {
 
 func TestRunRestoreVersionMissingFlags(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	if err := runRestoreVersion([]string{"--config", cfgPath}); err == nil {
+	if err := runRestoreCurrent([]string{"--config", cfgPath}); err == nil {
 		t.Fatal("restore version without --file-id/--at must error")
 	}
 }
 
 func TestRunRestoreVersionBadArgs(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	if err := runRestoreVersion([]string{"--config", cfgPath, "--file-id", "not-a-uuid", "--at", "2026-07-01T00:00:00Z"}); err == nil {
+	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", "not-a-uuid", "--at", "2026-07-01T00:00:00Z"}); err == nil {
 		t.Fatal("a non-uuid --file-id must error")
 	}
-	if err := runRestoreVersion([]string{"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", "--at", "yesterday"}); err == nil {
+	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", "--at", "yesterday"}); err == nil {
 		t.Fatal("a non-RFC3339 --at must error")
 	}
 }
@@ -103,7 +129,7 @@ func TestRunRestoreVersionBadArgs(t *testing.T) {
 // TestRunRestoreVersionUnknownTarget: --from names a target not in the config → pickTarget errors.
 func TestRunRestoreVersionUnknownTarget(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	err := runRestoreVersion([]string{
+	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
 		"--at", "2026-07-01T00:00:00Z", "--hash", sha3hex([]byte("x")), "--from", "nope",
 	})
@@ -116,7 +142,7 @@ func TestRunRestoreVersionUnknownTarget(t *testing.T) {
 // alkemio DB; a targets-only config (no alkemioDB) fails validation before opening a pool.
 func TestRunRestoreVersionNoHashNeedsAlkemioDB(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	err := runRestoreVersion([]string{
+	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
 		"--at", "2026-07-01T00:00:00Z", "--from", "local",
 	})
@@ -133,7 +159,7 @@ func TestRunRestoreVersionNoHashDBUnreachable(t *testing.T) {
 	cfgPath := writeConfig(t, dir,
 		"alkemioDB:\n  host: 127.0.0.1\n  port: 1\n  user: u\n  dbName: d\n  sslMode: disable\n"+
 			"dbTimeoutSec: 15\ntargets:\n  - name: local\n    type: filesystem\n    path: "+filepath.Join(dir, "store")+"\n")
-	err := runRestoreVersion([]string{
+	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
 		"--at", "2026-07-01T00:00:00Z", "--from", "local",
 	})
@@ -152,7 +178,7 @@ func TestRunRestoreVersionHashDefaultsToFirstTarget(t *testing.T) {
 	content := []byte("default-target restore")
 	h := storeObject(t, cfgPath, content)
 	to := t.TempDir()
-	err := runRestoreVersion([]string{
+	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
 		"--at", "2026-07-01T00:00:00Z", "--hash", h, "--to", to,
 	})

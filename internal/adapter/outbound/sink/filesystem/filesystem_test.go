@@ -36,19 +36,24 @@ func TestSinkRejectsTraversalHash(t *testing.T) {
 	}
 }
 
-// TestLatestManifestPicksNewest: the inventory reader returns the lexicographically-highest
-// (newest, since names are UTC-nanosecond timestamps) .jsonl under _manifest/.
-func TestLatestManifestPicksNewest(t *testing.T) {
+// TestLatestManifestPicksNewestViaPointer: PutManifest writes the _manifest/LATEST pointer, so
+// LatestManifest resolves the newest snapshot via the pointer (fast path) — even when an OLDER
+// manifest sorts higher by name, the pointer (not a name-sort) decides.
+func TestLatestManifestPicksNewestViaPointer(t *testing.T) {
 	root := t.TempDir()
 	s := New("fs", root)
 	ctx := context.Background()
 	newest := []byte(`{"externalID":"newest"}` + "\n")
-	// PutManifest writes under _manifest/<name>. Two snapshots; the higher name is newest.
 	if err := s.PutManifest(ctx, "2026-01-01T000000.000000000Z.jsonl", bytes.NewReader([]byte("old\n"))); err != nil {
 		t.Fatalf("put old manifest: %v", err)
 	}
 	if err := s.PutManifest(ctx, "2026-06-01T000000.000000000Z.jsonl", bytes.NewReader(newest)); err != nil {
 		t.Fatalf("put new manifest: %v", err)
+	}
+	// The pointer now names the second (newest) manifest. Corrupt it to prove the pointer is USED
+	// (a name-sort fallback would still find "2026-06-...", so re-point at the OLD one and expect it).
+	if err := os.WriteFile(filepath.Join(root, "_manifest", "LATEST"), []byte("2026-01-01T000000.000000000Z.jsonl"), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("repoint: %v", err)
 	}
 	rc, err := s.LatestManifest(ctx)
 	if err != nil {
@@ -56,8 +61,39 @@ func TestLatestManifestPicksNewest(t *testing.T) {
 	}
 	defer func() { _ = rc.Close() }()
 	got, err := io.ReadAll(rc)
-	if err != nil || !bytes.Equal(got, newest) {
-		t.Fatalf("want the newest manifest, got %q err=%v", got, err)
+	if err != nil || !bytes.Equal(got, []byte("old\n")) {
+		t.Fatalf("LatestManifest must honor the pointer (the OLD manifest), got %q err=%v", got, err)
+	}
+}
+
+// TestLatestManifestFallbackScanFiltersStray: with NO pointer (old data written before the
+// pointer), LatestManifest falls back to the highest `.jsonl` and IGNORES a stray non-manifest file
+// so it can't pick it as "latest".
+func TestLatestManifestFallbackScanFiltersStray(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "_manifest")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	newest := []byte(`{"externalID":"newest"}` + "\n")
+	// Two manifests written DIRECTLY (no pointer), plus a stray file that sorts ABOVE any .jsonl.
+	for name, body := range map[string][]byte{
+		"2026-01-01T000000.000000000Z.jsonl": []byte("old\n"),
+		"2026-06-01T000000.000000000Z.jsonl": newest,
+		"zzz-stray.txt":                      []byte("not a manifest"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o644); err != nil { //nolint:gosec // test fixture
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	rc, err := New("fs", root).LatestManifest(context.Background())
+	if err != nil {
+		t.Fatalf("LatestManifest (fallback): %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, newest) {
+		t.Fatalf("fallback scan must pick the newest .jsonl (ignoring the stray), got %q", got)
 	}
 }
 

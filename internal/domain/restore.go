@@ -93,9 +93,10 @@ func restoreObjectTo(ctx context.Context, src Sink, hash, destDir string) (skipp
 
 // RestoreAllStats summarizes a whole-store restore.
 type RestoreAllStats struct {
-	Restored int // freshly restored (fetched + decoded + hash-verified + written)
-	Skipped  int // already present + intact at the destination (idempotent re-run)
-	Failed   int // a hash-mismatch / unreadable source — the object was NOT restored
+	Restored  int // freshly restored (fetched + decoded + hash-verified + written)
+	Skipped   int // already present + intact at the destination (idempotent re-run)
+	Failed    int // GENUINE failures (hash-mismatch / unreadable source / per-object timeout / panic) — NOT restored
+	Cancelled int // aborted by a parent-ctx cancellation (SIGTERM) — a resumable interruption, NOT a failure
 }
 
 // RestoreAll restores every object the ledger records stored ON targetName from src to destDir
@@ -124,7 +125,10 @@ func RestoreAll(ctx context.Context, led Ledger, src Sink, targetName, destDir s
 
 // restoreAllOne restores one object under a per-object deadline, folding the outcome into st
 // (mutated under mu — the restores run concurrently). A panic (a poison object) is contained as a
-// counted failure so it can't crash the whole pass.
+// GENUINE failure so it can't crash the whole pass. A cancellation aborting this object in flight
+// (parent ctx cancelled — a SIGTERM) is counted as Cancelled, NOT Failed, so a clean shutdown
+// doesn't manufacture a false "restore failed" verdict (while a real failure that coincides with
+// the SIGTERM still lands in Failed).
 func restoreAllOne(ctx context.Context, src Sink, hash, destDir string, perObjectTimeout time.Duration, st *RestoreAllStats, mu *sync.Mutex) {
 	defer recoverFailed(mu, &st.Failed)
 	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
@@ -133,6 +137,8 @@ func restoreAllOne(ctx context.Context, src Sink, hash, destDir string, perObjec
 	mu.Lock()
 	defer mu.Unlock()
 	switch {
+	case cancelledInFlight(ctx, err):
+		st.Cancelled++
 	case err != nil:
 		st.Failed++
 	case skipped:

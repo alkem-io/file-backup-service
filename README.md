@@ -38,7 +38,7 @@ operator restore. A worker + CLI, not a public API.
 | `backfill`  | Back up the whole pre-existing corpus (the file-service `file` table) — for objects created before this service. Resumable + rate-limited (`--rate`). |
 | `reconcile` | Repair under-replicated objects target-to-target: fetch from a holder, re-fan-out to the targets missing it (`--rate`). |
 | `audit`     | Verify the ledger against reality (FR-014): sample objects per target and confirm the target still holds them (ledger→target). Also runs the WORM immutability drift-check, and — with `--inventory` — the target→ledger direction (diff each target's manifest against the ledger). Nonzero exit on missing/drift/unverifiable, for cron/CI (`--sample`, `--inventory`). |
-| `restore`   | Operator DR. `restore [object] --hash --from [--to]` restores one object; `restore all --from [--to] [--concurrency]` restores the whole store (resumable, idempotent); `restore version --file-id --at [--hash] [--from] [--to]` restores a file's past version (best-effort — see below). Every restored object is hash-verified. |
+| `restore`   | Operator DR. `restore [object] --hash --from [--to]` restores one object; `restore all --from [--to] [--concurrency]` restores the whole store (resumable, idempotent, prints per-target sizes); `restore current --file-id --at [--hash] [--from] [--to]` restores a file's CURRENT backed-up version, guarded by `--at` (fail loud otherwise — see below). Every restored object is hash-verified; `--from` must be a readable (non-WORM) target. |
 | `verify`    | Confirm one stored object decodes + hashes correctly, no write (`--hash`, `--from`). |
 | `migrate`   | Apply the embedded ledger migrations to the ledger DB (a one-shot init step / init-container). |
 | `drill`     | Restore drill (FR-024): restore a random sample of the objects stored on a target to a scratch dir, hash-verify each, exit nonzero if any fails — proving the end-to-end restore *procedure*, not just byte existence (`--from`, `--sample`, `--to`, `--metrics-file`). |
@@ -82,11 +82,11 @@ every field, env var, default, and constraint — is in
   via a Prometheus **textfile** (`--metrics-file` / `FBS_DRILL_METRICS_FILE`, the
   node-exporter textfile-collector convention); its primary signal is the exit code
   (a failing drill Job trips `kube_job_status_failed`, like the audit job).
-- **Restore a past version (`restore version`):** the live `file` table holds only
-  each file's *current* version, resolved by its **last-modified** time
-  (`updatedDate`). It **fails loud** (never guesses): if the current version was
-  last-modified after `--at`, or `updatedDate` is NULL, you must recover the
-  historical `file.externalID` from a **DB point-in-time restore** and pass it via
+- **Restore by point-in-time (`restore current`):** the live `file` table holds only
+  each file's *current* version (no history), so this restores the CURRENT backed-up
+  version **guarded by `--at`** — it **fails loud** (never guesses): if the current
+  version was last-modified after `--at`, or `updatedDate` is NULL, you must recover
+  the historical `file.externalID` from a **DB point-in-time restore** and pass it via
   `--hash`. See [`restore-and-ops.md`](../agents-hq/specs/008-continuous-file-backup/contracts/restore-and-ops.md).
 
 ## Layout (hexagonal)

@@ -176,9 +176,10 @@ func TestCountersCachedPerTarget(t *testing.T) {
 	}
 }
 
-// TestSetImmutabilityOK: the WORM drift gauge is a per-target series set to 1 (ok) / 0 (drift),
-// and a target we never set has NO series (so `== 0` can't false-fire on an unverifiable target).
-func TestSetImmutabilityOK(t *testing.T) {
+// TestSetAndClearImmutabilityOK: the WORM drift gauge is a per-target series set to 1 (ok) / 0
+// (drift); ClearImmutabilityOK (the real adapter method — Cluster 4's structural-clear) DROPS a
+// series, so CollectAndCount reflects it.
+func TestSetAndClearImmutabilityOK(t *testing.T) {
 	m := New()
 	m.SetImmutabilityOK("good", true)
 	m.SetImmutabilityOK("drift", false)
@@ -188,9 +189,17 @@ func TestSetImmutabilityOK(t *testing.T) {
 	if got := testutil.ToFloat64(m.immutabilityOK.WithLabelValues("drift")); got != 0 {
 		t.Errorf("drift immutability gauge = %v, want 0", got)
 	}
-	// Only the two series we set exist — an unverifiable target contributes none.
 	if got := testutil.CollectAndCount(m.immutabilityOK); got != 2 {
 		t.Errorf("immutability series = %d, want exactly 2 (no series for unverifiable targets)", got)
+	}
+	// ClearImmutabilityOK drops the series (used for a structurally-unverifiable target).
+	m.ClearImmutabilityOK("good")
+	if got := testutil.CollectAndCount(m.immutabilityOK); got != 1 {
+		t.Errorf("after clear, immutability series = %d, want 1 (the cleared target's series is gone)", got)
+	}
+	m.ClearImmutabilityOK("never-set") // clearing an absent series is a harmless no-op
+	if got := testutil.CollectAndCount(m.immutabilityOK); got != 1 {
+		t.Errorf("clearing an absent series must be a no-op, got %d series", got)
 	}
 }
 
@@ -200,7 +209,7 @@ func TestSetImmutabilityOK(t *testing.T) {
 func TestDrillMetricsSetAndTextfile(t *testing.T) {
 	d := NewDrillMetrics()
 	now := time.Unix(1_700_000_000, 0)
-	d.Set(true, now)
+	d.SetPass(true, now)
 	if got := testutil.ToFloat64(d.pass); got != 1 {
 		t.Errorf("drill pass = %v, want 1", got)
 	}
@@ -231,33 +240,50 @@ func TestDrillMetricsSetAndTextfile(t *testing.T) {
 	}
 }
 
-// TestDrillWriteTextfileBadPath: a textfile whose parent dir doesn't exist fails the write (the
-// temp can't be created); a path that is an existing DIRECTORY fails the final rename. Both must
-// surface as errors, not be silently dropped.
+// TestDrillWriteTextfileBadPath: a textfile whose parent dir doesn't exist fails the write. (The
+// durable CommitWrite MkdirAll's the parent, so a NONEXISTENT parent chain with a file in the way
+// is used to force the failure.)
 func TestDrillWriteTextfileBadPath(t *testing.T) {
 	d := NewDrillMetrics()
-	d.Set(true, time.Unix(1, 0))
-	if err := d.WriteTextfile(filepath.Join(t.TempDir(), "no-such-dir", "x.prom")); err == nil {
-		t.Fatal("WriteTextfile to a nonexistent parent dir must error")
+	d.SetPass(true, time.Unix(1, 0))
+	// A regular file where a parent DIRECTORY is expected → MkdirAll fails (ENOTDIR).
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
 	}
-	// path is an existing directory → the temp is created in its parent, but the final rename of a
-	// file onto a directory fails.
-	if err := d.WriteTextfile(t.TempDir()); err == nil {
-		t.Fatal("WriteTextfile onto an existing directory must fail the rename")
+	if err := d.WriteTextfile(filepath.Join(blocker, "sub", "x.prom")); err == nil {
+		t.Fatal("WriteTextfile under a file-as-dir must error")
 	}
 }
 
-// TestDrillMetricsFailKeepsLastSuccess: a FAILING drill sets pass=0 but leaves the last-success
-// timestamp untouched, so an operator sees when the drill last actually succeeded.
-func TestDrillMetricsFailKeepsLastSuccess(t *testing.T) {
-	d := NewDrillMetrics()
-	d.Set(true, time.Unix(1_000, 0)) // an earlier success
-	d.Set(false, time.Unix(2_000, 0))
-	if got := testutil.ToFloat64(d.pass); got != 0 {
-		t.Errorf("drill pass after failure = %v, want 0", got)
+// TestDrillMetricsCarriesForwardLastSuccess (review Cluster 2): each drill is a SEPARATE process
+// overwriting the same textfile. A FAILING run (a fresh DrillMetrics, last-success 0 in memory) must
+// NOT clobber the file's true last-success to 0 — it reads the prior textfile and re-emits it.
+func TestDrillMetricsCarriesForwardLastSuccess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	// Process 1: a PASS at t=1700000000 writes the file.
+	pass := NewDrillMetrics()
+	pass.SetPass(true, time.Unix(1_700_000_000, 0))
+	if err := pass.WriteTextfile(path); err != nil {
+		t.Fatalf("pass write: %v", err)
 	}
-	if got := testutil.ToFloat64(d.lastSuccess); got != 1_000 {
-		t.Errorf("last-success must stay at the last PASS (1000), got %v", got)
+	// Process 2 (fresh metrics): a FAIL overwrites the file — last-success must be CARRIED FORWARD.
+	fail := NewDrillMetrics()
+	fail.SetPass(false, time.Unix(1_800_000_000, 0))
+	if err := fail.WriteTextfile(path); err != nil {
+		t.Fatalf("fail write: %v", err)
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // test temp path
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	body := string(b)
+	if !strings.Contains(body, "filebackup_restore_drill_pass 0") {
+		t.Errorf("failing run must record pass=0:\n%s", body)
+	}
+	if !strings.Contains(body, "filebackup_drill_last_success_timestamp_seconds 1.7e+09") {
+		t.Errorf("failing run must CARRY FORWARD the prior last-success (1.7e+09), not clobber to 0:\n%s", body)
 	}
 }
 

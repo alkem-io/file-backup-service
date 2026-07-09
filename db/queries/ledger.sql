@@ -33,6 +33,15 @@ ON CONFLICT ("externalID", target) DO UPDATE SET
 SELECT target FROM file_backup_target_status
 WHERE "externalID" = sqlc.arg(external_id) AND state = 'stored';
 
+-- name: StoredCountByTarget :many
+-- Count of objects currently stored per configured target — the restore-all completeness snapshot,
+-- so an operator sees per-target disparity before trusting a single-source restore. Index-only on
+-- (target, state). A target with no rows is simply absent from the result (the caller fills 0).
+SELECT target, count(*)::bigint AS n
+FROM file_backup_target_status
+WHERE state = 'stored' AND target = ANY(sqlc.arg(targets)::text[])
+GROUP BY target;
+
 -- name: StoredObjectsPage :many
 -- Objects stored ON one target (manifest/audit), keyset-paged by externalID; the
 -- (target, state, "externalID") index makes the WHERE+ORDER an index-ordered range scan.

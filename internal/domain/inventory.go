@@ -24,19 +24,33 @@ type InventoryAudit struct {
 	ManifestSize int  // externalIDs in the target's latest manifest
 	Extra        int  // in the manifest, NOT ledger-stored on this target (orphan / lost ledger record)
 	Missing      int  // ledger-stored on this target, NOT in the manifest (usually newer than the snapshot)
-	Unverifiable bool // no manifest capability, or the target's read is denied / no manifest yet
+	Unverifiable bool // no definitive diff (see NoData/Worm for whether that's benign)
+	NoData       bool // Unverifiable because there is nothing to diff yet (no manifest / no capability) — benign
+	Worm         bool // read-denying by design; an unreadable (not no-data) NON-worm target is a broken read path → FAIL
 	Detail       string
-	Err          error // a non-nil ledger/parse error for this target (surfaced via errors.Join)
+	Err          error // a fault (corrupt manifest, ledger read error, panic) — surfaced via the joined sweep error
 }
 
 // Failed reports GENUINE target→ledger drift for this target: the target's own manifest lists
-// objects the ledger has no stored record of (an orphan, or a ledger record lost since the
-// snapshot). An unverifiable target never fails; Missing (snapshot staleness) never fails.
-func (a InventoryAudit) Failed() bool { return !a.Unverifiable && a.Err == nil && a.Extra > 0 }
+// objects the ledger has no stored record of (an orphan / lost ledger record), OR — the unified
+// audit policy — a NON-worm target whose manifest could not be READ (a broken read path, not just
+// "no manifest yet"), consistent with ledger→target's UnexpectedlyUnverifiable. A fault (Err) is
+// surfaced separately (the sweep error), a worm read-deny / no-data is benign, and Missing
+// (snapshot staleness) never fails.
+func (a InventoryAudit) Failed() bool {
+	if a.Err != nil {
+		return false
+	}
+	if a.Unverifiable {
+		return !a.NoData && !a.Worm
+	}
+	return a.Extra > 0
+}
 
-// errCorruptManifest marks a manifest that WAS fetched but is malformed (a truncated/corrupt
-// JSONL) — a real fault (the target's DR inventory is broken), distinct from a read-DENIED or
-// missing manifest, which are merely unverifiable.
+// errCorruptManifest marks a manifest that WAS fetched but is malformed (a truncated/corrupt JSONL,
+// a bufio.ErrTooLong line, a non-ascending key, or a mid-stream read fault) — a real fault (the
+// target's DR inventory is broken), distinct from a read-DENIED or missing manifest, which are
+// merely unverifiable.
 var errCorruptManifest = errors.New("corrupt manifest")
 
 // InventoryReport is the per-target target→ledger audit result.
@@ -45,26 +59,38 @@ type InventoryReport struct {
 }
 
 // FailErr is the target→ledger pass/fail verdict: non-nil (nonzero exit for cron/CI) when any
-// target's own manifest references objects the ledger doesn't record as stored there (Extra>0).
+// target's manifest references objects the ledger doesn't record stored (Extra>0), OR a non-worm
+// target's manifest couldn't be read (a broken read path). Faults (per-target Err) are surfaced
+// via AuditInventory's joined return, not here.
 func (r InventoryReport) FailErr() error {
-	var drifted []string
+	var extra, unreadable []string
 	for _, a := range r.Targets {
-		if a.Failed() {
-			drifted = append(drifted, fmt.Sprintf("%s (%d extra)", a.Target, a.Extra))
+		switch {
+		case a.Err != nil:
+			// a fault — surfaced separately
+		case !a.Unverifiable && a.Extra > 0:
+			extra = append(extra, fmt.Sprintf("%s (%d extra)", a.Target, a.Extra))
+		case a.Unverifiable && !a.NoData && !a.Worm:
+			unreadable = append(unreadable, a.Target)
 		}
 	}
-	if len(drifted) > 0 {
-		return fmt.Errorf("targets whose manifest holds objects the ledger doesn't record stored (orphan / lost ledger record): %v", drifted)
+	var errs []error
+	if len(extra) > 0 {
+		errs = append(errs, fmt.Errorf("targets whose manifest holds objects the ledger doesn't record stored (orphan / lost ledger record): %v", extra))
 	}
-	return nil
+	if len(unreadable) > 0 {
+		errs = append(errs, fmt.Errorf("non-worm targets whose manifest could not be read (broken read path): %v", unreadable))
+	}
+	return errors.Join(errs...)
 }
 
-// AuditInventory runs the target→ledger direction for every target: it reads each target's most
-// recent manifest (its self-declared inventory) and diffs it against the ledger's current stored
-// set for that target. A target whose sink can't return a manifest (a WORM read-denying
-// credential, or a target with no manifest written yet) is reported Unverifiable — NOT failed —
-// per the WORM contract. Targets are swept concurrently; a ledger error for one target is
-// captured in its Err and surfaced via the joined return.
+// AuditInventory runs the target→ledger direction for every target: it stream-merges each target's
+// most recent manifest (its self-declared inventory) against the ledger's current stored set for
+// that target — O(page) memory, no full-corpus maps. A target whose manifest can't be read (a WORM
+// read-denying credential, or no manifest written yet) is Unverifiable — benign for a worm/no-data
+// target, a failure for a non-worm one (broken read path). Targets are swept concurrently; a fault
+// (corrupt manifest / ledger error / panic) is captured in the target's Err and surfaced via the
+// joined return.
 func AuditInventory(ctx context.Context, led Ledger, targets []Target) (InventoryReport, error) {
 	rep := InventoryReport{Targets: make([]InventoryAudit, len(targets))}
 	errs := RunParallelIdx(len(targets),
@@ -77,44 +103,161 @@ func AuditInventory(ctx context.Context, led Ledger, targets []Target) (Inventor
 	return rep, errors.Join(errs...)
 }
 
-// auditInventoryTarget diffs one target's latest manifest against the ledger's stored set for it.
-func auditInventoryTarget(ctx context.Context, led Ledger, t Target) InventoryAudit {
+// auditInventoryTarget stream-merges one target's latest manifest against the ledger's stored set
+// for it, bounded by a per-target deadline (so a wedged NFS / black-holing S3 can't hang the Job)
+// and panic-recovered (so a driver/scan panic becomes this target's Err, not a crashed sweep).
+func auditInventoryTarget(ctx context.Context, led Ledger, t Target) (a InventoryAudit) {
 	name := t.Sink.Name()
+	a.Target, a.Worm = name, t.Worm
+	// A driver panic (a pgx scan on a drifted column, a broken reader) becomes this target's Err —
+	// a populated result is ALWAYS written, like checkOne.
+	defer func() {
+		if r := recover(); r != nil {
+			a = InventoryAudit{Target: name, Worm: t.Worm, Err: PanicErr("inventory "+name, r)}
+		}
+	}()
+	// Bound the whole per-target probe (fetch + read + ledger paging) — it runs under a deadline-less
+	// signal ctx, so a wedged target would otherwise hang the audit Job forever.
+	tctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
+	defer cancel()
+
 	ir, ok := t.Sink.(inventoryReader)
 	if !ok {
-		return InventoryAudit{Target: name, Unverifiable: true, Detail: "target type cannot enumerate its manifest"}
+		a.Unverifiable, a.NoData, a.Detail = true, true, "target type cannot enumerate its manifest"
+		return a
 	}
-	manifest, err := readLatestManifest(ctx, ir)
+	rc, err := fetchLatestManifest(tctx, ir)
 	if err != nil {
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			return InventoryAudit{Target: name, Unverifiable: true, Detail: "no manifest written yet (nothing to diff)"}
-		case errors.Is(err, errCorruptManifest):
-			// The manifest WAS fetched but is malformed — a real DR fault (its inventory is broken),
-			// surfaced as a sweep error (nonzero exit), not silently under-counted as unverifiable.
-			return InventoryAudit{Target: name, Err: fmt.Errorf("manifest for %s: %w", name, err)}
-		default:
-			// A read-denying WORM credential (403) or a transient read fault → unverifiable, not drift.
-			return InventoryAudit{Target: name, Unverifiable: true, Detail: fmt.Sprintf("manifest unreadable (read-denying credential or transient error): %v", err)}
+		if errors.Is(err, os.ErrNotExist) {
+			a.Unverifiable, a.NoData, a.Detail = true, true, "no manifest written yet (nothing to diff)"
+			return a
 		}
+		// A read-denying credential / transient fetch error → unverifiable (fails a non-worm target).
+		a.Unverifiable, a.Detail = true, fmt.Sprintf("manifest unreadable (read-denying credential or transient error): %v", err)
+		return a
 	}
-	stored, err := storedSet(ctx, led, name)
-	if err != nil {
-		return InventoryAudit{Target: name, Err: fmt.Errorf("ledger stored set for %s: %w", name, err)}
-	}
-	a := InventoryAudit{Target: name, ManifestSize: len(manifest)}
-	for id := range manifest {
-		if !stored[id] {
-			a.Extra++
+	defer func() { _ = rc.Close() }()
+
+	extra, missing, msize, merr := mergeInventory(manifestIterator(tctx, rc), ledgerStoredIterator(tctx, led, name))
+	if merr != nil {
+		if errors.Is(merr, errCorruptManifest) {
+			a.Err = fmt.Errorf("manifest for %s: %w", name, merr)
+		} else {
+			a.Err = fmt.Errorf("inventory diff for %s (ledger read): %w", name, merr)
 		}
+		return a
 	}
-	for id := range stored {
-		if !manifest[id] {
-			a.Missing++
-		}
-	}
-	a.Detail = fmt.Sprintf("manifest=%d ledger-stored=%d", len(manifest), len(stored))
+	a.Extra, a.Missing, a.ManifestSize = extra, missing, msize
+	a.Detail = fmt.Sprintf("manifest=%d extra=%d missing=%d", msize, extra, missing)
 	return a
+}
+
+// mergeInventory lock-steps two STRICTLY-ASCENDING externalID streams — the target's manifest and
+// the ledger's stored set — counting Extra (in manifest, not ledger), Missing (in ledger, not
+// manifest) and the manifest size, in O(1) extra memory (no full-corpus maps). Both sources are
+// strictly ascending (the manifest is written from StoredObjectsPage ORDER BY externalID; the
+// ledger page query is ORDER BY externalID); manifestIterator enforces monotonicity and reports a
+// non-ascending manifest as corrupt.
+func mergeInventory(nextManifest, nextLedger func() (string, bool, error)) (extra, missing, manifestSize int, err error) {
+	m, mok, err := nextManifest()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	l, lok, err := nextLedger()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for mok || lok {
+		switch {
+		case mok && (!lok || m < l): // in manifest, not (yet) in ledger → extra
+			extra++
+			manifestSize++
+			if m, mok, err = nextManifest(); err != nil {
+				return 0, 0, 0, err
+			}
+		case lok && (!mok || l < m): // in ledger, not in manifest → missing
+			missing++
+			if l, lok, err = nextLedger(); err != nil {
+				return 0, 0, 0, err
+			}
+		default: // m == l — in both
+			manifestSize++
+			if m, mok, err = nextManifest(); err != nil {
+				return 0, 0, 0, err
+			}
+			if l, lok, err = nextLedger(); err != nil {
+				return 0, 0, 0, err
+			}
+		}
+	}
+	return extra, missing, manifestSize, nil
+}
+
+// manifestIterator returns a pull iterator over the manifest's externalIDs. The manifest is JSONL
+// (one manifestLine per row) written RAW (no codec), parsed line-by-line so a large manifest isn't
+// buffered whole. A malformed line, a bufio.ErrTooLong / mid-stream read fault, OR a non-ascending
+// key is a CORRUPT manifest (errCorruptManifest — a real fault), NOT unverifiable: the object was
+// fetched but its content is broken.
+func manifestIterator(ctx context.Context, rc io.Reader) func() (string, bool, error) {
+	sc := bufio.NewScanner(ctxReader{ctx, rc})
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	prev := ""
+	first := true
+	return func() (string, bool, error) {
+		for sc.Scan() {
+			line := sc.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var ml manifestLine
+			if uerr := json.Unmarshal(line, &ml); uerr != nil {
+				return "", false, fmt.Errorf("%w: parse line: %w", errCorruptManifest, uerr)
+			}
+			if ml.ExternalID == "" {
+				continue
+			}
+			if !first && ml.ExternalID <= prev {
+				return "", false, fmt.Errorf("%w: not strictly ascending (%q after %q)", errCorruptManifest, ml.ExternalID, prev)
+			}
+			prev, first = ml.ExternalID, false
+			return ml.ExternalID, true, nil
+		}
+		if serr := sc.Err(); serr != nil {
+			return "", false, fmt.Errorf("%w: read: %w", errCorruptManifest, serr)
+		}
+		return "", false, nil // clean EOF
+	}
+}
+
+// ledgerStoredIterator returns a pull iterator over the externalIDs the ledger records stored on
+// target, keyset-paged (ORDER BY externalID) so it holds at most one page in memory and releases
+// the DB connection between pages.
+func ledgerStoredIterator(ctx context.Context, led Ledger, target string) func() (string, bool, error) {
+	var page []string
+	i := 0
+	after := ""
+	done := false
+	return func() (string, bool, error) {
+		for i >= len(page) {
+			if done {
+				return "", false, nil
+			}
+			p, err := led.StoredExternalIDsPage(ctx, target, after, KeysetPageSize)
+			if err != nil {
+				return "", false, err
+			}
+			if len(p) < KeysetPageSize {
+				done = true
+			}
+			if len(p) == 0 {
+				return "", false, nil
+			}
+			after, page, i = p[len(p)-1], p, 0
+		}
+		id := page[i]
+		i++
+		return id, true, nil
+	}
 }
 
 // manifestFetch carries a LatestManifest result across the abandonment boundary.
@@ -123,86 +266,20 @@ type manifestFetch struct {
 	err error
 }
 
-// fetchLatestManifest runs LatestManifest in its own goroutine and honors ctx even when the sink
-// can't (a filesystem os.ReadDir/os.Open on a WEDGED MOUNT is uninterruptible — the same hazard
-// the write path guards with callWithCtx): on ctx cancellation it returns ctx.Err() and ABANDONS
-// the goroutine. Crucially, unlike the generic RunAbandonable it OWNS the result channel, so a
-// LatestManifest that completes AFTER the abandon has its produced ReadCloser DRAINED AND CLOSED
-// (in a detached goroutine) — otherwise the reader leaks an fd no one ever closes. A driver panic
-// becomes an error. The channel is buffered (cap 1) so neither the abandoned nor the drain send
-// ever blocks.
+// fetchLatestManifest runs LatestManifest honoring ctx even when the sink can't (a filesystem
+// os.ReadDir/os.Open on a WEDGED MOUNT is uninterruptible — the write path guards it with
+// callWithCtx too), via the shared RunAbandonableCleanup primitive: on ctx cancellation it returns
+// ctx.Err() and abandons the goroutine, and the cleanup CLOSES any ReadCloser the abandoned call
+// produces LATE so it can't leak an fd. A driver panic becomes an error.
 func fetchLatestManifest(ctx context.Context, ir inventoryReader) (io.ReadCloser, error) {
-	ch := make(chan manifestFetch, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ch <- manifestFetch{err: PanicErr("latest manifest", r)}
+	res := RunAbandonableCleanup(ctx,
+		func() manifestFetch { rc, err := ir.LatestManifest(ctx); return manifestFetch{rc: rc, err: err} },
+		func() manifestFetch { return manifestFetch{err: ctx.Err()} },
+		func(r any) manifestFetch { return manifestFetch{err: PanicErr("latest manifest", r)} },
+		func(f manifestFetch) {
+			if f.rc != nil {
+				_ = f.rc.Close()
 			}
-		}()
-		rc, err := ir.LatestManifest(ctx)
-		ch <- manifestFetch{rc: rc, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		// Abandon the goroutine, but drain its (buffered) result and close any reader it produced
-		// late, so a wedged-then-completing LatestManifest can't leak an open fd.
-		go func() {
-			if res := <-ch; res.rc != nil {
-				_ = res.rc.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	case res := <-ch:
-		return res.rc, res.err
-	}
-}
-
-// readLatestManifest reads a target's newest manifest snapshot into a set of externalIDs. The
-// manifest is JSONL (one manifestLine per row) written RAW (no codec), so it is parsed directly.
-// A malformed line stops the parse (a truncated/corrupt manifest is a real fault, not silently
-// under-counted). The reader is always closed.
-func readLatestManifest(ctx context.Context, ir inventoryReader) (map[string]bool, error) {
-	rc, err := fetchLatestManifest(ctx, ir)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rc.Close() }()
-	set := map[string]bool{}
-	// A manifest can be large (one line per object); scan line-by-line with a generous max token
-	// so a long JSONL row (all fields present) isn't rejected, without buffering the whole file.
-	sc := bufio.NewScanner(ctxReader{ctx, rc})
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var ml manifestLine
-		if err := json.Unmarshal(line, &ml); err != nil {
-			return nil, fmt.Errorf("%w: parse line: %w", errCorruptManifest, err)
-		}
-		if ml.ExternalID != "" {
-			set[ml.ExternalID] = true
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("read manifest: %w", err)
-	}
-	return set, nil
-}
-
-// storedSet loads the ledger's current stored externalID set for target, keyset-paged (releasing
-// the connection between pages) so the diff doesn't pin a connection for the whole enumeration.
-func storedSet(ctx context.Context, led Ledger, target string) (map[string]bool, error) {
-	set := map[string]bool{}
-	err := KeysetLoop("", KeysetPageSize,
-		func(after string, limit int) ([]string, error) {
-			return led.StoredExternalIDsPage(ctx, target, after, limit)
-		},
-		func(id string) string { return id },
-		func(id string) error { set[id] = true; return nil })
-	if err != nil {
-		return nil, err
-	}
-	return set, nil
+		})
+	return res.rc, res.err
 }

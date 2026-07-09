@@ -46,6 +46,16 @@ func bump(mu *sync.Mutex, counter *int) {
 	mu.Unlock()
 }
 
+// cancelledInFlight reports whether a per-object sweep error is a benign in-flight CANCELLATION
+// (the parent sweep ctx was cancelled — a SIGTERM aborted this object) rather than a GENUINE
+// failure. A per-object TIMEOUT while the parent ctx is still live (a slow/wedged source) is
+// GENUINE, not a cancellation — only the PARENT being cancelled is a shutdown. The ONE owner of
+// the cancel-vs-genuine distinction shared by restore-all + drill, so an interrupted DR sweep never
+// records a spurious "object failed" while a real failure that coincides with a SIGTERM still counts.
+func cancelledInFlight(parentCtx context.Context, objErr error) bool {
+	return objErr != nil && parentCtx.Err() != nil
+}
+
 // runBoundedPaced dispatches each item `enumerate` yields to `work`, at up to `concurrency`
 // in flight and paced at ratePerSec DISPATCHES/sec (0 = unlimited). The pacer AND a semaphore
 // gate dispatch; each item runs in a worker goroutine; ALL in-flight workers are drained before

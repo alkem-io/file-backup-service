@@ -54,12 +54,11 @@ func TestAuditInventoryUnverifiableBranch(t *testing.T) {
 	}
 	t.Cleanup(mock.Close)
 	ledger := db.NewLedgerRepo(mock)
-	// A target whose sink can't enumerate a manifest (fakeSink — no LatestManifest) is
-	// unverifiable: auditInventory prints it and the ledger is never queried (no expectations),
-	// so both the verdict and the sweep error are nil.
-	verdict, sweep := auditInventory(context.Background(), ledger, []domain.Target{{Sink: &fakeSink{name: "nocap"}}})
-	if verdict != nil || sweep != nil {
-		t.Fatalf("an unverifiable inventory target must yield (nil,nil), got verdict=%v sweep=%v", verdict, sweep)
+	// A WORM target whose sink can't enumerate a manifest (fakeSink — no LatestManifest) is
+	// unverifiable-benign: auditInventory prints it and the ledger is never queried (no
+	// expectations), so the joined verdict is nil.
+	if err := auditInventory(context.Background(), ledger, []domain.Target{{Sink: &fakeSink{name: "nocap"}, Worm: true}}); err != nil {
+		t.Fatalf("an unverifiable-benign inventory target must yield a nil verdict, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("no ledger query should have run for an unverifiable target: %v", err)

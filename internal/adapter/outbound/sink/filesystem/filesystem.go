@@ -105,14 +105,21 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-// PutManifest writes a ledger snapshot object under _manifest/ atomically so a
-// crash mid-write can't leave a truncated manifest a DR restore would trust. It
-// uses the same 0644 durable spine as Store — a DR restore on a different uid
-// must be able to read it.
+// PutManifest writes a ledger snapshot object under _manifest/ atomically so a crash mid-write
+// can't leave a truncated manifest a DR restore would trust, then overwrites the `_manifest/LATEST`
+// pointer with the snapshot's name so a reader single-opens the pointer instead of scanning the
+// dir. It uses the same 0644 durable spine as Store — a DR restore on a different uid must be able
+// to read it.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
 	dest := s.osPath(fsutil.ManifestKey(name))
-	_, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r)
-	return err
+	if _, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r); err != nil {
+		return err
+	}
+	ptr := s.osPath(fsutil.ManifestLatestKey())
+	if _, err := writeAtomic(ctx, filepath.Dir(ptr), filepath.Base(ptr), strings.NewReader(name)); err != nil {
+		return fmt.Errorf("write manifest pointer: %w", err)
+	}
+	return nil
 }
 
 // LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem
@@ -123,32 +130,45 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // deliberately does NOT implement CheckImmutability — a filesystem WORM target is reported
 // unverifiable for the drift check, which is correct (POSIX has no bucket object-lock to read).
 func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
+	name, err := s.latestManifestName()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(s.osPath(fsutil.ManifestKey(name))) //nolint:gosec // name is a manifest base name under the configured root, not caller-supplied
+	if err != nil {
+		return nil, fmt.Errorf("open manifest %s: %w", name, err)
+	}
+	return f, nil
+}
+
+// latestManifestName resolves the newest manifest's base name: the fast path reads the
+// `_manifest/LATEST` pointer; when it's missing/empty (old data) it falls back to the highest
+// `.jsonl` in _manifest/ (filtered to timestamped manifests via the shared fsutil rule, so the
+// pointer + any stray file can't be picked). Returns a wrapped os.ErrNotExist when none exist.
+func (s *Sink) latestManifestName() (string, error) {
+	if b, err := os.ReadFile(s.osPath(fsutil.ManifestLatestKey())); err == nil { //nolint:gosec // fixed pointer key under the configured root
+		if name := strings.TrimSpace(string(b)); fsutil.IsTimestampedManifest(name) {
+			return name, nil
+		}
+	}
 	dir := s.osPath(fsutil.ManifestDir())
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("no manifest dir %s: %w", dir, os.ErrNotExist)
+			return "", fmt.Errorf("no manifest dir %s: %w", dir, os.ErrNotExist)
 		}
-		return nil, fmt.Errorf("read manifest dir %s: %w", dir, err)
+		return "", fmt.Errorf("read manifest dir %s: %w", dir, err)
 	}
 	var latest string
 	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-		if name > latest {
-			latest = name
+		if base := e.Name(); !e.IsDir() && fsutil.IsTimestampedManifest(base) && base > latest {
+			latest = base
 		}
 	}
 	if latest == "" {
-		return nil, fmt.Errorf("no manifest in %s: %w", dir, os.ErrNotExist)
+		return "", fmt.Errorf("no manifest in %s: %w", dir, os.ErrNotExist)
 	}
-	f, err := os.Open(filepath.Join(dir, latest)) //nolint:gosec // latest is a dir entry name under the configured root, not caller-supplied
-	if err != nil {
-		return nil, fmt.Errorf("open manifest %s: %w", latest, err)
-	}
-	return f, nil
+	return latest, nil
 }
 
 // writeAtomic streams r into dir/base (0644) via the shared fsutil.CommitWrite durable

@@ -167,6 +167,41 @@ func (q *Queries) RecordBackup(ctx context.Context, arg RecordBackupParams) erro
 	return err
 }
 
+const storedCountByTarget = `-- name: StoredCountByTarget :many
+SELECT target, count(*)::bigint AS n
+FROM file_backup_target_status
+WHERE state = 'stored' AND target = ANY($1::text[])
+GROUP BY target
+`
+
+type StoredCountByTargetRow struct {
+	Target string `json:"target"`
+	N      int64  `json:"n"`
+}
+
+// Count of objects currently stored per configured target — the restore-all completeness snapshot,
+// so an operator sees per-target disparity before trusting a single-source restore. Index-only on
+// (target, state). A target with no rows is simply absent from the result (the caller fills 0).
+func (q *Queries) StoredCountByTarget(ctx context.Context, targets []string) ([]StoredCountByTargetRow, error) {
+	rows, err := q.db.Query(ctx, storedCountByTarget, targets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []StoredCountByTargetRow{}
+	for rows.Next() {
+		var i StoredCountByTargetRow
+		if err := rows.Scan(&i.Target, &i.N); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const storedExternalIDsPage = `-- name: StoredExternalIDsPage :many
 SELECT "externalID" FROM file_backup_target_status
 WHERE target = $1 AND state = 'stored' AND "externalID" > $2

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"time"
 )
 
 // immutabilityChecker is an OPTIONAL sink capability (only the s3 sink implements it) for the
@@ -25,23 +24,24 @@ type inventoryReader interface {
 	LatestManifest(ctx context.Context) (io.ReadCloser, error)
 }
 
-// immutabilityProbeTimeout bounds one target's lock/versioning probe so a black-holing backend
-// can't stall the drift check (which runs under a deadline-less signal/sampler ctx).
-const immutabilityProbeTimeout = 30 * time.Second
-
 // ImmutabilityResult is one target's WORM drift-check outcome.
 type ImmutabilityResult struct {
-	Target       string
-	Checked      bool   // the probe ran and returned a definitive lock/versioning verdict
-	OK           bool   // object-lock AND versioning are both still enabled
-	Unverifiable bool   // the target can't be checked (not s3, or a read-denying credential)
+	Target string
+	OK     bool // VERIFIED: object-lock AND versioning are both still enabled (meaningful only when !Unverifiable)
+	// Unverifiable: no definitive verdict. Structural=true means the sink CANNOT report object-lock
+	// AT ALL (a non-s3 target) — it will never have a signal, so the gauge drops any series;
+	// Structural=false is a TRANSIENT / read-denying error (a 403 PutObject-only WORM credential, a
+	// timeout) — the gauge KEEPS the prior value (a slow-but-healthy target must not go no-signal).
+	Unverifiable bool
+	Structural   bool
 	Detail       string // human-readable state or the unverifiable reason
 }
 
 // Failed reports a GENUINE drift: the probe read the config and object-lock or versioning is no
 // longer enabled. An unverifiable target (read-denying WORM credential, or a non-s3 target) is
-// NOT a failure — it is reported unverifiable, per the WORM contract.
-func (r ImmutabilityResult) Failed() bool { return r.Checked && !r.OK }
+// NOT a failure — it is reported unverifiable, per the WORM contract. Checked (== !Unverifiable) is
+// derived, not stored, so the drift verdict can't drift out of lock-step with the state.
+func (r ImmutabilityResult) Failed() bool { return !r.Unverifiable && !r.OK }
 
 // ImmutabilityFailErr is the WORM drift pass/fail VERDICT over a target set — non-nil (a nonzero
 // exit for cron/CI) when any Worm target's object-lock/versioning is verifiably no longer enabled.
@@ -84,16 +84,18 @@ func CheckImmutability(ctx context.Context, targets []Target) []ImmutabilityResu
 	return results
 }
 
-// checkOne probes a single Worm target's immutability, bounded by immutabilityProbeTimeout and
-// recover-guarded so a driver panic (a broken minio response) becomes an unverifiable result
-// rather than crashing the sampler/audit goroutine.
+// checkOne probes a single Worm target's immutability, bounded by auditProbeTimeout (the shared DR
+// probe deadline) and recover-guarded so a driver panic (a broken minio response) becomes a
+// TRANSIENT-unverifiable result rather than crashing the sampler/audit goroutine. A sink that can't
+// report object-lock at all (not s3) is STRUCTURAL-unverifiable; a read-deny / timeout / panic is
+// TRANSIENT-unverifiable (the gauge keeps the prior value).
 func checkOne(ctx context.Context, t Target) ImmutabilityResult {
 	name := t.Sink.Name()
 	ic, ok := t.Sink.(immutabilityChecker)
 	if !ok {
-		return ImmutabilityResult{Target: name, Unverifiable: true, Detail: "target type cannot report object-lock (not an S3 target)"}
+		return ImmutabilityResult{Target: name, Unverifiable: true, Structural: true, Detail: "target type cannot report object-lock (not an S3 target)"}
 	}
-	pctx, cancel := context.WithTimeout(ctx, immutabilityProbeTimeout)
+	pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
 	defer cancel()
 	return RunAbandonable(pctx,
 		func() ImmutabilityResult {
@@ -101,14 +103,13 @@ func checkOne(ctx context.Context, t Target) ImmutabilityResult {
 			if err != nil {
 				// A read-denying WORM credential (403) — or any inability to READ the config — is
 				// unverifiable by design, NOT drift: report it as such so the `== 0` alert never
-				// fires on a target we simply couldn't inspect.
+				// fires on a target we simply couldn't inspect. TRANSIENT (Structural=false): keep prior.
 				return ImmutabilityResult{Target: name, Unverifiable: true, Detail: fmt.Sprintf("unverifiable (read-denying credential or transient error): %v", err)}
 			}
 			return ImmutabilityResult{
-				Target:  name,
-				Checked: true,
-				OK:      lock && versioning,
-				Detail:  fmt.Sprintf("object-lock=%v versioning=%v", lock, versioning),
+				Target: name,
+				OK:     lock && versioning,
+				Detail: fmt.Sprintf("object-lock=%v versioning=%v", lock, versioning),
 			}
 		},
 		func() ImmutabilityResult {
@@ -146,22 +147,30 @@ func NewImmutabilitySampler(targets []Target, gauge ImmutabilityGauge) *Immutabi
 	return &ImmutabilitySampler{targets: targets, gauge: gauge}
 }
 
-// Sample runs one drift-check pass, emitting the gauge for each VERIFIABLE Worm target. It never
-// returns an error for an unverifiable target (that is the expected state of a PutObject-only
-// WORM copy); a genuine drift is surfaced through the gauge (0), which the alert keys on, not
-// through this return.
+// Sample runs one drift-check pass and updates the gauge per the WORM signal model:
+//   - VERIFIED (ok or drift) → SetImmutabilityOK(1/0).
+//   - TRANSIENT-unverifiable (a read-denying credential, a timeout) → do NOTHING — KEEP the prior
+//     value. This is the fix for the over-clear: a slow-but-healthy WORM target that merely times
+//     out must not go no-signal and hide a real drift; and a read-denying (by-design) target simply
+//     never gets a series, so the `== 0` alert can't false-fire.
+//   - STRUCTURAL-unverifiable (the sink can NEVER report object-lock — a non-s3 target) → CLEAR any
+//     series: it will never carry a valid signal, so it must not linger stale.
+//
+// It never returns an error for an unverifiable target (that is the expected state of a
+// PutObject-only WORM copy); a genuine drift is surfaced through the gauge (0), not this return.
 func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	for _, r := range CheckImmutability(ctx, s.targets) {
-		if r.Unverifiable {
-			// Drop any prior series so a formerly-green target that becomes unreadable doesn't
-			// stay stuck at 1 (masking drift); an absent series can't fire the `== 0` alert either.
+		switch {
+		case !r.Unverifiable:
+			s.gauge.SetImmutabilityOK(r.Target, r.OK)
+		case r.Structural:
 			s.gauge.ClearImmutabilityOK(r.Target)
-			continue
+		default:
+			// transient / read-denying → keep the prior value (don't clobber a healthy-but-slow target)
 		}
-		s.gauge.SetImmutabilityOK(r.Target, r.OK)
 	}
 	return nil
 }

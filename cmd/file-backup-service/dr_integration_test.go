@@ -131,7 +131,7 @@ func TestIntegrationRestoreVersion(t *testing.T) {
 
 	// --at AFTER the version time → the current hash IS the version as of --at → restores.
 	after := verTime.Add(time.Hour).Format(time.RFC3339)
-	if err := runRestoreVersion([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", after, "--from", name, "--to", restoreDir}); err != nil {
+	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", after, "--from", name, "--to", restoreDir}); err != nil {
 		t.Fatalf("restore version (--at after version time) must resolve + restore, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(restoreDir, hashes[0])); err != nil {
@@ -140,13 +140,13 @@ func TestIntegrationRestoreVersion(t *testing.T) {
 
 	// --at BEFORE the version time → the historical version isn't live → error directing to PITR.
 	before := verTime.Add(-time.Hour).Format(time.RFC3339)
-	err := runRestoreVersion([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", before, "--from", name, "--to", t.TempDir()})
+	err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", before, "--from", name, "--to", t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "PITR") {
 		t.Fatalf("restore version (--at before a replaced version) must error toward PITR/--hash, got %v", err)
 	}
 
 	// An unknown file id → error (no current hash).
-	if err := runRestoreVersion([]string{"--config", cfgPath, "--file-id", uuid.NewString(), "--at", after, "--from", name}); err == nil {
+	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", uuid.NewString(), "--at", after, "--from", name}); err == nil {
 		t.Fatal("restore version of an unknown file id must error")
 	}
 }
@@ -249,7 +249,7 @@ func TestIntegrationRestoreVersionNullUpdatedDate(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 	cfgPath, _ := harnessConfig(t, "http://unused")
-	err := runRestoreVersion([]string{
+	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", fid.String(), "--at", time.Now().Format(time.RFC3339), "--from", "local",
 	})
 	if err == nil || !strings.Contains(err.Error(), "NULL updatedDate") {

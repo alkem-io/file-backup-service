@@ -3,10 +3,14 @@
 package metrics
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +21,7 @@ import (
 	"github.com/prometheus/common/expfmt"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // Metrics holds the Prometheus collectors.
@@ -142,7 +147,12 @@ type DrillMetrics struct {
 	reg         *prometheus.Registry
 	pass        prometheus.Gauge
 	lastSuccess prometheus.Gauge
+	passed      bool // whether the recorded run passed — drives the last-success carry-forward
 }
+
+// drillLastSuccessMetric is the last-success gauge name — shared by NewDrillMetrics and the
+// carry-forward parse (readPriorLastSuccess), so they can't disagree on the metric name.
+const drillLastSuccessMetric = "filebackup_drill_last_success_timestamp_seconds"
 
 // NewDrillMetrics builds the drill metric set on a private, collector-free registry.
 func NewDrillMetrics() *DrillMetrics {
@@ -152,67 +162,78 @@ func NewDrillMetrics() *DrillMetrics {
 		reg: reg,
 		pass: f.NewGauge(prometheus.GaugeOpts{
 			Name: "filebackup_restore_drill_pass",
-			Help: "Last restore-drill result: 1 = every sampled object restored + hash-matched, 0 = at least one failed. Set by the `drill` subcommand; exported via a textfile (--metrics-file) since the drill process is short-lived. Alert on == 0.",
+			Help: "Last restore-drill result: 1 = every sampled object restored + hash-matched, 0 = at least one failed (or 0 sampled). Set by the `drill` subcommand; exported via a textfile (--metrics-file) since the drill process is short-lived. Alert on == 0.",
 		}),
 		lastSuccess: f.NewGauge(prometheus.GaugeOpts{
-			Name: "filebackup_drill_last_success_timestamp_seconds",
-			Help: "Unix timestamp (seconds) of the last FULLY-PASSING restore drill; 0 until the first. Alert on time() - this > a week to catch a drill that stopped succeeding.",
+			Name: drillLastSuccessMetric,
+			Help: "Unix timestamp (seconds) of the last FULLY-PASSING restore drill; 0 until the first. Preserved across FAILING runs. Alert on time() - this > a week to catch a drill that stopped succeeding.",
 		}),
 	}
 }
 
-// Set records a drill outcome: the pass gauge (1/0) and, on a full pass, the last-success
-// timestamp. A failing drill leaves the last-success timestamp untouched, so an operator sees when
-// the drill last actually SUCCEEDED, not merely when it last ran.
-func (d *DrillMetrics) Set(pass bool, at time.Time) {
+// SetPass records a drill outcome: the pass gauge (1/0) and, ON A PASS, the last-success timestamp.
+// A FAILING/0-checked run leaves last-success at 0 HERE — WriteTextfile then carries forward the
+// prior textfile's last-success so a failing run never CLOBBERS the true last-success to 0 (each
+// drill is a separate short-lived process overwriting the same file).
+func (d *DrillMetrics) SetPass(pass bool, at time.Time) {
+	d.passed = pass
 	d.pass.Set(b2f(pass))
 	if pass {
 		d.lastSuccess.Set(float64(at.Unix()))
 	}
 }
 
-// WriteTextfile atomically writes the drill registry to path in Prometheus text-exposition format
-// (temp + rename, so a scrape never reads a half-written file) — the node-exporter
-// textfile-collector convention for a short-lived batch job's metrics (a scraped /metrics can't
-// carry them because the process exits). A "" path is a no-op (the exit code carries the signal).
+// WriteTextfile durably writes the drill registry to path in Prometheus text-exposition format via
+// fsutil.CommitWrite (temp → fsync → rename → parent-dir fsync, so a crash can't leave a torn or
+// non-durable file). On a NON-pass run it first carries forward the PRIOR textfile's last-success
+// timestamp, so a failing/0-checked drill overwriting the file never resets last-success to 0 — the
+// file always carries the true last-success. A "" path is a no-op (the exit code carries the signal).
 func (d *DrillMetrics) WriteTextfile(path string) error {
 	if path == "" {
 		return nil
+	}
+	if !d.passed {
+		if prior := readPriorLastSuccess(path); prior > 0 {
+			d.lastSuccess.Set(prior)
+		}
 	}
 	mfs, gerr := d.reg.Gather()
 	if gerr != nil {
 		return fmt.Errorf("gather metrics: %w", gerr)
 	}
-	tmp, cerr := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
-	if cerr != nil {
-		return fmt.Errorf("create metrics temp: %w", cerr)
-	}
-	// Remove the temp on any failure path; on success it has been renamed away (the committed
-	// flag skips the Remove of the now-absent temp).
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tmp.Close()
-			_ = os.Remove(tmp.Name())
+	return fsutil.CommitWrite(context.Background(), filepath.Dir(path), filepath.Base(path), func(f *os.File) error {
+		enc := expfmt.NewEncoder(f, expfmt.NewFormat(expfmt.TypeTextPlain))
+		for _, mf := range mfs {
+			if eerr := enc.Encode(mf); eerr != nil {
+				return fmt.Errorf("encode metrics: %w", eerr)
+			}
 		}
-	}()
-	enc := expfmt.NewEncoder(tmp, expfmt.NewFormat(expfmt.TypeTextPlain))
-	for _, mf := range mfs {
-		if eerr := enc.Encode(mf); eerr != nil {
-			return fmt.Errorf("encode metrics: %w", eerr)
+		return nil
+	})
+}
+
+// readPriorLastSuccess parses the existing textfile for the last-success gauge's value, so a
+// failing run can re-emit it unchanged. A missing/unparseable file yields 0 (nothing to carry).
+func readPriorLastSuccess(path string) float64 {
+	f, err := os.Open(path) //nolint:gosec // operator-configured metrics textfile path
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, drillLastSuccessMetric) {
+			continue
+		}
+		fields := strings.Fields(line) // "<name> <value>"
+		if len(fields) == 2 && fields[0] == drillLastSuccessMetric {
+			if v, perr := strconv.ParseFloat(fields[1], 64); perr == nil {
+				return v
+			}
 		}
 	}
-	if serr := tmp.Sync(); serr != nil {
-		return fmt.Errorf("sync metrics temp: %w", serr)
-	}
-	if clerr := tmp.Close(); clerr != nil {
-		return fmt.Errorf("close metrics temp: %w", clerr)
-	}
-	if rerr := os.Rename(tmp.Name(), path); rerr != nil {
-		return fmt.Errorf("commit metrics textfile: %w", rerr)
-	}
-	committed = true
-	return nil
+	return 0
 }
 
 // SetBacklog updates the outbox backlog gauges (pending count + oldest-pending age).

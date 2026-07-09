@@ -12,12 +12,15 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 const (
-	manifestPrefix  = "_manifest"
-	preflightPrefix = "_preflight"
+	manifestPrefix     = "_manifest"
+	manifestLatestName = "LATEST"
+	manifestSuffix     = ".jsonl"
+	preflightPrefix    = "_preflight"
 	// contentHashLen is the hex length of a SHA3-256 externalID (32 bytes -> 64 hex chars).
 	contentHashLen = 64
 )
@@ -153,6 +156,17 @@ func ManifestKey(name string) string {
 // target→ledger inventory reader lists a target's manifests in the SAME place PutManifest
 // (via ManifestKey) writes them — one owner, so the write + enumerate paths can't diverge.
 func ManifestDir() string { return manifestPrefix }
+
+// ManifestLatestKey is the fixed pointer object (`_manifest/LATEST`) naming the newest manifest, so
+// a reader single-GETs it instead of listing the whole prefix. PutManifest overwrites it each pass
+// (a new object VERSION on a versioned/object-lock bucket, so it's WORM-safe).
+func ManifestLatestKey() string { return path.Join(manifestPrefix, manifestLatestName) }
+
+// IsTimestampedManifest reports whether base is a timestamped manifest object (a `.jsonl`), so the
+// fallback newest-scan (used when the LATEST pointer is absent) IGNORES the pointer + any stray
+// object — the ONE naming rule shared by the s3 + filesystem sinks, so they can't diverge on which
+// object is "the newest manifest".
+func IsTimestampedManifest(base string) bool { return strings.HasSuffix(base, manifestSuffix) }
 
 // syncDir fsyncs a directory so a create/rename within it is durable
 // (atomic != durable). Used after every content write.
