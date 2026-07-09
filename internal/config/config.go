@@ -235,11 +235,15 @@ func (c *Config) seedTargetsFromEnv() {
 	if strings.TrimSpace(raw) == "" {
 		return
 	}
+	// Key the YAML base by env-var TOKEN, not raw name — the identity applyTargetEnv and
+	// ValidateTargets use — so FBS_TARGETS can reference a YAML-declared target by any
+	// token-equivalent spelling (e.g. "OFFSITE" ↔ "offsite") and keep its entry (its Name and any
+	// YAML-only fields). Matching by raw name would silently rebuild it as a bare target.
 	base := make(map[string]Target, len(c.Targets))
 	for _, t := range c.Targets {
-		base[t.Name] = t
+		base[envToken(t.Name)] = t
 	}
-	out := make([]Target, 0, len(base)+1)
+	out := make([]Target, 0, len(c.Targets)+1)
 	seen := make(map[string]bool)
 	for _, name := range strings.Split(raw, ",") {
 		name = strings.TrimSpace(name)
@@ -247,8 +251,8 @@ func (c *Config) seedTargetsFromEnv() {
 			continue
 		}
 		seen[name] = true
-		if t, ok := base[name]; ok {
-			out = append(out, t) // keep the YAML-declared base; applyTargetEnv overlays it
+		if t, ok := base[envToken(name)]; ok {
+			out = append(out, t) // keep the YAML-declared base (Name + fields); applyTargetEnv overlays it
 		} else {
 			out = append(out, Target{Name: name})
 		}

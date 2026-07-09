@@ -109,6 +109,36 @@ targets:
 	}
 }
 
+// TestEnvTargets_TokenEquivalentMatchesYAML: FBS_TARGETS may reference a YAML-declared target by a
+// token-equivalent spelling (case/punctuation) and MUST keep its entry — the original Name plus any
+// YAML-only field env doesn't re-supply — because applyTargetEnv + ValidateTargets identify targets
+// by env-var token, not raw name. (With raw-name matching this rebuilt a bare target, dropping the
+// compression field and flipping the ledger name.)
+func TestEnvTargets_TokenEquivalentMatchesYAML(t *testing.T) {
+	yml := writeTempConfig(t, `
+fileServiceBase: http://fs
+alkemioDB: { host: h, user: u, dbName: alkemio }
+ledgerDB:  { host: h, user: u, dbName: filebackup }
+targets:
+  - { name: offsite, type: filesystem, path: /a, compression: zstd }
+`)
+	t.Setenv("FBS_TARGETS", "OFFSITE") // uppercase — token-equivalent to the YAML "offsite"
+
+	cfg, err := Load(yml)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if len(cfg.Targets) != 1 {
+		t.Fatalf("want 1 target, got %+v", cfg.Targets)
+	}
+	if tgt := cfg.Targets[0]; tgt.Name != "offsite" || tgt.Compression != "zstd" || tgt.Path != "/a" {
+		t.Fatalf("token-equivalent FBS_TARGETS must keep the YAML base (Name + fields): %+v", tgt)
+	}
+}
+
 // TestEnvTargets_DedupAndBlanks: FBS_TARGETS trims blanks and de-dups, preserving first-seen order.
 func TestEnvTargets_DedupAndBlanks(t *testing.T) {
 	baseEnv(t)
