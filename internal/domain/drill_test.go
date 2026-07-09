@@ -152,23 +152,26 @@ func TestDrillCancelDuringObjectIsInterruptNotFailure(t *testing.T) {
 	}
 }
 
-// panicFetchSink panics on Fetch — a poison object that must be contained as ONE failure, not crash
-// the drill.
+// panicFetchSink panics on Fetch — a poison object. The restore path's callWithCtx (RestoreObject →
+// decodeStream) turns that panic into an error, so the drill records it as a failure instead of
+// crashing.
 type panicFetchSink struct{ memSink }
 
 func (*panicFetchSink) Fetch(context.Context, string) (io.ReadCloser, error) { panic("boom") }
 
-// TestDrillContainsPanic: a per-object panic (a poison object / driver bug) is contained as one
-// GENUINE failure, not a crash — the drill (via runBoundedPaced + recover) keeps going and reports it.
-func TestDrillContainsPanic(t *testing.T) {
+// TestDrillContainsPoisonObject: a poison object whose sink Fetch PANICS is contained by the restore
+// path (callWithCtx) as one GENUINE failure — the drill keeps going and reports it, never crashes.
+// (drillOne itself has no panic path of its own — the sink is behind callWithCtx and the os-spine
+// doesn't panic — so this defends the reachable containment, not a dead recover.)
+func TestDrillContainsPoisonObject(t *testing.T) {
 	led := newFakeLedger()
 	hashes := seedDrillCorpus(t, led, newMemSink("t"), 1)
 	sink := &panicFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{hashes[0]: []byte("x")}}}
 	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 0, time.Minute)
 	if err != nil {
-		t.Fatalf("a contained panic must not abort the drill, got %v", err)
+		t.Fatalf("a contained poison object must not abort the drill, got %v", err)
 	}
 	if out.Checked != 1 || out.Failed != 1 || out.Pass() {
-		t.Fatalf("a panicking object must be one contained failure, got %+v", out)
+		t.Fatalf("a panicking-Fetch object must be one contained failure, got %+v", out)
 	}
 }

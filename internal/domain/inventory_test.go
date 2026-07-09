@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -235,6 +236,93 @@ func TestAuditInventoryNonAscendingIsCorrupt(t *testing.T) {
 	_, err := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
 	if err == nil || !errors.Is(err, errCorruptManifest) {
 		t.Fatalf("a non-ascending manifest must be corrupt, got %v", err)
+	}
+}
+
+// TestManifestIteratorClassifiesReadErrors (delta re-review #1): the scanner-error classification —
+// a ctx cancel/deadline propagates as cancellation (NOT corrupt); a transient network reset is a
+// plain read error (NOT corrupt); a JSON parse error, bufio.ErrTooLong, and a non-ascending key are
+// all CORRUPT.
+func TestManifestIteratorClassifiesReadErrors(t *testing.T) {
+	line := func(id string) []byte { return []byte(`{"externalID":"` + id + `"}` + "\n") }
+
+	// ctx-cancel mid-read → the ctx error, NOT corrupt.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := manifestIterator(ctx, bytes.NewReader(line("aa")))(); !errors.Is(err, context.Canceled) || errors.Is(err, errCorruptManifest) {
+		t.Fatalf("a ctx-cancel mid-read must be a cancellation, not corrupt: %v", err)
+	}
+
+	// transient network reset mid-stream → a plain read error, NOT corrupt.
+	boom := errors.New("connection reset by peer")
+	it := manifestIterator(context.Background(), io.MultiReader(bytes.NewReader(line("aa")), errReader{boom}))
+	if _, ok, _ := it(); !ok {
+		t.Fatal("first manifest line should yield")
+	}
+	_, _, err := it()
+	if err == nil || errors.Is(err, errCorruptManifest) || errors.Is(err, context.Canceled) {
+		t.Fatalf("a transient mid-read reset must be a plain read error (not corrupt/cancel): %v", err)
+	}
+
+	// a malformed JSON line → corrupt.
+	if _, _, err := manifestIterator(context.Background(), bytes.NewReader([]byte("{bad json\n")))(); !errors.Is(err, errCorruptManifest) {
+		t.Fatalf("a JSON parse error must be corrupt: %v", err)
+	}
+
+	// a line longer than the 1 MiB buffer → bufio.ErrTooLong → corrupt.
+	huge := append(bytes.Repeat([]byte("a"), 2<<20), '\n')
+	if _, _, err := manifestIterator(context.Background(), bytes.NewReader(huge))(); !errors.Is(err, errCorruptManifest) || !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("an over-long line must be corrupt (ErrTooLong): %v", err)
+	}
+
+	// non-ascending order → corrupt (surfaced on the second pull).
+	it2 := manifestIterator(context.Background(), io.MultiReader(bytes.NewReader(line("bb")), bytes.NewReader(line("aa"))))
+	_, _, _ = it2() // consume "bb"
+	if _, _, err := it2(); !errors.Is(err, errCorruptManifest) {
+		t.Fatalf("a non-ascending key must be corrupt: %v", err)
+	}
+}
+
+// ioErrManifestSink serves prefix bytes then a fixed I/O error mid-stream — a transient reset.
+type ioErrManifestSink struct {
+	stubSink
+	prefix []byte
+	err    error
+}
+
+func (s ioErrManifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(io.MultiReader(bytes.NewReader(s.prefix), errReader{s.err})), nil
+}
+
+// TestAuditInventoryTransientReadIsUnverifiable (delta re-review #1): a mid-stream transient read
+// reset is UNVERIFIABLE (retry next pass) — NOT a data-corruption fault, symmetric with the fetch
+// path.
+func TestAuditInventoryTransientReadIsUnverifiable(t *testing.T) {
+	led := newFakeLedger()
+	storeOnTarget(t, led, hashOf("a"))
+	sink := ioErrManifestSink{stubSink: stubSink{name: "t"}, prefix: []byte(`{"externalID":"` + hashOf("a") + `"}` + "\n"), err: errors.New("connection reset by peer")}
+	rep, err := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
+	if err != nil {
+		t.Fatalf("a transient read reset must NOT be a sweep fault, got %v", err)
+	}
+	if a := rep.Targets[0]; !a.Unverifiable || a.Err != nil {
+		t.Fatalf("a transient mid-read reset must be unverifiable (not corrupt/fault): %+v", a)
+	}
+}
+
+// TestAuditInventoryCancelledIsBenign (delta re-review #1): a ctx cancellation during the read is
+// benign at the target level (NoData) — the audit's top-level ctx.Err() fold surfaces the abort, not
+// a spurious per-target corruption fault.
+func TestAuditInventoryCancelledIsBenign(t *testing.T) {
+	led := newFakeLedger()
+	storeOnTarget(t, led, hashOf("a"))
+	sink := ioErrManifestSink{stubSink: stubSink{name: "t"}, prefix: []byte(`{"externalID":"` + hashOf("a") + `"}` + "\n"), err: context.Canceled}
+	rep, err := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
+	if err != nil {
+		t.Fatalf("a cancellation must not be a per-target sweep fault, got %v", err)
+	}
+	if a := rep.Targets[0]; !a.Unverifiable || !a.NoData || a.Err != nil || a.Failed() {
+		t.Fatalf("a cancelled read must be benign (unverifiable+NoData, no fault), got %+v", a)
 	}
 }
 

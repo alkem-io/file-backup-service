@@ -47,11 +47,17 @@ func (a InventoryAudit) Failed() bool {
 	return a.Extra > 0
 }
 
-// errCorruptManifest marks a manifest that WAS fetched but is malformed (a truncated/corrupt JSONL,
-// a bufio.ErrTooLong line, a non-ascending key, or a mid-stream read fault) — a real fault (the
-// target's DR inventory is broken), distinct from a read-DENIED or missing manifest, which are
-// merely unverifiable.
+// errCorruptManifest marks a manifest that WAS fetched but has a STRUCTURAL content fault — a
+// malformed JSONL line, a bufio.ErrTooLong line, or a non-ascending key — a real fault (the
+// target's DR inventory is broken). It deliberately does NOT cover a transient mid-stream read
+// reset (unverifiable, retry) or a ctx cancellation (propagated), so a blip/SIGTERM can't fire a
+// false data-corruption fault.
 var errCorruptManifest = errors.New("corrupt manifest")
+
+// errLedgerRead marks an error from the ledger side of the merge (StoredExternalIDsPage), so
+// auditInventoryTarget can classify a genuine DB fault (a real fault) apart from a transient
+// MANIFEST read (unverifiable) — both surface through mergeInventory as one error otherwise.
+var errLedgerRead = errors.New("ledger read")
 
 // InventoryReport is the per-target target→ledger audit result.
 type InventoryReport struct {
@@ -128,28 +134,45 @@ func auditInventoryTarget(ctx context.Context, led Ledger, t Target) (a Inventor
 	}
 	rc, err := fetchLatestManifest(tctx, ir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			a.Unverifiable, a.NoData, a.Detail = true, true, "no manifest written yet (nothing to diff)"
-			return a
-		}
-		// A read-denying credential / transient fetch error → unverifiable (fails a non-worm target).
-		a.Unverifiable, a.Detail = true, fmt.Sprintf("manifest unreadable (read-denying credential or transient error): %v", err)
+		classifyInventoryErr(&a, name, err)
 		return a
 	}
 	defer func() { _ = rc.Close() }()
 
 	extra, missing, msize, merr := mergeInventory(manifestIterator(tctx, rc), ledgerStoredIterator(tctx, led, name))
 	if merr != nil {
-		if errors.Is(merr, errCorruptManifest) {
-			a.Err = fmt.Errorf("manifest for %s: %w", name, merr)
-		} else {
-			a.Err = fmt.Errorf("inventory diff for %s (ledger read): %w", name, merr)
-		}
+		classifyInventoryErr(&a, name, merr)
 		return a
 	}
 	a.Extra, a.Missing, a.ManifestSize = extra, missing, msize
 	a.Detail = fmt.Sprintf("manifest=%d extra=%d missing=%d", msize, extra, missing)
 	return a
+}
+
+// classifyInventoryErr folds a manifest fetch/read/diff error into the target's result — the ONE
+// classifier for BOTH the fetch and the merge paths, so the two can't diverge on what "corrupt" vs
+// "unverifiable" vs "cancelled" means:
+//   - os.ErrNotExist → NoData (no manifest yet) — benign.
+//   - context.Canceled / DeadlineExceeded → benign this pass: a real shutdown is surfaced by the
+//     audit's top-level ctx.Err() fold, not a spurious per-target fault, and a per-target probe
+//     deadline just means "couldn't finish this pass".
+//   - errCorruptManifest (a JSON parse error, bufio.ErrTooLong, or a non-ascending key) → a FAULT.
+//   - errLedgerRead (a genuine DB error) → a FAULT.
+//   - anything else (a read-denying credential, a transient mid-stream manifest read reset) →
+//     unverifiable (benign; a non-worm target's broken read path fails, per the unified policy).
+func classifyInventoryErr(a *InventoryAudit, name string, err error) {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		a.Unverifiable, a.NoData, a.Detail = true, true, "no manifest written yet (nothing to diff)"
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		a.Unverifiable, a.NoData, a.Detail = true, true, fmt.Sprintf("aborted mid-check (cancelled/deadline): %v", err)
+	case errors.Is(err, errCorruptManifest):
+		a.Err = fmt.Errorf("manifest for %s: %w", name, err)
+	case errors.Is(err, errLedgerRead):
+		a.Err = fmt.Errorf("inventory diff for %s: %w", name, err)
+	default:
+		a.Unverifiable, a.Detail = true, fmt.Sprintf("manifest unreadable (read-denying credential or transient read fault): %v", err)
+	}
 }
 
 // mergeInventory lock-steps two STRICTLY-ASCENDING externalID streams — the target's manifest and
@@ -223,7 +246,19 @@ func manifestIterator(ctx context.Context, rc io.Reader) func() (string, bool, e
 			return ml.ExternalID, true, nil
 		}
 		if serr := sc.Err(); serr != nil {
-			return "", false, fmt.Errorf("%w: read: %w", errCorruptManifest, serr)
+			switch {
+			case errors.Is(serr, context.Canceled) || errors.Is(serr, context.DeadlineExceeded):
+				// A cancellation / per-target deadline (surfaced through ctxReader) — propagate as-is,
+				// NOT a corruption fault: a clean SIGTERM / probe timeout is not "the manifest is broken".
+				return "", false, serr
+			case errors.Is(serr, bufio.ErrTooLong):
+				// A line larger than the buffer — a genuine structural content fault.
+				return "", false, fmt.Errorf("%w: line too long: %w", errCorruptManifest, serr)
+			default:
+				// A transient mid-stream read fault (a network reset) — NOT structural corruption;
+				// benign, retry next pass (classified unverifiable by auditInventoryTarget).
+				return "", false, fmt.Errorf("manifest read: %w", serr)
+			}
 		}
 		return "", false, nil // clean EOF
 	}
@@ -244,7 +279,7 @@ func ledgerStoredIterator(ctx context.Context, led Ledger, target string) func()
 			}
 			p, err := led.StoredExternalIDsPage(ctx, target, after, KeysetPageSize)
 			if err != nil {
-				return "", false, err
+				return "", false, fmt.Errorf("%w: %w", errLedgerRead, err)
 			}
 			if len(p) < KeysetPageSize {
 				done = true
