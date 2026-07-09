@@ -14,8 +14,14 @@ import (
 type VerdictStatus int
 
 const (
+	// StatusUnknown is the ZERO VALUE — an unpopulated verdict. It MUST never read as a pass: if a
+	// probe goroutine panics in its own body (outside the inner abandon-recover) before writing its
+	// slot, that slot stays zero-value, and a passing zero value would let a target SILENTLY PASS.
+	// So the zero value fails closed (Failed()=true), and probeTargets additionally folds any
+	// recovered body-panic into an explicit StatusFault.
+	StatusUnknown VerdictStatus = iota
 	// StatusVerified means the target was checked and is correct.
-	StatusVerified VerdictStatus = iota
+	StatusVerified
 	// StatusDrift means the target was DEFINITIVELY checked and is WRONG — silent loss (ledger→target),
 	// an orphan / lost ledger record (inventory), or object-lock/versioning removed (immutability).
 	// Always fails.
@@ -36,6 +42,8 @@ const (
 
 func (s VerdictStatus) String() string {
 	switch s {
+	case StatusUnknown:
+		return "UNKNOWN"
 	case StatusVerified:
 		return "verified"
 	case StatusDrift:
@@ -62,8 +70,8 @@ func (s VerdictStatus) String() string {
 //     read path, and an incomplete integrity check must not read green).
 func (s VerdictStatus) Failed(worm bool) bool {
 	switch s {
-	case StatusDrift, StatusCorrupt, StatusFault:
-		return true
+	case StatusDrift, StatusCorrupt, StatusFault, StatusUnknown:
+		return true // StatusUnknown (the zero value) fails closed — an unpopulated verdict is never a pass
 	case StatusUnverifiable:
 		return !worm
 	default: // StatusVerified, StatusNoData
@@ -131,13 +139,31 @@ func (r VerdictReport) FailErr() error {
 func probeTargets(ctx context.Context, targets []Target, perTargetTimeout time.Duration,
 	probe func(pctx context.Context, t Target) TargetVerdict) []TargetVerdict {
 	out := make([]TargetVerdict, len(targets))
-	_ = RunParallelIdx(len(targets),
-		func(i int) string { return "probe " + targets[i].Sink.Name() },
+	errs := RunParallelIdx(len(targets),
+		func(i int) string { return "probe " + safeSinkName(targets[i]) },
 		func(i int) error {
 			out[i] = probeOne(ctx, targets[i], perTargetTimeout, probe)
 			return nil
 		})
+	// A panic in probeOne's OWN body — OUTSIDE the inner abandon-recover, e.g. a nil t.Sink deref
+	// while stamping the verdict — is recovered by RunParallelIdx and returned here; out[i] would then
+	// stay the zero-value TargetVerdict, which MUST NOT read as a pass. Fold any such recovered error
+	// into an explicit failing Fault so no target can silently pass on a body panic. Never discard.
+	for i, err := range errs {
+		if err != nil {
+			out[i] = TargetVerdict{Target: safeSinkName(targets[i]), Worm: targets[i].Worm, Status: StatusFault, Err: err}
+		}
+	}
 	return out
+}
+
+// safeSinkName returns the target's sink name, guarding a nil Sink so building the panic label /
+// fault verdict can't itself panic (which would crash the recover handler).
+func safeSinkName(t Target) string {
+	if t.Sink == nil {
+		return "<nil-sink>"
+	}
+	return t.Sink.Name()
 }
 
 // probeOne runs one target's probe in an abandonable goroutine (so a probe that blocks IGNORING ctx
@@ -158,9 +184,9 @@ func probeOne(ctx context.Context, t Target, timeout time.Duration,
 		func() TargetVerdict { return probe(pctx, t) },
 		func() TargetVerdict { return abandonVerdict(ctx, pctx) },
 		func(r any) TargetVerdict {
-			return TargetVerdict{Status: StatusFault, Err: PanicErr("probe "+t.Sink.Name(), r)}
+			return TargetVerdict{Status: StatusFault, Err: PanicErr("probe "+safeSinkName(t), r)}
 		})
-	v.Target = t.Sink.Name()
+	v.Target = safeSinkName(t)
 	v.Worm = t.Worm
 	return v
 }
@@ -171,7 +197,14 @@ func probeOne(ctx context.Context, t Target, timeout time.Duration,
 // target (Unverifiable → fails a non-worm target: an incomplete integrity check must not read green).
 func abandonVerdict(parentCtx, probeCtx context.Context) TargetVerdict {
 	if parentCtx.Err() != nil {
-		return TargetVerdict{Status: StatusNoData, Detail: fmt.Sprintf("aborted by shutdown: %v", probeCtx.Err())}
+		return shutdownVerdict(probeCtx.Err())
 	}
 	return TargetVerdict{Status: StatusUnverifiable, Detail: fmt.Sprintf("per-target probe deadline exceeded (wedged target): %v", probeCtx.Err())}
+}
+
+// shutdownVerdict is the benign NoData verdict for a probe aborted by a PARENT cancel (a SIGTERM):
+// the audit's top-level ctx.Err() fold surfaces the abort, so a per-target shutdown must NOT read as a
+// failure. The ONE owner of this construction, shared by abandonVerdict + both direction classifiers.
+func shutdownVerdict(cause error) TargetVerdict {
+	return TargetVerdict{Status: StatusNoData, Detail: fmt.Sprintf("aborted by shutdown: %v", cause)}
 }

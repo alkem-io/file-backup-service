@@ -242,15 +242,16 @@ type existsPanicSink struct{ stubSink }
 
 func (existsPanicSink) Exists(context.Context, string) (bool, error) { panic("exists boom") }
 
-// TestAuditExistsPanicContained: a panic in an Exists probe is recovered by existsWithCtx into an
-// errored probe result — counted, so a non-worm target reads Unverifiable and FAILS (never a crash).
-func TestAuditExistsPanicContained(t *testing.T) {
+// TestAuditExistsPanicIsFault (re-review B3): a panic in an Exists probe is recovered by existsWithCtx
+// (never a crash) and routed to Fault — a driver panic is a code bug, fail-loud, not swallowed to a
+// benign Unverifiable.
+func TestAuditExistsPanicIsFault(t *testing.T) {
 	ctx := context.Background()
 	led := newFakeLedger()
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "hashA"}, []TargetStatus{{Target: "t", State: StateStored}})
 	rep := Audit(ctx, led, []Target{{Sink: existsPanicSink{stubSink{name: "t"}}}}, 0)
-	if v := rep.Targets[0]; v.Checked == 0 || v.Status != StatusUnverifiable || !v.Failed() {
-		t.Fatalf("a panicking Exists must count as an errored probe → Unverifiable+fail: %+v", v)
+	if v := rep.Targets[0]; v.Status != StatusFault || !v.Failed() {
+		t.Fatalf("a panicking Exists must be a failing Fault (fail-loud on a code bug): %+v", v)
 	}
 }
 

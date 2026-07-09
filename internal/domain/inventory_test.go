@@ -195,15 +195,68 @@ func TestAuditInventoryMergeBoundaries(t *testing.T) {
 	}
 }
 
-// TestAuditInventoryNonAscendingIsCorrupt: a manifest whose keys aren't strictly ascending is
-// CORRUPT (the streaming merge relies on order).
-func TestAuditInventoryNonAscendingIsCorrupt(t *testing.T) {
+// TestAuditInventoryNonAscendingFallsBackToSortedDiff (re-review C3): a non-byte-ascending manifest
+// (an old-format / locale-collated manifest, legitimately written) must NOT hard-fail as corrupt —
+// the order-independent (sorted) fallback re-fetches, sorts, and diffs correctly.
+func TestAuditInventoryNonAscendingFallsBackToSortedDiff(t *testing.T) {
 	led := newFakeLedger()
-	body := []byte(`{"externalID":"bb"}` + "\n" + `{"externalID":"aa"}` + "\n")
+	storeOnTarget(t, led, "aa", "cc") // ledger stores aa, cc on "t"
+	// The manifest lists cc, bb, aa OUT of byte order. After the sorted fallback: bb is an orphan
+	// (extra=1) → Drift; aa/cc are in both. It must NOT be a corruption fault.
+	body := []byte(`{"externalID":"cc"}` + "\n" + `{"externalID":"bb"}` + "\n" + `{"externalID":"aa"}` + "\n")
 	sink := manifestSink{stubSink: stubSink{name: "t"}, manifest: body}
 	rep := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
-	if !errors.Is(rep.FailErr(), errCorruptManifest) {
-		t.Fatalf("a non-ascending manifest must be corrupt, got %v", rep.FailErr())
+	if v := rep.Targets[0]; v.Status != StatusDrift || v.Extra != 1 {
+		t.Fatalf("a non-ascending manifest must fall back to a sorted diff (bb orphan → Drift extra=1), got %+v", v)
+	}
+	if errors.Is(rep.FailErr(), errCorruptManifest) {
+		t.Fatalf("a non-ascending (old-format) manifest must NOT be a corruption fault: %v", rep.FailErr())
+	}
+}
+
+// flakyManifestSink returns a fixed manifest on the FIRST LatestManifest call and an error on the
+// SECOND — so a test can exercise the order-independent fallback's RE-FETCH failing.
+type flakyManifestSink struct {
+	stubSink
+	first []byte
+	err   error
+	calls int
+}
+
+func (s *flakyManifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
+	s.calls++
+	if s.calls == 1 {
+		return io.NopCloser(bytes.NewReader(s.first)), nil
+	}
+	return nil, s.err
+}
+
+// TestAuditInventorySortedDiffRefetchError (re-review C3): if the non-ascending fallback's RE-FETCH
+// of the manifest fails, it classifies that error (here a read-deny → Unverifiable), not a crash.
+func TestAuditInventorySortedDiffRefetchError(t *testing.T) {
+	led := newFakeLedger()
+	storeOnTarget(t, led, "aa", "bb")
+	sink := &flakyManifestSink{stubSink: stubSink{name: "t"}, first: []byte(`{"externalID":"bb"}` + "\n" + `{"externalID":"aa"}` + "\n"), err: errors.New("connection refused")}
+	rep := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
+	if v := rep.Targets[0]; v.Status != StatusUnverifiable {
+		t.Fatalf("a failed fallback re-fetch must be Unverifiable, got %+v", v)
+	}
+}
+
+// TestAuditInventorySortedDiffTooLarge (re-review C3): a non-ascending manifest too LARGE to buffer
+// order-independently (over maxSortedManifestIDs) must be Unverifiable — the fallback refuses to
+// buffer rather than risk an OOM.
+func TestAuditInventorySortedDiffTooLarge(t *testing.T) {
+	old := maxSortedManifestIDs
+	maxSortedManifestIDs = 2
+	defer func() { maxSortedManifestIDs = old }()
+	led := newFakeLedger()
+	storeOnTarget(t, led, "aa", "bb", "cc") // all in the ledger → extra=0 when the non-ascending fires
+	body := []byte(`{"externalID":"cc"}` + "\n" + `{"externalID":"bb"}` + "\n" + `{"externalID":"aa"}` + "\n")
+	sink := manifestSink{stubSink: stubSink{name: "t"}, manifest: body}
+	rep := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
+	if v := rep.Targets[0]; v.Status != StatusUnverifiable {
+		t.Fatalf("a non-ascending manifest over the sorted-diff bound must be Unverifiable, got %+v", v)
 	}
 }
 
@@ -242,11 +295,25 @@ func TestManifestIteratorClassifiesReadErrors(t *testing.T) {
 		t.Fatalf("an over-long line must be corrupt (ErrTooLong): %v", err)
 	}
 
-	// non-ascending order → corrupt (surfaced on the second pull).
+	// non-ascending order → errNonAscendingManifest (NOT corrupt — the fallback signal), surfaced on
+	// the second pull.
 	it2 := manifestIterator(io.MultiReader(bytes.NewReader(line("bb")), bytes.NewReader(line("aa"))))
 	_, _, _ = it2() // consume "bb"
-	if _, _, err := it2(); !errors.Is(err, errCorruptManifest) {
-		t.Fatalf("a non-ascending key must be corrupt: %v", err)
+	if _, _, err := it2(); !errors.Is(err, errNonAscendingManifest) || errors.Is(err, errCorruptManifest) {
+		t.Fatalf("a non-ascending key must signal errNonAscendingManifest (not corrupt): %v", err)
+	}
+}
+
+// TestManifestScannerNonStrict: the non-strict scanner (the order-independent fallback collector)
+// yields non-ascending ids WITHOUT erroring — it does NOT enforce monotonicity (the caller sorts).
+func TestManifestScannerNonStrict(t *testing.T) {
+	line := func(id string) []byte { return []byte(`{"externalID":"` + id + `"}` + "\n") }
+	itNS := manifestScanner(io.MultiReader(bytes.NewReader(line("bb")), bytes.NewReader(line("aa"))), false)
+	if id, ok, err := itNS(); !ok || err != nil || id != "bb" {
+		t.Fatalf("non-strict scan first: id=%q ok=%v err=%v", id, ok, err)
+	}
+	if id, ok, err := itNS(); !ok || err != nil || id != "aa" {
+		t.Fatalf("non-strict scan must yield a non-ascending id without error: id=%q ok=%v err=%v", id, ok, err)
 	}
 }
 
@@ -259,6 +326,20 @@ type ioErrManifestSink struct {
 
 func (s ioErrManifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(io.MultiReader(bytes.NewReader(s.prefix), errReader{s.err})), nil
+}
+
+// TestAuditInventoryPartialDriftPreserved (re-review C2): a definitive orphan (extra>0) observed
+// BEFORE a transient mid-stream read fault must be reported as Drift, NOT discarded and relabeled
+// Unverifiable — mirrors the immutability 404-drift preservation. (An empty ledger makes the
+// manifest's first id an orphan.)
+func TestAuditInventoryPartialDriftPreserved(t *testing.T) {
+	led := newFakeLedger()
+	orphan := hashOf("orphan")
+	sink := ioErrManifestSink{stubSink: stubSink{name: "t"}, prefix: []byte(`{"externalID":"` + orphan + `"}` + "\n"), err: errors.New("connection reset by peer")}
+	rep := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
+	if v := rep.Targets[0]; v.Status != StatusDrift || v.Extra != 1 {
+		t.Fatalf("an orphan seen before a transient read fault must be Drift extra=1 (not discarded), got %+v", v)
+	}
 }
 
 // TestAuditInventoryTransientReadIsUnverifiable: a mid-stream transient read reset is Unverifiable
@@ -340,13 +421,13 @@ type panicManifestSink struct{ stubSink }
 
 func (panicManifestSink) LatestManifest(context.Context) (io.ReadCloser, error) { panic("driver boom") }
 
-// TestAuditInventoryRecoversManifestPanic: a panic in LatestManifest is CONTAINED (via
-// abandonableFetch's recover) — the sweep doesn't crash. A non-worm target whose manifest couldn't be
-// read (here because it panicked) is Unverifiable and FAILS the audit.
-func TestAuditInventoryRecoversManifestPanic(t *testing.T) {
+// TestAuditInventoryManifestPanicIsFault (re-review B3): a panic in LatestManifest is CONTAINED (via
+// abandonableFetch's recover) — the sweep doesn't crash — and routed to Fault (a driver panic is a
+// code bug, never benign), so it FAILS the audit even on a worm target.
+func TestAuditInventoryManifestPanicIsFault(t *testing.T) {
 	rep := AuditInventory(context.Background(), newFakeLedger(), []Target{{Sink: panicManifestSink{stubSink: stubSink{name: "boom"}}}})
-	if v := rep.Targets[0]; v.Status != StatusUnverifiable || !v.Failed() {
-		t.Fatalf("a panicked non-worm manifest read must be Unverifiable + failing, got %+v", v)
+	if v := rep.Targets[0]; v.Status != StatusFault || !v.Failed() {
+		t.Fatalf("a panicked manifest read must be a failing Fault (fail-loud on a code bug), got %+v", v)
 	}
 }
 
@@ -365,18 +446,28 @@ func TestAuditInventorySkipsBlankAndEmptyLines(t *testing.T) {
 }
 
 // blockingReader blocks in Read IGNORING ctx (a wedged mount / black-holing S3 body), so the
-// stallReader's per-read bound is the only thing that can stop it.
-type blockingReader struct{ release chan struct{} }
+// stallReader's per-read bound is the only thing that can stop it. Its Close records that it was
+// closed (so a test can prove the abandon path — not a concurrent deferred Close — owns closing it).
+type blockingReader struct {
+	release chan struct{}
+	closed  chan struct{}
+}
 
 func (b blockingReader) Read([]byte) (int, error) { <-b.release; return 0, io.EOF }
+func (b blockingReader) Close() error {
+	if b.closed != nil {
+		close(b.closed)
+	}
+	return nil
+}
 
 // TestStallReaderBoundsWedgedRead: a mid-stream read that stalls IGNORING ctx must be abandoned at
-// the stallReader's per-read deadline (so a wedged manifest body can't hang the inventory diff), and
-// an already-cancelled ctx short-circuits before even starting a read.
+// the stallReader's per-read deadline (so a wedged manifest body can't hang the inventory diff), the
+// abandon path must OWN closing rc (only AFTER the wedged read finishes — never concurrently), and an
+// already-cancelled ctx short-circuits before even starting a read.
 func TestStallReaderBoundsWedgedRead(t *testing.T) {
-	br := blockingReader{release: make(chan struct{})}
-	t.Cleanup(func() { close(br.release) })
-	sr := &stallReader{ctx: context.Background(), r: br, timeout: 50 * time.Millisecond}
+	br := blockingReader{release: make(chan struct{}), closed: make(chan struct{})}
+	sr := &stallReader{ctx: context.Background(), rc: br, timeout: 50 * time.Millisecond}
 	done := make(chan error, 1)
 	go func() { _, err := sr.Read(make([]byte, 16)); done <- err }()
 	select {
@@ -387,10 +478,26 @@ func TestStallReaderBoundsWedgedRead(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("stallReader HUNG on a wedged reader — per-read bound not enforced")
 	}
+	// Close() must be a no-op while the read is still wedged (the abandon path owns the close);
+	// rc is closed only after the read goroutine finishes.
+	if err := sr.Close(); err != nil {
+		t.Fatalf("Close after abandon must be a no-op, got %v", err)
+	}
+	select {
+	case <-br.closed:
+		t.Fatal("rc was closed while the wedged read was still in flight (fd race)")
+	default:
+	}
+	close(br.release) // let the wedged read finish; the abandon path then closes rc
+	select {
+	case <-br.closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the abandon path did not close rc after the wedged read finished (fd leak)")
+	}
 
 	cctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := (&stallReader{ctx: cctx, r: br, timeout: time.Minute}).Read(make([]byte, 16)); !errors.Is(err, context.Canceled) {
+	if _, err := (&stallReader{ctx: cctx, rc: blockingReader{release: make(chan struct{})}, timeout: time.Minute}).Read(make([]byte, 16)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("an already-cancelled ctx must short-circuit the read, got %v", err)
 	}
 }

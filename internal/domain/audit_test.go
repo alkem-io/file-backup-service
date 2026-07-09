@@ -151,6 +151,7 @@ func TestAuditSampleNoBoundaryDoubleCount(t *testing.T) {
 // a drift/corrupt/fault must render LOUD (uppercase) so an operator scanning output sees it.
 func TestVerdictStatusString(t *testing.T) {
 	for status, want := range map[VerdictStatus]string{
+		StatusUnknown:      "UNKNOWN",
 		StatusVerified:     "verified",
 		StatusDrift:        "DRIFT",
 		StatusNoData:       "no-data",

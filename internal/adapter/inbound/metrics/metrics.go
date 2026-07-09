@@ -245,9 +245,11 @@ func readPriorLastSuccess(path string) float64 {
 		return 0
 	}
 	defer func() { _ = f.Close() }()
-	// NewTextParser (not a zero-value TextParser): a zero-value parser has an UnsetValidation name
-	// scheme, whose IsValidMetricName PANICS in prometheus/common v0.66.1 — which would crash any
-	// failing drill run that reads a prior textfile. Use the library's default name-validation scheme.
+	// NewTextParser (NOT a zero-value TextParser): a zero-value parser has an UnsetValidation name
+	// scheme whose IsValidMetricName PANICS — verified STILL required as of prometheus/common v0.69.0
+	// (the current release; UnsetValidation.IsValidMetricName panics there too), so this is not a stale
+	// pin but the library's required API. Passing an explicit scheme is the intended usage; UTF8 is the
+	// library's current default for names.
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	mfs, err := parser.TextToMetricFamilies(f)
 	if err != nil {

@@ -20,6 +20,16 @@ func (s *immSink) CheckImmutability(context.Context) (bool, bool, error) {
 	return s.lock, s.versioning, s.err
 }
 
+// noAuditCredSink is a WORM s3-like target WITHOUT an audit/read credential (ImmutabilityReadable() ==
+// false — the standard immutable prod config, a PutObject-only worker credential). Its drift-check is
+// N/A → NoData (silent), so it never false-passes AND never false-alerts.
+type noAuditCredSink struct{ stubSink }
+
+func (noAuditCredSink) CheckImmutability(context.Context) (bool, bool, error) {
+	return false, false, errors.New("AccessDenied")
+}
+func (noAuditCredSink) ImmutabilityReadable() bool { return false }
+
 func wormTarget(sink Sink) Target { return Target{Sink: sink, Worm: true} }
 
 func TestCheckImmutabilitySkipsNonWorm(t *testing.T) {
@@ -75,6 +85,16 @@ func TestCheckImmutabilityNoCapabilityIsNoData(t *testing.T) {
 	}
 }
 
+// TestCheckImmutabilityNoAuditCredIsNoData (re-review B1): a WORM s3 target WITHOUT a read/audit
+// credential (ImmutabilityReadable()==false) is NoData — the drift-check is N/A, so it never
+// false-passes and never false-alerts. CheckImmutability is NOT called on it (the gate short-circuits).
+func TestCheckImmutabilityNoAuditCredIsNoData(t *testing.T) {
+	rep := CheckImmutability(context.Background(), []Target{wormTarget(noAuditCredSink{stubSink{name: "offsite"}})})
+	if v := rep.Targets[0]; v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("a WORM target with no audit credential must be NoData (silent, N/A): %+v", v)
+	}
+}
+
 // fakeImmGauge records the three gauge calls so the sampler's derive-from-Status policy is testable
 // without a live registry.
 type fakeImmGauge struct {
@@ -103,87 +123,55 @@ func TestImmutabilitySamplerPolicy(t *testing.T) {
 	s := NewImmutabilitySampler([]Target{
 		wormTarget(&immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true}),
 		wormTarget(&immSink{stubSink: stubSink{name: "drift"}, lock: false, versioning: true}),
-		wormTarget(&immSink{stubSink: stubSink{name: "denied"}, err: errors.New("AccessDenied")}), // Unverifiable
-		wormTarget(stubSink{name: "nocap"}),                                                       // NoData
-		{Sink: &immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}},         // not Worm
+		wormTarget(&immSink{stubSink: stubSink{name: "readfail"}, err: errors.New("timeout")}), // READABLE (has audit cred), read failed → Unverifiable → alert
+		wormTarget(noAuditCredSink{stubSink{name: "offsite"}}),                                 // NO audit cred → NoData → silent
+		wormTarget(stubSink{name: "nocap"}),                                                    // non-s3 → NoData → silent
+		{Sink: &immSink{stubSink: stubSink{name: "plain"}, lock: true, versioning: true}},      // not Worm
 	}, g)
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("Sample: %v", err)
 	}
-	if v, ok := g.set["ok"]; !ok || !v {
-		t.Fatalf("verified must set gauge true, got %v/%v", v, ok)
-	}
-	if g.unverif["ok"] {
-		t.Fatal("a verified target must clear its unverifiable signal")
+	if v, ok := g.set["ok"]; !ok || !v || g.unverif["ok"] {
+		t.Fatalf("verified must set gauge true + clear the unverifiable signal, got set=%v/%v unverif=%v", v, ok, g.unverif["ok"])
 	}
 	if v, ok := g.set["drift"]; !ok || v {
 		t.Fatalf("drift must set gauge false, got %v/%v", v, ok)
 	}
-	// denied = Unverifiable, never verified this pass (a by-design write-only WORM): DROP the _ok
-	// series (no stale-green) but stay SILENT — do NOT raise the distinct signal (its 403 is expected;
-	// paging on the standard immutable prod config would be a continuous false alarm).
-	if _, ok := g.set["denied"]; ok {
-		t.Fatal("an unverifiable target must NOT keep an _ok series")
+	// readfail = a READ-CAPABLE target (has an audit cred) whose read failed → DROP the _ok series AND
+	// raise the distinct signal (a genuinely unexpected fault worth alerting).
+	if _, ok := g.set["readfail"]; ok {
+		t.Fatal("a readable target that failed its read must NOT keep an _ok series")
 	}
-	if !g.cleared["denied"] {
-		t.Fatal("an unverifiable target must CLEAR its _ok series (no stale-green)")
+	if !g.cleared["readfail"] || !g.unverif["readfail"] {
+		t.Fatalf("a readable target that failed its read must clear _ok AND raise the unverifiable signal, cleared=%v unverif=%v", g.cleared["readfail"], g.unverif["readfail"])
 	}
-	if g.unverif["denied"] {
-		t.Fatal("a by-design (never-verified) unverifiable WORM target must NOT raise the unverifiable signal")
+	// offsite = NO audit credential (by-design write-only) → NoData: drop _ok, stay SILENT.
+	if !g.cleared["offsite"] || g.unverif["offsite"] {
+		t.Fatalf("a no-audit-cred WORM target must clear _ok but stay silent, cleared=%v unverif=%v", g.cleared["offsite"], g.unverif["offsite"])
 	}
-	// nocap = structural NoData: drop the _ok series but do NOT alert (it can never carry a signal).
-	if !g.cleared["nocap"] {
-		t.Fatal("a structural-NoData target must clear its _ok series")
-	}
-	if g.unverif["nocap"] {
-		t.Fatal("a structural-NoData target must NOT raise the unverifiable signal (it's expected)")
+	// nocap = non-s3 NoData: drop _ok, no alert.
+	if !g.cleared["nocap"] || g.unverif["nocap"] {
+		t.Fatalf("a non-s3 NoData target must clear _ok but stay silent, cleared=%v unverif=%v", g.cleared["nocap"], g.unverif["nocap"])
 	}
 	if _, ok := g.set["plain"]; ok {
 		t.Fatal("a non-Worm target must not be sampled")
 	}
 }
 
-// TestImmutabilitySamplerAlertsOnLostReadAccess (Pillar 1): a target that was verifiable-green then
-// turns unverifiable (an UNEXPECTED loss of read access — e.g. a credential rotated to write-only)
-// must NOT stay frozen stale-green — the _ok series is DROPPED and, BECAUSE it was readable before,
-// the distinct unverifiable signal IS raised, so a later real drift can't be masked.
-func TestImmutabilitySamplerAlertsOnLostReadAccess(t *testing.T) {
-	g := newFakeImmGauge()
-	sink := &immSink{stubSink: stubSink{name: "flip"}, lock: true, versioning: true}
-	s := NewImmutabilitySampler([]Target{wormTarget(sink)}, g)
-	if err := s.Sample(context.Background()); err != nil {
-		t.Fatalf("pass 1: %v", err)
-	}
-	if v, present := g.set["flip"]; !present || !v {
-		t.Fatalf("pass 1 must set the series green, got %v/%v", v, present)
-	}
-	sink.err = errors.New("timeout") // pass 2: the formerly-readable target now can't be read
-	if err := s.Sample(context.Background()); err != nil {
-		t.Fatalf("pass 2: %v", err)
-	}
-	if !g.cleared["flip"] {
-		t.Fatal("a now-unverifiable pass must DROP the formerly-green series (no stale-green)")
-	}
-	if !g.unverif["flip"] {
-		t.Fatal("a target that LOST its read access must raise the distinct unverifiable signal (not go silent)")
-	}
-}
-
-// TestImmutabilitySamplerByDesignWormStaysSilent (re-review item 2): a WORM target that is
-// unverifiable FROM THE START (a PutObject-only worker credential — the standard immutable prod
-// config) is NEVER readable, so its 403 is EXPECTED: across passes the sampler clears any _ok series
-// but must NEVER raise the unverifiable signal — paging continuously on a healthy, correctly-immutable
-// target would be a false alarm. Its immutability is covered by object-lock + audit + never_verified.
+// TestImmutabilitySamplerByDesignWormStaysSilent (re-review item 2): a WORM target with NO audit
+// credential (the standard immutable prod config — a PutObject-only worker credential) is N/A →
+// NoData: across passes the sampler must never keep an _ok series NOR raise the unverifiable signal.
+// Paging continuously on a healthy, correctly-immutable target would be a false alarm; its
+// immutability is asserted by object-lock + the audit (with a read cred) + never_verified.
 func TestImmutabilitySamplerByDesignWormStaysSilent(t *testing.T) {
 	g := newFakeImmGauge()
-	sink := &immSink{stubSink: stubSink{name: "offsite"}, err: errors.New("AccessDenied")} // 403 from inception
-	s := NewImmutabilitySampler([]Target{wormTarget(sink)}, g)
+	s := NewImmutabilitySampler([]Target{wormTarget(noAuditCredSink{stubSink{name: "offsite"}})}, g)
 	for pass := 1; pass <= 2; pass++ {
 		if err := s.Sample(context.Background()); err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
 		if _, ok := g.set["offsite"]; ok {
-			t.Fatalf("pass %d: a never-readable WORM target must have no _ok series", pass)
+			t.Fatalf("pass %d: a no-audit-cred WORM target must have no _ok series", pass)
 		}
 		if g.unverif["offsite"] {
 			t.Fatalf("pass %d: a by-design write-only WORM target must NOT raise the unverifiable signal (false alarm)", pass)

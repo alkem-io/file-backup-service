@@ -51,14 +51,25 @@ func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir str
 	perObjectTimeout = NormalizePerObjectTimeout(perObjectTimeout)
 	out := DrillOutcome{Target: targetName}
 	var mu sync.Mutex
+	dispatched := 0 // objects actually handed to a worker (single-threaded enumeration, read after drain)
 	err := runBoundedPaced(ctx, 1, 0,
-		func(yield func(string) error) error { return streamSampledStored(ctx, led, targetName, sample, yield) },
+		func(yield func(string) error) error {
+			return streamSampledStored(ctx, led, targetName, sample, func(h string) error {
+				if yerr := yield(h); yerr != nil {
+					return yerr
+				}
+				dispatched++
+				return nil
+			})
+		},
 		func(h string) { drillOne(ctx, src, h, scratchDir, perObjectTimeout, &out, &mu) })
-	// A cancellation that landed DURING a work goroutine (after enumeration already dispatched the
-	// last object) leaves runBoundedPaced's return nil — but the drill was still INTERRUPTED and
-	// proved less than it sampled. Surface ctx.Err() so an aborted integrity check can't read green
-	// (unlike restore-all, an interrupted drill must exit nonzero — the drilled object went uncounted).
-	if err == nil {
+	// "Interrupted" is a TRUNCATED sweep, derived from progress — NOT from ctx.Err() sampled after
+	// completion: either an enumeration error (a mid-sweep cancel, already in err), OR a dispatched
+	// object that went uncounted because its work goroutine was cancelled after enumeration finished
+	// (out.Checked() < dispatched). A SIGTERM that lands AFTER every sampled object already passed
+	// leaves dispatched == Checked, so the completed pass's success is NOT discarded (the old
+	// `if err==nil { err=ctx.Err() }` wrongly paged a false stale-drill on a post-completion SIGTERM).
+	if err == nil && out.Checked() < dispatched {
 		err = ctx.Err()
 	}
 	return out, err
@@ -73,6 +84,7 @@ func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir str
 // the pre-existing-file read). A cancellation aborting this object in flight (parent ctx cancelled —
 // a SIGTERM) is NOT counted: the sweep surfaces it as its returned error, not a failed object.
 func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectTimeout time.Duration, out *DrillOutcome, mu *sync.Mutex) {
+	defer recoverFailed(mu, &out.Failed) // symmetry with restoreAllOne: a stray panic is one Failed, not a crash
 	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
 	defer cancel()
 	err := RestoreObject(octx, src, hash, scratchDir)

@@ -78,6 +78,7 @@ func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePer
 // wrap. It tallies checked/missing/errored probes and classifies the result into a verdict.
 func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int, startAfter string) TargetVerdict {
 	var checked, missing, errored int
+	var panicErr error
 	name := t.Sink.Name()
 	err := keysetSample(ctx, samplePerTarget, startAfter,
 		func(after string, limit int) ([]string, error) {
@@ -101,6 +102,9 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 				switch {
 				case e.err != nil:
 					errored++
+					if errors.Is(e.err, ErrProbePanic) { // a driver panic is a code bug, not a benign read error
+						panicErr = e.err
+					}
 				case !e.present:
 					missing++
 				}
@@ -109,6 +113,9 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 		})
 	if err != nil {
 		return classifyAuditErr(ctx, name, err)
+	}
+	if panicErr != nil { // a recovered probe panic → Fault (fail-loud), not swallowed to Unverifiable
+		return TargetVerdict{Status: StatusFault, Checked: checked, Err: fmt.Errorf("audit probe %s: %w", name, panicErr), Detail: "probe panicked"}
 	}
 	detail := fmt.Sprintf("checked=%d missing=%d errors=%d", checked, missing, errored)
 	switch {
@@ -127,7 +134,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 func classifyAuditErr(parentCtx context.Context, name string, err error) TargetVerdict {
 	switch {
 	case cancelledInFlight(parentCtx, err):
-		return TargetVerdict{Status: StatusNoData, Detail: fmt.Sprintf("aborted by shutdown: %v", err)}
+		return shutdownVerdict(err)
 	case errors.Is(err, errLedgerRead):
 		return TargetVerdict{Status: StatusFault, Err: fmt.Errorf("audit target %s: %w", name, err), Detail: "ledger read error"}
 	default:
