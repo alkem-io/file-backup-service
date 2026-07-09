@@ -98,15 +98,31 @@ The **symmetric** backup destination list: every object goes to **every** target
 and an object is "done" only when all targets have it. There is no
 primary/required/optional.
 
+**The list can be defined entirely from env — no config file required.** Set
+**`FBS_TARGETS`** to a comma-separated list of target names; each name becomes a
+target whose fields are then supplied by `FBS_TARGET_<NAME>_<FIELD>` (below,
+including `TYPE` and `PATH`). When `FBS_TARGETS` is set it is **authoritative**: a
+name that also appears in the YAML keeps that entry as a base (env overlays it),
+any other name is created fresh, and YAML targets not listed are dropped. Without
+`FBS_TARGETS`, the YAML `targets:` list stands (and env still overlays fields).
+
 Per-target secrets and any field can be injected with
 `FBS_TARGET_<NAME>_<FIELD>`, where **`<NAME>`** is the target's `name` **upcased
 with every non-alphanumeric replaced by `_`** (e.g. `offsite-eu` → `OFFSITE_EU`,
 so `FBS_TARGET_OFFSITE_EU_ACCESSKEY`). Two names that collapse to the same token
 are rejected at startup.
 
+```bash
+# fully env-defined, single local filesystem target (no config file):
+FBS_TARGETS=local
+FBS_TARGET_LOCAL_TYPE=filesystem
+FBS_TARGET_LOCAL_PATH=/storage
+```
+
 | YAML key | Env override | Applies to | Description |
 |---|---|---|---|
-| `name` | — | all | Unique target name (≤ 64 chars — the ledger column width). |
+| (list) | `FBS_TARGETS` | all | Comma-separated target names — defines the list from env when set. |
+| `name` | (from `FBS_TARGETS`) | all | Unique target name (≤ 64 chars — the ledger column width). |
 | `type` | `FBS_TARGET_<N>_TYPE` | all | `s3` or `filesystem`. |
 | `compression` | `FBS_TARGET_<N>_COMPRESSION` | all | `""`/`none` or `zstd` (per-target). |
 | `worm` | `FBS_TARGET_<N>_WORM` | all | `true` for a write-once, read-denying (PutObject-only) target; audit expects its `Exists` to deny and won't alert. |
