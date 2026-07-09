@@ -146,7 +146,7 @@ func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
 	if err := s.confirmRoot(); err != nil {
 		return nil, err
 	}
-	name, err := fsutil.SelectLatestManifest(s.readManifestPointer, s.listManifestNames)
+	name, err := fsutil.SelectLatestManifest(s.readManifestPointer, s.listManifestNamesAfter)
 	if err != nil {
 		return nil, err
 	}
@@ -193,23 +193,27 @@ func (s *Sink) readManifestPointer() (string, bool) {
 	return name, name != ""
 }
 
-// listManifestNames returns every non-dir entry's base name under _manifest/ (unfiltered —
-// SelectLatestManifest applies the timestamped-manifest rule). A missing manifest dir (the root is
-// present — confirmRoot passed — but nothing has been written yet) is not an error: it yields no
-// names, which SelectLatestManifest turns into "" → the caller's benign os.ErrNotExist / NoData.
-func (s *Sink) listManifestNames() ([]string, error) {
+// listManifestNamesAfter returns every non-dir base name under _manifest/ STRICTLY AFTER `after` (so
+// SelectLatestManifest can bound its stale-pointer check to newer manifests; `after==""` = all). A
+// missing manifest dir is not necessarily benign: the ROOT could have vanished between confirmRoot and
+// this ReadDir (a TOCTOU on a detached mount), so an ENOENT re-checks the root — a gone root → an
+// ERROR (Unverifiable), a present root with no manifest dir yet → benign NoData (no names).
+func (s *Sink) listManifestNamesAfter(after string) ([]string, error) {
 	dir := s.osPath(fsutil.ManifestDir())
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			if rerr := s.confirmRoot(); rerr != nil {
+				return nil, rerr // the root vanished after confirmRoot (TOCTOU) → not benign
+			}
+			return nil, nil // present root, no manifest dir yet → benign NoData
 		}
 		return nil, fmt.Errorf("read manifest dir %s: %w", dir, err)
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
+		if base := e.Name(); !e.IsDir() && base > after {
+			names = append(names, base)
 		}
 	}
 	return names, nil

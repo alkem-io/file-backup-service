@@ -15,7 +15,7 @@ import (
 // /{bucket}/ is a BucketExists. It always 404s the object (so Exists takes the confirm-bucket
 // branch) and returns bucketStatus for the bucket HEAD, counting how many bucket checks ran.
 type s3Stub struct {
-	bucketStatus int          // 200 = bucket present, 404 = gone
+	bucketStatus atomic.Int32 // 200 = bucket present, 404 = gone (atomic so a test can flip it mid-sweep)
 	bucketChecks atomic.Int32 // how many BucketExists HEADs arrived
 }
 
@@ -26,7 +26,7 @@ func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodHead && bucketLevel:
 		s.bucketChecks.Add(1)
-		w.WriteHeader(s.bucketStatus)
+		w.WriteHeader(int(s.bucketStatus.Load()))
 	case r.Method == http.MethodHead: // StatObject → object always absent (404)
 		w.WriteHeader(http.StatusNotFound)
 	default:
@@ -36,7 +36,8 @@ func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func newStubSink(t *testing.T, bucketStatus int) (*Sink, *s3Stub) {
 	t.Helper()
-	stub := &s3Stub{bucketStatus: bucketStatus}
+	stub := &s3Stub{}
+	stub.bucketStatus.Store(int32(bucketStatus)) //nolint:gosec // test constant status codes
 	srv := httptest.NewServer(stub)
 	t.Cleanup(srv.Close)
 	sink, err := New(Config{
@@ -68,21 +69,34 @@ func TestExistsGoneBucketIsError(t *testing.T) {
 	}
 }
 
-// TestExistsPresentBucketAbsentObject: a 404 with the bucket PRESENT is a genuinely absent
-// object → (false, nil), and the bucket check is CACHED (one BucketExists per sink, not one
-// per probe) across repeated Exists calls. (R6-1)
-func TestExistsPresentBucketAbsentObject(t *testing.T) {
+// TestExistsPresentBucketNotCached (re-review C5): a 404 with the bucket PRESENT is a genuinely
+// absent object → (false, nil); the PRESENT verdict is NOT cached — it is re-checked on each
+// absent-object probe so a bucket that vanishes MID-SWEEP is caught (later 404s → error, not false
+// silent-loss), matching the filesystem sink's per-call confirmRoot. (Only the terminal GONE verdict
+// is cached — see TestExistsGoneBucketCached.)
+func TestExistsPresentBucketNotCached(t *testing.T) {
 	sink, stub := newStubSink(t, http.StatusOK) // bucket present
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		present, err := sink.Exists(context.Background(), strings.Repeat("a", 64))
-		if err != nil {
-			t.Fatalf("probe %d: bucket present + object absent must be (false, nil), got err %v", i, err)
-		}
-		if present {
-			t.Fatalf("probe %d: object must be reported absent", i)
+		if err != nil || present {
+			t.Fatalf("probe %d: bucket present + object absent must be (false, nil), got present=%v err=%v", i, present, err)
 		}
 	}
-	if n := stub.bucketChecks.Load(); n != 1 {
-		t.Fatalf("BucketExists ran %d times, want exactly 1 (the verdict must be cached)", n)
+	if n := stub.bucketChecks.Load(); n != 3 {
+		t.Fatalf("BucketExists ran %d times, want 3 (a PRESENT bucket must NOT be cached, so a mid-sweep vanish is caught)", n)
+	}
+}
+
+// TestExistsMidSweepBucketVanishCaught (re-review C5): a bucket present on the first probe but GONE on
+// the next must surface the vanish as an ERROR (Unverifiable), not a cached "present" that reads the
+// missing object as false silent-loss.
+func TestExistsMidSweepBucketVanishCaught(t *testing.T) {
+	sink, stub := newStubSink(t, http.StatusOK)
+	if _, err := sink.Exists(context.Background(), strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("first probe (bucket present) must be clean, got %v", err)
+	}
+	stub.bucketStatus.Store(http.StatusNotFound) // the bucket vanishes mid-sweep
+	if _, err := sink.Exists(context.Background(), strings.Repeat("a", 64)); err == nil {
+		t.Fatal("a bucket that vanishes mid-sweep must surface as an error, not a cached present")
 	}
 }

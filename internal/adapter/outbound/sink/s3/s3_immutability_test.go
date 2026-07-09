@@ -29,6 +29,24 @@ type wormStub struct {
 	getFail          bool   // fail the object GET (the manifest fetch)
 }
 
+// serveList renders the list-objects XML, honoring the bounded StartAfter (exclusive) query param.
+func (s *wormStub) serveList(w http.ResponseWriter, after string) {
+	if s.listErr != 0 {
+		w.WriteHeader(s.listErr)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<ListBucketResult><Name>bkt</Name><IsTruncated>false</IsTruncated>`)
+	for _, k := range s.listKeys {
+		if after != "" && k <= after {
+			continue
+		}
+		fmt.Fprintf(&b, `<Contents><Key>%s</Key><Size>%d</Size></Contents>`, k, len(s.manifest))
+	}
+	b.WriteString(`</ListBucketResult>`)
+	_, _ = io.WriteString(w, b.String())
+}
+
 func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
 	switch s.lockStatus {
 	case http.StatusOK:
@@ -59,17 +77,7 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = fmt.Fprintf(w, `<VersioningConfiguration><Status>%s</Status></VersioningConfiguration>`, s.versioningStatus)
 	case r.Method == http.MethodGet && q.Has("list-type"):
-		if s.listErr != 0 {
-			w.WriteHeader(s.listErr)
-			return
-		}
-		var b strings.Builder
-		b.WriteString(`<ListBucketResult><Name>bkt</Name><IsTruncated>false</IsTruncated>`)
-		for _, k := range s.listKeys {
-			fmt.Fprintf(&b, `<Contents><Key>%s</Key><Size>%d</Size></Contents>`, k, len(s.manifest))
-		}
-		b.WriteString(`</ListBucketResult>`)
-		_, _ = io.WriteString(w, b.String())
+		s.serveList(w, q.Get("start-after"))
 	case r.Method == http.MethodHead: // object HEAD = StatObject — LatestManifest's EAGER obj.Stat()
 		if s.getFail {
 			w.WriteHeader(http.StatusForbidden) // a read-deny surfaces at the eager stat → unverifiable
@@ -111,6 +119,34 @@ func newWormSink(t *testing.T, stub *wormStub) *Sink {
 		t.Fatalf("new sink: %v", err)
 	}
 	return sink
+}
+
+// TestImmutabilityReadableAuditCredential (re-review B1): a sink WITHOUT an audit/read credential is
+// NOT ImmutabilityReadable (the drift-check is N/A → the domain reports NoData, silent); a sink WITH
+// one IS readable and runs CheckImmutability via the audit client.
+func TestImmutabilityReadableAuditCredential(t *testing.T) {
+	stub := &wormStub{lockStatus: http.StatusOK, lockEnabled: true, versioningStatus: "Enabled"}
+	// No audit credential → not readable.
+	if noCred := newWormSink(t, stub); noCred.ImmutabilityReadable() {
+		t.Fatal("a sink without an audit credential must NOT be ImmutabilityReadable")
+	}
+	// With an audit credential → readable, and the drift-check actually runs (via the audit client).
+	srv := httptest.NewServer(stub)
+	t.Cleanup(srv.Close)
+	sink, err := New(Config{
+		Name: "worm", Endpoint: strings.TrimPrefix(srv.URL, "http://"), Region: "us-east-1", Bucket: "bkt",
+		AccessKey: "AK", SecretKey: "SK", AuditAccessKey: "AAK", AuditSecretKey: "ASK",
+	})
+	if err != nil {
+		t.Fatalf("new sink with audit cred: %v", err)
+	}
+	if !sink.ImmutabilityReadable() {
+		t.Fatal("a sink WITH an audit credential must be ImmutabilityReadable")
+	}
+	lock, ver, cerr := sink.CheckImmutability(context.Background())
+	if cerr != nil || !lock || !ver {
+		t.Fatalf("CheckImmutability via the audit client must run: lock=%v ver=%v err=%v", lock, ver, cerr)
+	}
 }
 
 func TestCheckImmutabilityEnabled(t *testing.T) {
@@ -237,15 +273,20 @@ func TestLatestManifestNoneIsNotExist(t *testing.T) {
 	}
 }
 
-// TestLatestManifestUsesPointer: the fast path reads _manifest/LATEST for the newest name and GETs
-// that manifest — NO list-objects scan needed.
-func TestLatestManifestUsesPointer(t *testing.T) {
+// TestLatestManifestPointerCurrentUsed: the pointer fast-path reads _manifest/LATEST, then a BOUNDED
+// StartAfter=<pointer> list confirms NOTHING newer exists (C1 staleness check), so the pointer's
+// manifest is used (no full scan of the whole prefix).
+func TestLatestManifestPointerCurrentUsed(t *testing.T) {
 	body := []byte(`{"externalID":"abc"}` + "\n")
-	stub := &wormStub{pointerName: "2026-06-01T000000.000000000Z.jsonl", manifest: body, listErr: http.StatusInternalServerError}
+	stub := &wormStub{
+		pointerName: "2026-06-01T000000.000000000Z.jsonl",
+		manifest:    body,
+		listKeys:    []string{"_manifest/2026-06-01T000000.000000000Z.jsonl"}, // only the pointer's own key → nothing newer
+	}
 	sink := newWormSink(t, stub)
 	rc, err := sink.LatestManifest(context.Background())
-	if err != nil { // listErr=500 would surface only if it fell back to a scan — the pointer must avoid that
-		t.Fatalf("LatestManifest via pointer must not scan, got %v", err)
+	if err != nil {
+		t.Fatalf("LatestManifest via a current pointer must not error, got %v", err)
 	}
 	defer func() { _ = rc.Close() }()
 	got, err := io.ReadAll(rc)

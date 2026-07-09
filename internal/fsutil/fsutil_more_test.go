@@ -102,36 +102,60 @@ func TestIsTimestampedManifest(t *testing.T) {
 	}
 }
 
-// TestSelectLatestManifestPointerFastPath: a VALID timestamped pointer is returned directly and the
-// scan is short-circuited — proven by a listNames that errors if consulted (its error would surface).
-func TestSelectLatestManifestPointerFastPath(t *testing.T) {
+// TestSelectLatestManifestPointerUsedWhenCurrent: a VALID pointer with NOTHING newer (the bounded
+// listFrom(pointer) returns empty) is used directly — the fast path avoids a full scan.
+func TestSelectLatestManifestPointerUsedWhenCurrent(t *testing.T) {
 	const valid = "2026-06-01T000000.000000000Z.jsonl"
-	listCalled := false
+	var listedAfter string
 	got, err := SelectLatestManifest(
 		func() (string, bool) { return valid, true },
-		func() ([]string, error) {
-			listCalled = true
-			return nil, errors.New("listNames must not be consulted on a valid-pointer fast path")
-		},
+		func(after string) ([]string, error) { listedAfter = after; return nil, nil }, // nothing newer than the pointer
 	)
 	if err != nil {
-		t.Fatalf("valid pointer fast-path must not error: %v", err)
+		t.Fatalf("current pointer must not error: %v", err)
 	}
 	if got != valid {
-		t.Fatalf("fast-path returned %q, want the pointer name %q", got, valid)
+		t.Fatalf("a current pointer must be used, got %q want %q", got, valid)
 	}
-	if listCalled {
-		t.Fatal("a valid pointer must short-circuit the scan (listNames was consulted)")
+	if listedAfter != valid {
+		t.Fatalf("the staleness check must list AFTER the pointer (%q), listed after %q", valid, listedAfter)
 	}
 }
 
-// TestSelectLatestManifestScanIgnoresStrayAndPointer: an INVALID pointer forces the scan, which must
-// pick the highest VALID timestamped name while ignoring a stray `backup.jsonl` (sorts above every
-// real name) and the `LATEST` pointer object.
+// TestSelectLatestManifestStalePointerOverridden (re-review C1): the pointer write is best-effort, so
+// it can be STALE. If a NEWER timestamped manifest exists (the bounded listFrom returns it), the
+// newer one is used instead of the stale pointer — else the inventory diff would miss an orphan added
+// after the stale pointer (a false Verified).
+func TestSelectLatestManifestStalePointerOverridden(t *testing.T) {
+	const stale = "2026-03-01T000000.000000000Z.jsonl"
+	const newer = "2026-06-01T000000.000000000Z.jsonl"
+	got, err := SelectLatestManifest(
+		func() (string, bool) { return stale, true },
+		func(after string) ([]string, error) {
+			if after != stale {
+				t.Fatalf("must list after the stale pointer %q, got %q", stale, after)
+			}
+			return []string{newer, "backup.jsonl"}, nil // a newer valid manifest exists; ignore the stray
+		},
+	)
+	if err != nil {
+		t.Fatalf("stale-pointer override must not error: %v", err)
+	}
+	if got != newer {
+		t.Fatalf("a stale pointer must be overridden by the newer manifest, got %q want %q", got, newer)
+	}
+}
+
+// TestSelectLatestManifestScanIgnoresStrayAndPointer: an INVALID pointer forces a full scan (from ""),
+// which picks the highest VALID timestamped name while ignoring a stray `backup.jsonl` (sorts above
+// every real name) and the `LATEST` pointer object.
 func TestSelectLatestManifestScanIgnoresStrayAndPointer(t *testing.T) {
 	got, err := SelectLatestManifest(
-		func() (string, bool) { return "backup.jsonl", true }, // present but not timestamped → not a fast path
-		func() ([]string, error) {
+		func() (string, bool) { return "backup.jsonl", true }, // present but not timestamped → full scan
+		func(after string) ([]string, error) {
+			if after != "" {
+				t.Fatalf("an invalid pointer must trigger a full scan (after==\"\"), got %q", after)
+			}
 			return []string{
 				"2026-01-01T000000.000000000Z.jsonl",
 				"2026-06-01T000000.000000000Z.jsonl", // newest VALID
@@ -149,17 +173,16 @@ func TestSelectLatestManifestScanIgnoresStrayAndPointer(t *testing.T) {
 	}
 }
 
-// TestSelectLatestManifestListErrorPropagates: an absent pointer forces the scan, and a listNames
-// error (a read-deny / gone container) propagates unchanged — the caller reports Unverifiable, not
-// "no manifest".
+// TestSelectLatestManifestListErrorPropagates: a listFrom error (a read-deny / gone container)
+// propagates unchanged — the caller reports Unverifiable, not "no manifest".
 func TestSelectLatestManifestListErrorPropagates(t *testing.T) {
 	boom := errors.New("list read denied")
 	got, err := SelectLatestManifest(
-		func() (string, bool) { return "", false }, // absent pointer → must scan
-		func() ([]string, error) { return nil, boom },
+		func() (string, bool) { return "", false },
+		func(string) ([]string, error) { return nil, boom },
 	)
 	if !errors.Is(err, boom) {
-		t.Fatalf("listNames error must propagate, got %v", err)
+		t.Fatalf("listFrom error must propagate, got %v", err)
 	}
 	if got != "" {
 		t.Fatalf("on a list error the name must be \"\", got %q", got)
@@ -171,14 +194,14 @@ func TestSelectLatestManifestListErrorPropagates(t *testing.T) {
 func TestSelectLatestManifestEmptyOrAllInvalid(t *testing.T) {
 	got, err := SelectLatestManifest(
 		func() (string, bool) { return "", false },
-		func() ([]string, error) { return nil, nil },
+		func(string) ([]string, error) { return nil, nil },
 	)
 	if err != nil || got != "" {
 		t.Fatalf("an empty scan must yield (\"\", nil), got (%q, %v)", got, err)
 	}
 	got, err = SelectLatestManifest(
 		func() (string, bool) { return "", false },
-		func() ([]string, error) { return []string{"backup.jsonl", "LATEST", "notes.txt"}, nil },
+		func(string) ([]string, error) { return []string{"backup.jsonl", "LATEST", "notes.txt"}, nil },
 	)
 	if err != nil || got != "" {
 		t.Fatalf("only-invalid names must yield (\"\", nil), got (%q, %v)", got, err)

@@ -37,9 +37,11 @@ func TestSinkRejectsTraversalHash(t *testing.T) {
 }
 
 // TestLatestManifestPicksNewestViaPointer: PutManifest writes the _manifest/LATEST pointer, so
-// LatestManifest resolves the newest snapshot via the pointer (fast path) — even when an OLDER
-// manifest sorts higher by name, the pointer (not a name-sort) decides.
-func TestLatestManifestPicksNewestViaPointer(t *testing.T) {
+// TestLatestManifestStalePointerOverridden (re-review C1): the pointer write is best-effort, so it
+// can be STALE (name an OLDER manifest). LatestManifest must NOT trust a stale pointer — a bounded
+// list finds the newer manifest on disk and uses IT, so the diff can't miss an orphan added after
+// the stale pointer (a false Verified).
+func TestLatestManifestStalePointerOverridden(t *testing.T) {
 	root := t.TempDir()
 	s := New("fs", root)
 	ctx := context.Background()
@@ -50,10 +52,9 @@ func TestLatestManifestPicksNewestViaPointer(t *testing.T) {
 	if err := s.PutManifest(ctx, "2026-06-01T000000.000000000Z.jsonl", bytes.NewReader(newest)); err != nil {
 		t.Fatalf("put new manifest: %v", err)
 	}
-	// The pointer now names the second (newest) manifest. Corrupt it to prove the pointer is USED
-	// (a name-sort fallback would still find "2026-06-...", so re-point at the OLD one and expect it).
+	// STALE pointer: force it to name the OLD manifest even though a newer one exists on disk.
 	if err := os.WriteFile(filepath.Join(root, "_manifest", "LATEST"), []byte("2026-01-01T000000.000000000Z.jsonl"), 0o644); err != nil { //nolint:gosec // test fixture
-		t.Fatalf("repoint: %v", err)
+		t.Fatalf("repoint stale: %v", err)
 	}
 	rc, err := s.LatestManifest(ctx)
 	if err != nil {
@@ -61,8 +62,8 @@ func TestLatestManifestPicksNewestViaPointer(t *testing.T) {
 	}
 	defer func() { _ = rc.Close() }()
 	got, err := io.ReadAll(rc)
-	if err != nil || !bytes.Equal(got, []byte("old\n")) {
-		t.Fatalf("LatestManifest must honor the pointer (the OLD manifest), got %q err=%v", got, err)
+	if err != nil || !bytes.Equal(got, newest) {
+		t.Fatalf("a stale pointer must be overridden by the newer manifest, got %q err=%v", got, err)
 	}
 }
 
