@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -69,6 +70,17 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		b.WriteString(`</ListBucketResult>`)
 		_, _ = io.WriteString(w, b.String())
+	case r.Method == http.MethodHead: // object HEAD = StatObject — LatestManifest's EAGER obj.Stat()
+		if s.getFail {
+			w.WriteHeader(http.StatusForbidden) // a read-deny surfaces at the eager stat → unverifiable
+			return
+		}
+		// StatObject parses Last-Modified (a missing one errors) + Content-Length into ObjectInfo.
+		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"manifest-etag"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(s.manifest)))
+		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodGet: // object GET
 		if s.getFail {
 			w.WriteHeader(http.StatusForbidden)
@@ -148,6 +160,25 @@ func TestCheckImmutabilityObjectLockRemovedIsDrift(t *testing.T) {
 	}
 	if !ver {
 		t.Fatal("versioning was still enabled — must report true")
+	}
+}
+
+// TestCheckImmutabilityObjectLockRemovedDriftSurvivesVersioningReadError: the key new invariant —
+// object-lock is DEFINITIVELY removed (404) AND the best-effort versioning read ALSO fails (403). The
+// definitive drift must win: CheckImmutability returns (objectLock=false, versioning=false, err=nil).
+// A failed versioning read must NOT discard/mask the definitive object-lock-removed drift as merely
+// "unverifiable" — that would silently drop a WORM-lost alert.
+func TestCheckImmutabilityObjectLockRemovedDriftSurvivesVersioningReadError(t *testing.T) {
+	sink := newWormSink(t, &wormStub{lockStatus: http.StatusNotFound, versioningErr: http.StatusForbidden})
+	lock, ver, err := sink.CheckImmutability(context.Background())
+	if err != nil {
+		t.Fatalf("a definitive object-lock-removed drift must NOT error even when versioning read fails, got %v", err)
+	}
+	if lock {
+		t.Fatal("object-lock removed (404) must report objectLock=false (drift) regardless of the versioning read")
+	}
+	if ver {
+		t.Fatal("a failed versioning read must report versioning=false (best-effort detail), not true")
 	}
 }
 

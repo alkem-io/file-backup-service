@@ -21,6 +21,10 @@ const (
 	manifestLatestName = "LATEST"
 	manifestSuffix     = ".jsonl"
 	preflightPrefix    = "_preflight"
+	// manifestTimeLayout is the fixed-width UTC-nanosecond prefix ManifestName stamps onto every
+	// snapshot; IsTimestampedManifest PARSES it (not just the suffix) so a stray non-timestamped
+	// `.jsonl` can't sort above real names and be picked as "newest".
+	manifestTimeLayout = "2006-01-02T150405.000000000Z"
 	// contentHashLen is the hex length of a SHA3-256 externalID (32 bytes -> 64 hex chars).
 	contentHashLen = 64
 )
@@ -162,11 +166,45 @@ func ManifestDir() string { return manifestPrefix }
 // (a new object VERSION on a versioned/object-lock bucket, so it's WORM-safe).
 func ManifestLatestKey() string { return path.Join(manifestPrefix, manifestLatestName) }
 
-// IsTimestampedManifest reports whether base is a timestamped manifest object (a `.jsonl`), so the
-// fallback newest-scan (used when the LATEST pointer is absent) IGNORES the pointer + any stray
-// object — the ONE naming rule shared by the s3 + filesystem sinks, so they can't diverge on which
-// object is "the newest manifest".
-func IsTimestampedManifest(base string) bool { return strings.HasSuffix(base, manifestSuffix) }
+// IsTimestampedManifest reports whether base is a genuine timestamped manifest object: it must both
+// carry the `.jsonl` suffix AND parse as the fixed-width UTC-nanosecond ManifestName layout. Merely
+// checking the suffix let a stray `backup.jsonl` (which sorts ABOVE every real `2026-…Z.jsonl` name)
+// be picked as "newest" and diffed as the inventory — validating the timestamp layout rejects it.
+// The ONE naming rule shared by the s3 + filesystem sinks + selectLatestManifest, so they can't
+// diverge on which object is "the newest manifest".
+func IsTimestampedManifest(base string) bool {
+	ts, ok := strings.CutSuffix(base, manifestSuffix)
+	if !ok {
+		return false
+	}
+	_, err := time.Parse(manifestTimeLayout, ts)
+	return err == nil
+}
+
+// SelectLatestManifest resolves the newest manifest's base name from a pointer read + a name lister,
+// owning the pointer→validate→fallback-scan→newest-name policy in ONE place so the s3 and filesystem
+// sinks provide only primitive reads and can't diverge on selection. readPointer returns the
+// `_manifest/LATEST` contents and ok=false when the pointer is absent/unreadable/empty; on a VALID
+// timestamped pointer that name is used directly (the fast path, no listing). Otherwise it scans
+// listNames for the highest VALID timestamped name. It returns "" (nil error) when none exist — the
+// caller maps that to os.ErrNotExist / NoData — and propagates a listNames error (a read-deny /
+// gone container → the caller reports the target Unverifiable, not "no manifest").
+func SelectLatestManifest(readPointer func() (string, bool), listNames func() ([]string, error)) (string, error) {
+	if name, ok := readPointer(); ok && IsTimestampedManifest(name) {
+		return name, nil
+	}
+	names, err := listNames()
+	if err != nil {
+		return "", err
+	}
+	var latest string
+	for _, n := range names {
+		if IsTimestampedManifest(n) && n > latest {
+			latest = n
+		}
+	}
+	return latest, nil
+}
 
 // syncDir fsyncs a directory so a create/rename within it is durable
 // (atomic != durable). Used after every content write.

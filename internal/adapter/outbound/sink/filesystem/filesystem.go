@@ -106,69 +106,106 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 }
 
 // PutManifest writes a ledger snapshot object under _manifest/ atomically so a crash mid-write
-// can't leave a truncated manifest a DR restore would trust, then overwrites the `_manifest/LATEST`
-// pointer with the snapshot's name so a reader single-opens the pointer instead of scanning the
-// dir. It uses the same 0644 durable spine as Store — a DR restore on a different uid must be able
-// to read it.
+// can't leave a truncated manifest a DR restore would trust, then BEST-EFFORT overwrites the
+// `_manifest/LATEST` pointer with the snapshot's name so a reader single-opens the pointer instead of
+// scanning the dir. It uses the same 0644 durable spine as Store — a DR restore on a different uid
+// must be able to read it. The pointer is only a read-time OPTIMIZATION (SelectLatestManifest falls
+// back to a dir scan when it is absent/stale, so it is self-healing) — therefore a pointer-only
+// write failure must NOT fail the whole PutManifest: the manifest object itself is durably written.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
 	dest := s.osPath(fsutil.ManifestKey(name))
 	if _, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r); err != nil {
 		return err
 	}
 	ptr := s.osPath(fsutil.ManifestLatestKey())
-	if _, err := writeAtomic(ctx, filepath.Dir(ptr), filepath.Base(ptr), strings.NewReader(name)); err != nil {
-		return fmt.Errorf("write manifest pointer: %w", err)
-	}
+	// Best-effort pointer update: swallow a failure (the scan fallback covers correctness).
+	_, _ = writeAtomic(ctx, filepath.Dir(ptr), filepath.Base(ptr), strings.NewReader(name))
 	return nil
 }
 
 // LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem
-// sink's half of domain's optional inventoryReader capability (audit target→ledger). Manifest
-// names are UTC-nanosecond timestamps, so the lexicographically-highest name is the newest. A
-// missing manifest dir or an empty one returns a wrapped os.ErrNotExist (the domain maps that to
-// "unverifiable — nothing to diff"). Filesystem targets have no object-lock, so this sink
-// deliberately does NOT implement CheckImmutability — a filesystem WORM target is reported
-// unverifiable for the drift check, which is correct (POSIX has no bucket object-lock to read).
+// sink's half of domain's optional inventoryReader capability (audit target→ledger). The newest name
+// is resolved by the shared fsutil.SelectLatestManifest (pointer fast-path, else a dir scan filtered
+// to VALID timestamped manifests), so s3 and filesystem can't diverge on selection. Filesystem
+// targets have no object-lock, so this sink deliberately does NOT implement CheckImmutability — a
+// filesystem WORM target is reported unverifiable for the drift check, which is correct (POSIX has no
+// bucket object-lock to read).
+//
+// Parity with the s3 sink: a present root with no manifest yet returns a wrapped os.ErrNotExist (the
+// domain maps that to NoData — benign), while a GONE root (a detached mount) returns a NON-ErrNotExist
+// error so the audit reports the target Unverifiable rather than benignly "no manifest" — a
+// disappeared target has NOT lost nothing, it has lost everything.
 func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
-	name, err := s.latestManifestName()
+	if err := s.confirmRoot(); err != nil {
+		return nil, err
+	}
+	name, err := fsutil.SelectLatestManifest(s.readManifestPointer, s.listManifestNames)
 	if err != nil {
 		return nil, err
 	}
+	if name == "" {
+		return nil, fmt.Errorf("no manifest in %s: %w", s.osPath(fsutil.ManifestDir()), os.ErrNotExist)
+	}
 	f, err := os.Open(s.osPath(fsutil.ManifestKey(name))) //nolint:gosec // name is a manifest base name under the configured root, not caller-supplied
 	if err != nil {
+		if os.IsNotExist(err) { // named by the pointer/scan but vanished — eager not-found (benign, like s3)
+			return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)
+		}
 		return nil, fmt.Errorf("open manifest %s: %w", name, err)
 	}
 	return f, nil
 }
 
-// latestManifestName resolves the newest manifest's base name: the fast path reads the
-// `_manifest/LATEST` pointer; when it's missing/empty (old data) it falls back to the highest
-// `.jsonl` in _manifest/ (filtered to timestamped manifests via the shared fsutil rule, so the
-// pointer + any stray file can't be picked). Returns a wrapped os.ErrNotExist when none exist.
-func (s *Sink) latestManifestName() (string, error) {
-	if b, err := os.ReadFile(s.osPath(fsutil.ManifestLatestKey())); err == nil { //nolint:gosec // fixed pointer key under the configured root
-		if name := strings.TrimSpace(string(b)); fsutil.IsTimestampedManifest(name) {
-			return name, nil
-		}
+// confirmRoot verifies the sink root still exists and is a directory — the filesystem analogue of
+// the s3 sink's confirmBucket, so a detached mount surfaces as an ERROR (Unverifiable) instead of
+// being read as an empty/no-manifest target (NoData). A missing root deliberately does NOT wrap
+// os.ErrNotExist: a gone mount is a target-level fault, not the benign "no manifest yet".
+func (s *Sink) confirmRoot() error {
+	info, err := os.Stat(s.root)
+	switch {
+	case err == nil && info.IsDir():
+		return nil
+	case err == nil:
+		return fmt.Errorf("filesystem root %s is not a directory (misconfigured mount?)", s.root)
+	case os.IsNotExist(err):
+		return fmt.Errorf("filesystem root %s is gone (detached mount?)", s.root)
+	default:
+		return fmt.Errorf("stat filesystem root %s: %w", s.root, err)
 	}
+}
+
+// readManifestPointer reads the `_manifest/LATEST` pointer's raw contents (a manifest base name),
+// returning ok=false when the pointer is absent/unreadable/empty. The name is VALIDATED by
+// SelectLatestManifest, not here.
+func (s *Sink) readManifestPointer() (string, bool) {
+	b, err := os.ReadFile(s.osPath(fsutil.ManifestLatestKey())) //nolint:gosec // fixed pointer key under the configured root
+	if err != nil {
+		return "", false
+	}
+	name := strings.TrimSpace(string(b))
+	return name, name != ""
+}
+
+// listManifestNames returns every non-dir entry's base name under _manifest/ (unfiltered —
+// SelectLatestManifest applies the timestamped-manifest rule). A missing manifest dir (the root is
+// present — confirmRoot passed — but nothing has been written yet) is not an error: it yields no
+// names, which SelectLatestManifest turns into "" → the caller's benign os.ErrNotExist / NoData.
+func (s *Sink) listManifestNames() ([]string, error) {
 	dir := s.osPath(fsutil.ManifestDir())
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("no manifest dir %s: %w", dir, os.ErrNotExist)
+			return nil, nil
 		}
-		return "", fmt.Errorf("read manifest dir %s: %w", dir, err)
+		return nil, fmt.Errorf("read manifest dir %s: %w", dir, err)
 	}
-	var latest string
+	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if base := e.Name(); !e.IsDir() && fsutil.IsTimestampedManifest(base) && base > latest {
-			latest = base
+		if !e.IsDir() {
+			names = append(names, e.Name())
 		}
 	}
-	if latest == "" {
-		return "", fmt.Errorf("no manifest in %s: %w", dir, os.ErrNotExist)
-	}
-	return latest, nil
+	return names, nil
 }
 
 // writeAtomic streams r into dir/base (0644) via the shared fsutil.CommitWrite durable

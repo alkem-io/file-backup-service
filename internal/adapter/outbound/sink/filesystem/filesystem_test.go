@@ -119,6 +119,21 @@ func TestLatestManifestNoneIsNotExist(t *testing.T) {
 	}
 }
 
+// TestLatestManifestGoneRootIsError: a sink rooted at a path that does NOT exist (a detached mount)
+// must surface a NON-os.ErrNotExist error — a disappeared target is Unverifiable (it has lost
+// EVERYTHING), NOT the benign "no manifest yet" (os.ErrNotExist → NoData). confirmRoot draws that
+// distinction; without it a gone mount would read as an empty, healthy target.
+func TestLatestManifestGoneRootIsError(t *testing.T) {
+	goneRoot := filepath.Join(t.TempDir(), "never-created") // a subdir that is never mkdir'd
+	_, err := New("fs", goneRoot).LatestManifest(context.Background())
+	if err == nil {
+		t.Fatal("LatestManifest on a gone root must error, not succeed")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a gone root must NOT be a benign os.ErrNotExist (that is NoData); got %v", err)
+	}
+}
+
 // TestLatestManifestReadDirError: a _manifest path that is a FILE (not a dir) makes ReadDir fail
 // with a non-ErrNotExist error, which must propagate (not be masked as "no manifest").
 func TestLatestManifestReadDirError(t *testing.T) {

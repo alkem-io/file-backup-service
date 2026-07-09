@@ -200,17 +200,19 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 }
 
 // PutManifest writes a ledger snapshot object under _manifest/ (empty-safe: an empty ledger
-// snapshot is a legitimate 0-byte object) and overwrites the `_manifest/LATEST` pointer with the
-// snapshot's name, so a reader single-GETs the pointer instead of scanning the whole prefix. The
-// pointer PUT creates a new object VERSION on a versioned/object-lock bucket (object-lock requires
-// versioning), so it's WORM-safe — the old versions are retained, the current one names the newest.
+// snapshot is a legitimate 0-byte object) and BEST-EFFORT overwrites the `_manifest/LATEST` pointer
+// with the snapshot's name, so a reader single-GETs the pointer instead of scanning the whole
+// prefix. The pointer PUT creates a new object VERSION on a versioned/object-lock bucket
+// (object-lock requires versioning), so it's WORM-safe. The pointer is only a read-time
+// OPTIMIZATION — SelectLatestManifest falls back to a prefix scan when it is absent/stale, so it is
+// self-healing — therefore a pointer-only write failure must NOT fail the whole PutManifest: the
+// manifest object itself is durably written, and the next successful pass rewrites the pointer.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
 	if _, err := s.putStream(ctx, s.prefixed(fsutil.ManifestKey(name)), r); err != nil {
 		return err
 	}
-	if _, err := s.putStream(ctx, s.prefixed(fsutil.ManifestLatestKey()), strings.NewReader(name)); err != nil {
-		return fmt.Errorf("put manifest pointer: %w", err)
-	}
+	// Best-effort pointer update: swallow a failure (the scan fallback covers correctness).
+	_, _ = s.putStream(ctx, s.prefixed(fsutil.ManifestLatestKey()), strings.NewReader(name))
 	return nil
 }
 
@@ -220,46 +222,66 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // domain type-asserts it). A read-denying (PutObject-only) credential 403s these GET calls, so
 // the error is returned and the domain reports the target UNVERIFIABLE, not drifted — the
 // immutable off-site copy's write-only credential legitimately can't read its own config.
+//
+// A DEFINITIVE object-lock-removed answer (ObjectLockConfigurationNotFoundError / HTTP 404) — or a
+// present-but-not-"Enabled" config — is DRIFT (lock=false), and is returned as such REGARDLESS of
+// the subsequent versioning read: versioning is read only best-effort for the detail, so a transient
+// versioning-read failure can no longer DISCARD a definitive drift and mask it as "unverifiable".
 func (s *Sink) CheckImmutability(ctx context.Context) (objectLock, versioning bool, err error) {
 	lockStatus, _, _, _, lerr := s.client.GetObjectLockConfig(ctx, s.bucket)
-	lockEnabled := false
-	if lerr != nil {
-		// A DEFINITIVE "object-lock is not configured" answer — ObjectLockConfigurationNotFoundError
-		// / HTTP 404 — is DRIFT (a WORM bucket that LOST its lock config), NOT unverifiable: report
-		// lock=false so the caller flags it, rather than masking the loss as "couldn't read". Only a
-		// 403 / transient / other error is unverifiable (we genuinely couldn't determine it — e.g. a
-		// PutObject-only WORM credential that can't read its own config).
-		resp := minio.ToErrorResponse(lerr)
-		if resp.Code != "ObjectLockConfigurationNotFoundError" && resp.StatusCode != http.StatusNotFound {
-			return false, false, fmt.Errorf("object-lock config %q: %w", s.bucket, lerr)
-		}
-		// else: object-lock removed → lockEnabled stays false (drift)
-	} else {
-		// GetObjectLockConfig returns the bucket's ObjectLockEnabled value ("Enabled" when the
-		// bucket was created with object-lock).
-		lockEnabled = strings.EqualFold(lockStatus, "Enabled")
+	switch {
+	case lerr != nil && isObjectLockNotFound(lerr):
+		// Definitive: object-lock removed → DRIFT. lock=false regardless of versioning (a failed
+		// versioning read must NOT mask this); report versioning best-effort for the detail.
+		return false, s.versioningEnabled(ctx), nil
+	case lerr != nil:
+		// A 403 / transient / other error — we genuinely couldn't read the lock config → unverifiable.
+		return false, false, fmt.Errorf("object-lock config %q: %w", s.bucket, lerr)
+	case !strings.EqualFold(lockStatus, "Enabled"):
+		// Definitive: object-lock present but not enabled → DRIFT; versioning best-effort.
+		return false, s.versioningEnabled(ctx), nil
 	}
+	// Object-lock enabled → versioning is now load-bearing (a manual Suspend silently defeats WORM),
+	// so a versioning-read failure here IS genuinely unverifiable.
 	ver, verr := s.client.GetBucketVersioning(ctx, s.bucket)
 	if verr != nil {
 		return false, false, fmt.Errorf("versioning config %q: %w", s.bucket, verr)
 	}
-	// Versioning is a hard prerequisite S3 enforces for object-lock, but check it explicitly so a
-	// manual Suspend (which silently defeats WORM) is caught as drift, not masked by the lock flag
-	// alone. A bucket with versioning never/no-longer enabled returns an empty config (Status="",
-	// Enabled()=false), so a suspended/absent versioning surfaces as drift, not an error.
-	return lockEnabled, ver.Enabled(), nil
+	return true, ver.Enabled(), nil
+}
+
+// isObjectLockNotFound reports whether err is the definitive "object-lock is not configured" answer
+// (a WORM bucket that LOST its lock config) rather than a read-deny / transient error.
+func isObjectLockNotFound(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == "ObjectLockConfigurationNotFoundError" || resp.StatusCode == http.StatusNotFound
+}
+
+// versioningEnabled reads the bucket versioning state, returning false on any read error — used only
+// on the definitive-drift path where the lock verdict is already decided, so a versioning-read
+// failure is a missing detail, never a reason to mask the drift.
+func (s *Sink) versioningEnabled(ctx context.Context) bool {
+	ver, err := s.client.GetBucketVersioning(ctx, s.bucket)
+	if err != nil {
+		return false
+	}
+	return ver.Enabled()
 }
 
 // LatestManifest returns the newest ledger-snapshot manifest object under _manifest/ — the s3
-// sink's half of domain's optional inventoryReader capability (audit target→ledger). It single-GETs
-// the `_manifest/LATEST` pointer to resolve the newest name (no full-prefix scan); when the pointer
-// is absent (old data) it FALLS BACK to scanning the prefix, filtered to timestamped `.jsonl`
-// manifests so a stray/marker object can't be picked as "latest". When no manifest exists yet it
-// returns a wrapped os.ErrNotExist (the domain maps that to "unverifiable — nothing to diff", not a
-// failure). A read-denying credential's List/Get 403s surface as a plain error → the domain reports
-// the target unverifiable.
+// sink's half of domain's optional inventoryReader capability (audit target→ledger). The newest name
+// is resolved by the shared fsutil.SelectLatestManifest (pointer fast-path, else a prefix scan
+// filtered to VALID timestamped manifests), so s3 and filesystem can't diverge on selection. When no
+// manifest exists yet it returns a wrapped os.ErrNotExist (the domain maps that to NoData, not a
+// failure). It then EAGERLY confirms the object is readable (a Stat) so a not-found/read-deny
+// surfaces NOW — a vanished object as os.ErrNotExist (benign, like the filesystem sink), a read-deny
+// as an error (unverifiable) — rather than letting a LAZY GetObject 404 surface mid-READ, where the
+// inventory diff would misread it as a non-worm read-path failure while the filesystem sink stays
+// benign (sink parity).
 func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
-	name, err := s.latestManifestName(ctx)
+	name, err := fsutil.SelectLatestManifest(
+		func() (string, bool) { return s.readManifestPointer(ctx) },
+		func() ([]string, error) { return s.listManifestNames(ctx) })
 	if err != nil {
 		return nil, err
 	}
@@ -270,22 +292,20 @@ func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get manifest %s: %w", name, err)
 	}
+	if _, serr := obj.Stat(); serr != nil {
+		_ = obj.Close()
+		if resp := minio.ToErrorResponse(serr); resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+			return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist) // benign — like fs
+		}
+		return nil, fmt.Errorf("stat manifest %s: %w", name, serr) // read-deny / other → unverifiable
+	}
 	return obj, nil
 }
 
-// latestManifestName resolves the newest manifest's base name: the fast path reads the
-// `_manifest/LATEST` pointer (a single GET); if the pointer is missing/empty (old data written
-// before the pointer existed) it falls back to a prefix scan for the highest `.jsonl` name.
-func (s *Sink) latestManifestName(ctx context.Context) (string, error) {
-	if name, ok := s.readManifestPointer(ctx); ok {
-		return name, nil
-	}
-	return s.newestManifestByScan(ctx)
-}
-
-// readManifestPointer reads the `_manifest/LATEST` pointer's contents (a manifest base name),
-// returning ok=false when the pointer is absent/unreadable/empty (or a 403 read-deny) so the caller
-// falls back to the scan — which surfaces the same 403 as the audit's unverifiable signal.
+// readManifestPointer reads the `_manifest/LATEST` pointer's raw contents (a manifest base name),
+// returning ok=false when the pointer is absent/unreadable/empty (or a 403 read-deny) so
+// SelectLatestManifest falls back to the scan — which surfaces the same 403 as the audit's
+// unverifiable signal. The name is VALIDATED by SelectLatestManifest, not here.
 func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
 	obj, err := s.client.GetObject(ctx, s.bucket, s.prefixed(fsutil.ManifestLatestKey()), minio.GetObjectOptions{})
 	if err != nil {
@@ -294,32 +314,26 @@ func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
 	defer func() { _ = obj.Close() }()
 	b, err := io.ReadAll(io.LimitReader(obj, 4096)) // a base name — tiny
 	if err != nil {
-		return "", false
+		return "", false // includes a lazy 404/403 surfacing here → fall back to the scan
 	}
 	name := strings.TrimSpace(string(b))
-	if name == "" || !fsutil.IsTimestampedManifest(name) {
-		return "", false
-	}
-	return name, true
+	return name, name != ""
 }
 
-// newestManifestByScan lists the _manifest/ prefix and returns the highest timestamped `.jsonl`
-// base name, or "" when none exist. Non-manifest objects (the LATEST pointer, any marker) are
-// filtered out via the shared fsutil rule, so it can't pick a stray as newest. The list runs under
-// a CHILD ctx cancelled on return, so minio's producer goroutine is torn down whether the scan
-// finishes or bails (a leaked list goroutine per audit would otherwise accumulate).
-func (s *Sink) newestManifestByScan(ctx context.Context) (string, error) {
+// listManifestNames lists the _manifest/ prefix and returns every object's base name (unfiltered —
+// SelectLatestManifest applies the timestamped-manifest rule). The list runs under a CHILD ctx
+// cancelled on return, so minio's producer goroutine is torn down whether the scan finishes or bails
+// (a leaked list goroutine per audit would otherwise accumulate).
+func (s *Sink) listManifestNames(ctx context.Context) ([]string, error) {
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	prefix := s.prefixed(fsutil.ManifestDir()) + "/"
-	var latest string
+	var names []string
 	for obj := range s.client.ListObjects(lctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
 		if obj.Err != nil {
-			return "", fmt.Errorf("list manifests under %s: %w", prefix, obj.Err)
+			return nil, fmt.Errorf("list manifests under %s: %w", prefix, obj.Err)
 		}
-		if base := path.Base(obj.Key); fsutil.IsTimestampedManifest(base) && base > latest {
-			latest = base
-		}
+		names = append(names, path.Base(obj.Key))
 	}
-	return latest, nil
+	return names, nil
 }

@@ -295,14 +295,27 @@ func TestPutManifestRoutesToManifestPrefix(t *testing.T) {
 	}
 }
 
-// TestPutManifestPointerWriteErrorSurfaces: if the manifest writes but the LATEST pointer write
-// fails, PutManifest surfaces the error (a stale/absent pointer must not be silently swallowed).
-func TestPutManifestPointerWriteErrorSurfaces(t *testing.T) {
+// TestPutManifestPointerWriteFailureSwallowed: the LATEST pointer is a read-time OPTIMIZATION —
+// SelectLatestManifest self-heals via a prefix scan when it is absent/stale — so a pointer-only write
+// failure must NOT fail PutManifest. When the pointer write is denied but the manifest object itself
+// writes durably, PutManifest returns nil, having still ATTEMPTED the pointer (proved by its initiate).
+func TestPutManifestPointerWriteFailureSwallowed(t *testing.T) {
 	stub := &storeStub{putStatus: http.StatusOK, failPointer: true}
 	sink := newStoreSink(t, stub, "backups")
-	err := sink.PutManifest(context.Background(), "snapshot-9.jsonl", bytes.NewReader([]byte("ledger snapshot")))
-	if err == nil || !strings.Contains(err.Error(), "pointer") {
-		t.Fatalf("a failed LATEST-pointer write must surface, got %v", err)
+	if err := sink.PutManifest(context.Background(), "snapshot-9.jsonl", bytes.NewReader([]byte("ledger snapshot"))); err != nil {
+		t.Fatalf("a best-effort pointer-write failure must NOT fail PutManifest, got %v", err)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	got := map[string]bool{}
+	for _, k := range stub.initiates {
+		got[k] = true
+	}
+	if !got["backups/_manifest/snapshot-9.jsonl"] {
+		t.Fatalf("the manifest object itself must be written durably, got initiates %v", stub.initiates)
+	}
+	if !got["backups/_manifest/LATEST"] {
+		t.Fatalf("the pointer write must still be ATTEMPTED (it just fails best-effort), got initiates %v", stub.initiates)
 	}
 }
 
