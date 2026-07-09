@@ -208,21 +208,23 @@ on un-suspend, point it at a readable target; the WORM copy's integrity is cover
 
 **Restoring by point-in-time (`restore current`).** The live `file` table holds only
 each file's **current** version — there is **no version history** — so this restores
-the CURRENT backed-up version, *guarded* by `--at`. The effective-time decision keys on
-the **content version's own timeline** — the ledger's `firstSeenAt` for the current
-`externalID` (when the backup service first backed that content up) — **NOT** the mutable
-`file.updatedDate` (a metadata-only edit bumps `updatedDate` without changing the content,
-which would wrongly refuse a legitimate content restore). It **fails loud** rather than guess:
-- the current content was first backed up **at/before** `--at` → it IS the version as
-  of `--at` → restored;
-- first backed up **after** `--at` → **error** (the version at `--at` isn't the current one);
-- the current content is **not in the backup ledger** (never backed up) → **error** (no
-  timeline to verify against).
+the CURRENT backed-up version, *guarded* by `--at`. The guard keys on the **safe**
+timestamp `file.updatedDate` (when the current version became current): it restores only
+when the file has **not been modified since `--at`** (`updatedDate <= --at`). A
+modification since `--at` (`updatedDate > --at`) — which **includes a metadata-only edit**
+— **fails loud** → PITR/`--hash`. This is a **deliberate conservative over-refusal**: it
+never risks a silent wrong-version restore. (The ledger's first-seen time is *not* used —
+externalIDs are content hashes, so a hash can recycle A→B→A, and first-seen ≠ the current
+version's became-current time; content-version history is out of scope.) It fails loud:
+- `updatedDate` **at/before** `--at` → the current version was in effect at `--at` → restored;
+- `updatedDate` **after** `--at` (a since-modification, incl. a metadata edit) → **error**;
+- `updatedDate` is **NULL** (became-current time unknowable) → **error**.
 
-It needs BOTH the alkemio DB (the file→hash mapping) and the ledger DB (the content
-timeline). To recover a genuinely HISTORICAL version, recover `file.externalID` as of
-`--at` from a **DB point-in-time restore / backup** and pass it via `--hash` (which restores
-it directly, needing only the target). See `contracts/restore-and-ops.md`.
+To recover a genuinely HISTORICAL version — or when the guard over-refuses a metadata-only
+edit — recover `file.externalID` as of `--at` from a **DB point-in-time restore / backup**
+and pass it via `--hash` (which restores it directly, needing only the target). The
+`updatedDate` column is preflighted (`FileRepo.Probe`) so a schema drift fails loud up
+front. See `contracts/restore-and-ops.md`.
 
 **`restore all` completeness.** It restores only what the `--from` source holds, so
 before restoring it prints each configured target's stored-object count (marking the

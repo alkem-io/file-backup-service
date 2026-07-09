@@ -19,6 +19,7 @@ import (
 // / ?list-type) and an object GET carries a key path.
 type wormStub struct {
 	lockStatus       int    // HTTP status for GET ?object-lock (200 or 403)
+	lockErrCode      string // on a 404 lockStatus, the S3 <Code> to emit (default ObjectLockConfigurationNotFoundError)
 	lockEnabled      bool   // ObjectLockEnabled value in the 200 body
 	versioningStatus string // Status in the versioning body ("Enabled"/"Suspended")
 	versioningErr    int    // non-zero HTTP status to fail the versioning GET
@@ -56,10 +57,16 @@ func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
 		}
 		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled></ObjectLockConfiguration>`, lock)
 	case http.StatusNotFound:
-		// object-lock is NOT configured — the definitive DRIFT signal (a WORM bucket that lost its
-		// lock config), returned with the real S3 error code so the sink can distinguish it.
+		// A 404 — but the CODE decides the meaning. Only ObjectLockConfigurationNotFoundError is the
+		// definitive DRIFT signal (a WORM bucket that lost its lock config); any OTHER 404 code (e.g.
+		// NoSuchBucket) is a different fault → Unverifiable. lockErrCode overrides the default code so
+		// a test can drive a non-drift 404.
+		code := s.lockErrCode
+		if code == "" {
+			code = "ObjectLockConfigurationNotFoundError"
+		}
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = io.WriteString(w, `<Error><Code>ObjectLockConfigurationNotFoundError</Code><Message>Object Lock configuration does not exist for this bucket</Message></Error>`)
+		_, _ = fmt.Fprintf(w, `<Error><Code>%s</Code><Message>404</Message></Error>`, code)
 	default:
 		w.WriteHeader(s.lockStatus) // e.g. 403 AccessDenied — a read-denying credential
 	}
@@ -179,6 +186,17 @@ func TestCheckImmutabilityReadDeniedErrors(t *testing.T) {
 	sink := newWormSink(t, &wormStub{lockStatus: http.StatusForbidden})
 	if _, _, err := sink.CheckImmutability(context.Background()); err == nil {
 		t.Fatal("a 403 on the object-lock config must return an error (→ unverifiable), not (false,false,nil)")
+	}
+}
+
+// TestCheckImmutabilityOtherNotFoundIsUnverifiable (re-review item 3): a 404 with a DIFFERENT code
+// (e.g. NoSuchBucket — a gone/renamed bucket) is NOT drift; it must return an error → Unverifiable.
+// Only the specific ObjectLockConfigurationNotFoundError code is drift. Must FAIL if the match is
+// widened to any 404.
+func TestCheckImmutabilityOtherNotFoundIsUnverifiable(t *testing.T) {
+	sink := newWormSink(t, &wormStub{lockStatus: http.StatusNotFound, lockErrCode: "NoSuchBucket"})
+	if _, _, err := sink.CheckImmutability(context.Background()); err == nil {
+		t.Fatal("a 404 with a non-object-lock code (NoSuchBucket) must return an error (→ Unverifiable), not (false,false,nil) Drift")
 	}
 }
 

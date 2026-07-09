@@ -63,16 +63,24 @@ func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir str
 			})
 		},
 		func(h string) { drillOne(ctx, src, h, scratchDir, perObjectTimeout, &out, &mu) })
-	// "Interrupted" is a TRUNCATED sweep, derived from progress — NOT from ctx.Err() sampled after
-	// completion: either an enumeration error (a mid-sweep cancel, already in err), OR a dispatched
-	// object that went uncounted because its work goroutine was cancelled after enumeration finished
-	// (out.Checked() < dispatched). A SIGTERM that lands AFTER every sampled object already passed
-	// leaves dispatched == Checked, so the completed pass's success is NOT discarded (the old
-	// `if err==nil { err=ctx.Err() }` wrongly paged a false stale-drill on a post-completion SIGTERM).
-	if err == nil && out.Checked() < dispatched {
-		err = ctx.Err()
+	return out, drillInterruptErr(ctx, err, out.Checked(), dispatched)
+}
+
+// drillInterruptErr decides a drill's terminal error from PROGRESS, not from ctx.Err() sampled after
+// completion: a sweep error (a mid-sweep cancel / enumeration failure) propagates; otherwise the
+// drill is "interrupted" ONLY when the sweep was TRUNCATED — a dispatched object went uncounted
+// because its work goroutine was cancelled after enumeration finished (checked < dispatched). A
+// SIGTERM that lands AFTER every sampled object already passed leaves checked == dispatched, so the
+// COMPLETED pass's success is NOT discarded (the old `if err==nil { err=ctx.Err() }` wrongly paged a
+// false stale-drill on a post-completion SIGTERM).
+func drillInterruptErr(ctx context.Context, sweepErr error, checked, dispatched int) error {
+	if sweepErr != nil {
+		return sweepErr
 	}
-	return out, err
+	if checked < dispatched {
+		return ctx.Err()
+	}
+	return nil
 }
 
 // drillOne restores one object to scratchDir under a per-object deadline, removes the restored file

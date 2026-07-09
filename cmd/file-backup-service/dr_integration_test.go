@@ -50,10 +50,9 @@ func drConfig(t *testing.T, fileServiceBase string, extra ...string) (cfgPath, t
 }
 
 // seedBackedUp seeds n file-corpus rows + a stub file-service and runs backfill, so the ledger
-// records n objects stored on a unique target (and stamps each object's firstSeenAt ≈ now, the
-// backfill time — the CONTENT timeline restore-current keys on). Returns the config path, the target
-// dir + name, and the objects' (hash, fileID, content). verTime only sets the file's created/updated
-// dates (no longer used by restore-current).
+// records n objects stored on a unique target. Returns the config path, the target dir + name, and
+// the objects' (hash, fileID, content). The corpus rows carry updatedDate=verTime — the SAFE
+// restore-current guard (has the file been modified since --at?).
 func seedBackedUp(t *testing.T, n int, verTime time.Time) (cfgPath, targetDir, name string, hashes []string, fids []uuid.UUID) {
 	t.Helper()
 	ctx := context.Background()
@@ -122,30 +121,30 @@ func TestIntegrationRestoreAll(t *testing.T) {
 	}
 }
 
-// TestIntegrationRestoreCurrent (T024/T026, re-review E2): the effective-time decision keys on the
-// CONTENT's own timeline — the ledger's firstSeenAt (≈ the backfill time), NOT the mutable
-// file.updatedDate. With --at AFTER the content was first backed up it restores the current hash;
-// with --at BEFORE it errors toward PITR + --hash.
+// TestIntegrationRestoreCurrent (T024/T026, re-review item 2): the effective-time decision keys on
+// the SAFE guard `file.updatedDate` (has the file been modified since --at?). With `updatedDate <=
+// --at` the current version was in effect at --at → restores; with `updatedDate > --at` (a since-
+// modification) it errors toward PITR + --hash — a deliberate safe over-refusal that NEVER returns a
+// wrong version (content-version history / recyclable hashes are out of scope).
 func TestIntegrationRestoreCurrent(t *testing.T) {
-	// firstSeenAt is stamped at backfill time (~now); the file's updatedDate (2h ago) is irrelevant.
-	cfgPath, _, name, hashes, fids := seedBackedUp(t, 1, time.Now().Add(-2*time.Hour))
+	verTime := time.Now().Add(-2 * time.Hour) // the file's updatedDate
+	cfgPath, _, name, hashes, fids := seedBackedUp(t, 1, verTime)
 	restoreDir := t.TempDir()
 
-	// --at clearly AFTER the content's firstSeenAt (≈now) → the content existed as of --at → restores.
-	after := time.Now().Add(time.Hour).Format(time.RFC3339)
+	// --at AFTER updatedDate → the file has NOT changed since --at → the current version was in effect.
+	after := verTime.Add(time.Hour).Format(time.RFC3339)
 	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", after, "--from", name, "--to", restoreDir}); err != nil {
-		t.Fatalf("restore current (--at after the content was first backed up) must resolve + restore, got %v", err)
+		t.Fatalf("restore current (updatedDate <= --at) must resolve + restore, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(restoreDir, hashes[0])); err != nil {
 		t.Fatalf("restore current did not write the object: %v", err)
 	}
 
-	// --at clearly BEFORE the content was first backed up → the current content isn't the version as
-	// of --at → error directing to PITR.
-	before := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	// --at BEFORE updatedDate → the file was modified after --at → error directing to PITR.
+	before := verTime.Add(-time.Hour).Format(time.RFC3339)
 	err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", before, "--from", name, "--to", t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "PITR") {
-		t.Fatalf("restore current (--at before the content was first backed up) must error toward PITR/--hash, got %v", err)
+		t.Fatalf("restore current (updatedDate > --at) must error toward PITR/--hash, got %v", err)
 	}
 
 	// An unknown file id → error (no current hash).
@@ -154,23 +153,29 @@ func TestIntegrationRestoreCurrent(t *testing.T) {
 	}
 }
 
-// TestIntegrationRestoreCurrentMetadataEditRestores (re-review E2): a metadata-only edit bumps the
-// file's mutable updatedDate WITHOUT changing the content — keying on updatedDate would REFUSE a
-// legitimate content restore. Keying on the ledger's firstSeenAt (unchanged by the edit) restores it
-// for any --at at/after the content was first backed up.
-func TestIntegrationRestoreCurrentMetadataEditRestores(t *testing.T) {
-	cfgPath, _, name, hashes, fids := seedBackedUp(t, 1, time.Now().Add(-3*time.Hour))
-	// Simulate a metadata-only edit AFTER --at: bump updatedDate to now, content (externalID) unchanged.
+// TestIntegrationRestoreCurrentMetadataEditFailsLoud (re-review item 2+5): a metadata-only edit bumps
+// the file's `updatedDate` to now. With `--at` BEFORE the edit, the safe guard sees `updatedDate >
+// --at` and FAILS LOUD (a deliberate conservative over-refusal — it CANNOT prove the current version
+// was in effect at --at, and the content-version timeline is out of scope, so it never risks a wrong
+// version). The operator restores the content directly via `--hash`. This DISCRIMINATES the guard:
+// removing/inverting it would restore (test fails).
+func TestIntegrationRestoreCurrentMetadataEditFailsLoud(t *testing.T) {
+	cfgPath, _, name, hashes, fids := seedBackedUp(t, 1, time.Now().Add(-2*time.Hour))
+	// A metadata-only edit AFTER --at: bump updatedDate to now (content/externalID unchanged).
 	if err := harness.Exec(context.Background(), harness.AlkemioDB,
 		`UPDATE file SET "updatedDate"=now() WHERE id=$1`, fids[0]); err != nil {
 		t.Fatalf("metadata edit: %v", err)
 	}
-	// --at is BEFORE the metadata edit but AFTER the content's firstSeenAt (backfill ~now). Keying on
-	// updatedDate (now) would reject; keying on firstSeenAt restores.
-	at := time.Now().Add(time.Hour).Format(time.RFC3339)
+	// --at is BEFORE the metadata edit (1h ago) → updatedDate (now) > --at → fail loud.
+	at := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", at, "--from", name, "--to", t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "PITR") {
+		t.Fatalf("a file modified after --at (a metadata edit) must fail loud toward PITR (safe over-refusal), got %v", err)
+	}
+	// The operator's escape hatch: restore the current content DIRECTLY via --hash succeeds.
 	restoreDir := t.TempDir()
-	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", at, "--from", name, "--to", restoreDir}); err != nil {
-		t.Fatalf("a metadata-only edit must NOT refuse a content restore (keys on firstSeenAt, not updatedDate), got %v", err)
+	if err := runRestoreCurrent([]string{"--config", cfgPath, "--file-id", fids[0].String(), "--at", at, "--hash", hashes[0], "--from", name, "--to", restoreDir}); err != nil {
+		t.Fatalf("the --hash escape hatch must restore regardless of updatedDate, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(restoreDir, hashes[0])); err != nil {
 		t.Fatalf("restore current did not write the object after a metadata edit: %v", err)
@@ -263,15 +268,15 @@ func TestIntegrationRunDrillZeroSampled(t *testing.T) {
 	}
 }
 
-// TestIntegrationRestoreCurrentContentNotBackedUp (re-review E2): a file whose CURRENT content is not
-// recorded in the backup ledger (never backed up) has no content timeline — restore current (no
-// --hash) must FAIL LOUD (direct to PITR/--hash), never silently return an unbacked-up hash.
-func TestIntegrationRestoreCurrentContentNotBackedUp(t *testing.T) {
+// TestIntegrationRestoreCurrentNullUpdatedDate (re-review item 2): a file with a NULL updatedDate has
+// no became-current time to compare against --at — restore current (no --hash) must FAIL LOUD (direct
+// to PITR/--hash), never silently return the current hash.
+func TestIntegrationRestoreCurrentNullUpdatedDate(t *testing.T) {
 	ctx := context.Background()
-	content := []byte("content not in the ledger")
+	content := []byte("null updatedDate object")
 	h := sha3hex(content)
 	fid := uuid.New()
-	// A file row exists (externalID set), but the content is NOT backed up (no ledger row for h).
+	// createdDate set but updatedDate NULL (omitted).
 	if err := harness.Exec(ctx, harness.AlkemioDB,
 		`INSERT INTO file (id,"externalID",size,"temporaryLocation","createdDate") VALUES ($1,$2,$3,false,now())`,
 		fid, h, int64(len(content))); err != nil {
@@ -281,7 +286,7 @@ func TestIntegrationRestoreCurrentContentNotBackedUp(t *testing.T) {
 	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", fid.String(), "--at", time.Now().Format(time.RFC3339), "--from", "local",
 	})
-	if err == nil || !strings.Contains(err.Error(), "not recorded in the backup ledger") {
-		t.Fatalf("content with no ledger record must fail loud toward PITR/--hash, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "NULL updatedDate") {
+		t.Fatalf("a NULL updatedDate must fail loud toward PITR/--hash, got %v", err)
 	}
 }

@@ -3,11 +3,9 @@ package db
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db/queries"
@@ -197,21 +195,6 @@ func (r *LedgerRepo) StoredCountByTarget(ctx context.Context, targets []string) 
 		counts[row.Target] = int(row.N)
 	}
 	return counts, nil
-}
-
-// FirstSeenAt returns when this service first backed up (first saw) the content version — the
-// CONTENT version's own timeline, used by `restore current --at` to decide whether the current
-// backed-up version existed as of --at (independent of the file table's mutable updatedDate). found
-// is false when the content is not in the ledger (not backed up).
-func (r *LedgerRepo) FirstSeenAt(ctx context.Context, externalID string) (t time.Time, found bool, err error) {
-	ts, qerr := r.q.FirstSeenAt(ctx, externalID)
-	if qerr != nil {
-		if errors.Is(qerr, pgx.ErrNoRows) {
-			return time.Time{}, false, nil
-		}
-		return time.Time{}, false, fmt.Errorf("first seen at: %w", qerr)
-	}
-	return nullTime(ts), true, nil
 }
 
 // StoredTargets returns the set of target names already in state='stored' for externalID

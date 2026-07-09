@@ -3,6 +3,7 @@ package domain
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -150,6 +151,27 @@ func TestDrillCancelDuringObjectIsInterruptNotFailure(t *testing.T) {
 	}
 	if out.Failed != 0 {
 		t.Fatalf("a cancellation must NOT be counted as a failed object, got Failed=%d", out.Failed)
+	}
+}
+
+// TestDrillInterruptErr (re-review item 4): a COMPLETED sweep (every dispatched object counted) is
+// NOT interrupted even if a SIGTERM lands after it — so a completed drill keeps its pass=1 /
+// last_success; only a TRUNCATED sweep (a dispatched object went uncounted) is interrupted. This
+// FAILS if the guard is reverted to the unconditional `if err==nil { err=ctx.Err() }`.
+func TestDrillInterruptErr(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	// Completed (checked==dispatched) + a post-completion SIGTERM → NOT interrupted (nil).
+	if err := drillInterruptErr(cancelled, nil, 5, 5); err != nil {
+		t.Fatalf("a completed drill (checked==dispatched) must not be interrupted by a post-completion SIGTERM, got %v", err)
+	}
+	// Truncated (a dispatched object went uncounted) → interrupted.
+	if err := drillInterruptErr(cancelled, nil, 4, 5); err == nil {
+		t.Fatal("a truncated drill (checked<dispatched) must be interrupted")
+	}
+	// A sweep error always propagates.
+	if err := drillInterruptErr(context.Background(), errors.New("ledger down"), 0, 0); err == nil {
+		t.Fatal("a sweep error must propagate")
 	}
 }
 

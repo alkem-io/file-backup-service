@@ -640,6 +640,13 @@ func validateS3Target(t Target) error {
 		// degraded-target startup or an opaque 403 at preflight / restore fetch time.
 		return fmt.Errorf("target %q: s3 requires accessKey and secretKey (inject via FBS_TARGET_%s_ACCESSKEY / _SECRETKEY)", t.Name, envToken(t.Name))
 	}
+	// The OPTIONAL audit/read credential is all-or-nothing: s3.New only builds the audit client when
+	// BOTH keys are set, so a HALF-set pair would SILENTLY leave the WORM drift-check the operator
+	// intended to enable disabled (ImmutabilityReadable()==false → NoData, no error, no alert). Fail
+	// loud on a half-set pair (mirrors the primary pair).
+	if (t.AuditAccessKey == "") != (t.AuditSecretKey == "") {
+		return fmt.Errorf("target %q: the audit credential is all-or-nothing — set BOTH FBS_TARGET_%s_AUDITACCESSKEY and _AUDITSECRETKEY, or neither", t.Name, envToken(t.Name))
+	}
 	if !t.Insecure && (!t.UseSSL || !t.SSE) {
 		return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+
 			"set insecure=true only for local dev", t.Name)

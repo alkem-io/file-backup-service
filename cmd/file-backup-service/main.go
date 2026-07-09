@@ -519,51 +519,47 @@ func runRestoreCurrent(args []string) error {
 	return nil
 }
 
-// resolveCurrentHash maps (file-id, at) to the content hash to restore: it reads the file's CURRENT
-// externalID from the alkemio `file` table, then decides whether that CONTENT version was already in
-// effect at --at using the CONTENT's OWN timeline — the ledger's FirstSeenAt (when this service first
-// backed the content up) — NOT the mutable file.updatedDate (a metadata-only edit bumps updatedDate
-// without changing the content, which would refuse a legitimate content restore). It needs BOTH the
-// alkemio DB (the file→hash mapping) and the ledger DB (the content timeline), so it validates +
-// opens both here. It returns the current hash ONLY when the content was first seen at/before --at;
-// otherwise the version at --at is not resolvable live and the operator must recover it via a DB PITR
-// + --hash (see contracts/restore-and-ops.md).
+// resolveCurrentHash maps (file-id, at) to the content hash to restore, using the live `file` table
+// (which holds only the current version). It needs the alkemio DB, so it validates + opens it here
+// (and preflights the columns via FileRepo.Probe so a missing `updatedDate` fails loud up front, not
+// mid-DR). It keys on the SAFE guard — `file.updatedDate` (when the current version became current):
+// it returns the current hash ONLY when the file has NOT been modified since --at (updatedDate <=
+// --at → the current version was in effect at --at). A modification since --at (updatedDate > --at) —
+// which INCLUDES a metadata-only edit — is a deliberate SAFE OVER-REFUSAL (content-version history is
+// out of scope; the ledger's first-seen time is unsafe because externalIDs are content hashes and a
+// hash can RECYCLE A→B→A, so first-seen ≠ the current version's became-current time). It NEVER
+// returns a wrong version; the operator recovers a historical version via a DB PITR + --hash.
 func resolveCurrentHash(ctx context.Context, cfg *config.Config, fid uuid.UUID, at time.Time) (string, error) {
 	if err := cfg.AlkemioDB.Validate("alkemioDB"); err != nil {
 		return "", fmt.Errorf("invalid config (resolving --file-id needs alkemioDB; or pass --hash from a PITR query): %w", err)
 	}
-	if err := cfg.LedgerDB.Validate("ledgerDB"); err != nil {
-		return "", fmt.Errorf("invalid config (resolving --file-id also needs ledgerDB for the content's backup timeline; or pass --hash): %w", err)
-	}
-	apool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "alkemio")
+	pool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "alkemio")
 	if err != nil {
 		return "", err
 	}
-	defer apool.Close()
-	lpool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "ledger")
-	if err != nil {
+	defer pool.Close()
+	files := db.NewFileRepo(pool)
+	// Preflight the `file` columns (incl. updatedDate) so a schema drift fails loud up front, not
+	// mid-DR on FileByID's Scan.
+	if err := files.Probe(ctx); err != nil {
 		return "", err
 	}
-	defer lpool.Close()
-
-	hash, found, err := db.NewFileRepo(apool).FileByID(ctx, fid)
+	hash, versionTime, found, err := files.FileByID(ctx, fid)
 	if err != nil {
 		return "", fmt.Errorf("resolve file %s: %w", fid, err)
 	}
 	if !found {
 		return "", fmt.Errorf("file %s has no current content hash in the live file table — recover its externalID as of %s from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)", fid, at.Format(time.RFC3339))
 	}
-	// The content version's OWN timeline: when the backup service first saw this externalID.
-	firstSeen, seen, err := db.NewLedgerRepo(lpool).FirstSeenAt(ctx, hash)
-	if err != nil {
-		return "", fmt.Errorf("resolve content timeline for %s: %w", hash, err)
+	// FAIL LOUD when the version time is unknowable: a NULL updatedDate means we cannot prove the
+	// current version was the one in effect at --at, so we MUST NOT guess. Direct the operator to PITR.
+	if versionTime.IsZero() {
+		return "", fmt.Errorf("file %s has a NULL updatedDate — cannot determine whether it was modified after %s; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
+			fid, at.Format(time.RFC3339))
 	}
-	if !seen {
-		return "", fmt.Errorf("file %s current content %s is not recorded in the backup ledger — cannot verify it existed at %s; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)", fid, hash, at.Format(time.RFC3339))
-	}
-	if firstSeen.After(at) {
-		return "", fmt.Errorf("file %s current content %s was first backed up at %s, AFTER --at %s — the version in effect at --at is not the current one; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
-			fid, hash, firstSeen.Format(time.RFC3339), at.Format(time.RFC3339))
+	if versionTime.After(at) {
+		return "", fmt.Errorf("file %s was modified at %s, AFTER --at %s — cannot prove the current version was in effect at --at (a since-replacement OR a metadata-only edit); recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
+			fid, versionTime.Format(time.RFC3339), at.Format(time.RFC3339))
 	}
 	return hash, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -73,36 +74,42 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	})
 }
 
-// FileByID resolves a file's CURRENT content hash (externalID). It deliberately does NOT read
-// `file.updatedDate`: that is a last-modified-ANY-field timestamp (a metadata-only edit bumps it
-// without changing the content), so keying `restore current --at` on it would refuse a legitimate
-// content restore. The effective-time decision is made instead on the CONTENT version's own timeline
-// — the ledger's FirstSeenAt for this externalID — so no mutable `file` timestamp is read here (and
-// nothing to preflight beyond `externalID`, which Probe covers). found=false when no such file row,
-// or a NULL/empty externalID (a not-yet-stored file has no backup key). The `file` table holds only
-// the CURRENT version (no history) — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver:
-// `file` is the foreign, server-owned table).
-func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, found bool, err error) {
-	const q = `SELECT "externalID" FROM file WHERE id = $1`
+// FileByID resolves a file's CURRENT content hash (externalID) and the time its CURRENT version
+// became live — `file.updatedDate`, read DIRECTLY (NOT coalesced to createdDate): a file REPLACED in
+// place (same id + new externalID) updates updatedDate to the replace time, so this is the timestamp
+// `restore current --at` compares against. updatedDate is the SAFE guard: `restore current` keys on
+// "has the file been modified since --at?", never on the content's own history — externalIDs are
+// content hashes, so a hash can RECYCLE (A→B→A), and the content-version timeline is out of scope, so
+// we conservatively over-refuse (a metadata-only edit that bumped updatedDate) rather than ever risk
+// a silent wrong-version restore. A NULL updatedDate is returned as a ZERO versionTime so the caller
+// FAILS LOUD (directs to a DB PITR + --hash). found=false when no such file row (or a NULL/empty
+// externalID — a not-yet-stored file has no backup key); versionTime is still returned so the caller
+// can distinguish "NULL updatedDate" from "row absent". The `file` table holds only the CURRENT
+// version (no history) — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver: `file` is
+// the foreign, server-owned table; Probe covers the columns).
+func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, versionTime time.Time, found bool, err error) {
+	const q = `SELECT "externalID", "updatedDate" FROM file WHERE id = $1`
 	var ext pgtype.Text
-	if serr := r.p.QueryRow(ctx, q, id).Scan(&ext); serr != nil {
+	var vt pgtype.Timestamptz
+	if serr := r.p.QueryRow(ctx, q, id).Scan(&ext, &vt); serr != nil {
 		if errors.Is(serr, pgx.ErrNoRows) {
-			return "", false, nil
+			return "", time.Time{}, false, nil
 		}
-		return "", false, fmt.Errorf("file by id: %w", serr)
+		return "", time.Time{}, false, fmt.Errorf("file by id: %w", serr)
 	}
 	if !ext.Valid || ext.String == "" {
-		return "", false, nil // a file with no content hash yet has no backup to restore
+		return "", nullTime(vt), false, nil // a file with no content hash yet has no backup to restore
 	}
-	return ext.String, true, nil
+	return ext.String, nullTime(vt), true, nil
 }
 
-// Probe verifies the `file` table is readable via the scoped role AND has every column
-// EachFile reads (id/externalID/createdBy/createdDate/size/temporaryLocation) — so a
-// missing SELECT grant OR a server-side schema/column drift fails LOUD at startup, not
-// mid-pass when EachFile's Scan hits a renamed column (mirrors OutboxRepo.Probe).
+// Probe verifies the `file` table is readable via the scoped role AND has every column the repo
+// reads — EachFile's id/externalID/createdBy/createdDate/size/temporaryLocation AND FileByID's
+// "updatedDate" (the `restore current --at` guard) — so a missing SELECT grant OR a server-side
+// schema/column drift fails LOUD up front, not mid-pass/mid-DR when a Scan hits a renamed column
+// (mirrors OutboxRepo.Probe).
 func (r *FileRepo) Probe(ctx context.Context) error {
-	const q = `SELECT id, "externalID", "createdBy", "createdDate", size, "temporaryLocation"
+	const q = `SELECT id, "externalID", "createdBy", "createdDate", "updatedDate", size, "temporaryLocation"
 	FROM file LIMIT 1`
 	if _, err := r.p.Exec(ctx, q); err != nil {
 		return fmt.Errorf("file table not readable (scoped role SELECT grant / schema drift on file?): %w", err)

@@ -71,23 +71,38 @@ func TestFilesEachFileCallbackErrorStops(t *testing.T) {
 
 func TestFileByID(t *testing.T) {
 	fid := uuid.New()
+	ver := time.Now().Add(-time.Hour)
 
 	t.Run("found", func(t *testing.T) {
 		r, mock := newMockFiles(t)
-		// FileByID reads ONLY externalID now (the effective-time decision uses the ledger's
-		// FirstSeenAt, not the mutable file.updatedDate — a metadata edit must not refuse a restore).
-		mock.ExpectQuery(`"externalID" FROM file WHERE id`).WithArgs(fid).
-			WillReturnRows(pgxmock.NewRows([]string{"externalID"}).AddRow(pgtype.Text{String: "hashZ", Valid: true}))
-		ext, found, err := r.FileByID(context.Background(), fid)
-		if err != nil || !found || ext != "hashZ" {
-			t.Fatalf("found file: ext=%q found=%v err=%v", ext, found, err)
+		// FileByID reads externalID + updatedDate (the SAFE restore-current guard — has the file been
+		// modified since --at? — NOT the content's own recyclable timeline).
+		mock.ExpectQuery(`"externalID", "updatedDate" FROM file WHERE id`).WithArgs(fid).
+			WillReturnRows(pgxmock.NewRows([]string{"externalID", "updatedDate"}).
+				AddRow(pgtype.Text{String: "hashZ", Valid: true}, pgtype.Timestamptz{Time: ver, Valid: true}))
+		ext, vt, found, err := r.FileByID(context.Background(), fid)
+		if err != nil || !found || ext != "hashZ" || !vt.Equal(ver) {
+			t.Fatalf("found file: ext=%q vt=%v found=%v err=%v", ext, vt, found, err)
+		}
+	})
+
+	t.Run("null-updatedDate", func(t *testing.T) {
+		r, mock := newMockFiles(t)
+		// A NULL updatedDate → a ZERO versionTime so the caller fails loud (can't prove the current
+		// version was in effect at --at) rather than guessing.
+		mock.ExpectQuery(`"externalID", "updatedDate" FROM file WHERE id`).WithArgs(fid).
+			WillReturnRows(pgxmock.NewRows([]string{"externalID", "updatedDate"}).
+				AddRow(pgtype.Text{String: "hashZ", Valid: true}, pgtype.Timestamptz{}))
+		ext, vt, found, err := r.FileByID(context.Background(), fid)
+		if err != nil || !found || ext != "hashZ" || !vt.IsZero() {
+			t.Fatalf("a NULL updatedDate must return the row with a ZERO versionTime: ext=%q vt=%v found=%v err=%v", ext, vt, found, err)
 		}
 	})
 
 	t.Run("no-row", func(t *testing.T) {
 		r, mock := newMockFiles(t)
 		mock.ExpectQuery("FROM file WHERE id").WithArgs(fid).WillReturnError(pgx.ErrNoRows)
-		_, found, err := r.FileByID(context.Background(), fid)
+		_, _, found, err := r.FileByID(context.Background(), fid)
 		if err != nil || found {
 			t.Fatalf("an unknown id must be (found=false, nil), got found=%v err=%v", found, err)
 		}
@@ -97,8 +112,9 @@ func TestFileByID(t *testing.T) {
 		r, mock := newMockFiles(t)
 		// A file row with no content hash yet (NULL externalID) → not backup-restorable → found=false.
 		mock.ExpectQuery("FROM file WHERE id").WithArgs(fid).
-			WillReturnRows(pgxmock.NewRows([]string{"externalID"}).AddRow(pgtype.Text{}))
-		_, found, err := r.FileByID(context.Background(), fid)
+			WillReturnRows(pgxmock.NewRows([]string{"externalID", "updatedDate"}).
+				AddRow(pgtype.Text{}, pgtype.Timestamptz{Time: ver, Valid: true}))
+		_, _, found, err := r.FileByID(context.Background(), fid)
 		if err != nil || found {
 			t.Fatalf("a NULL externalID must be (found=false, nil), got found=%v err=%v", found, err)
 		}
@@ -107,7 +123,7 @@ func TestFileByID(t *testing.T) {
 	t.Run("query-error", func(t *testing.T) {
 		r, mock := newMockFiles(t)
 		mock.ExpectQuery("FROM file WHERE id").WithArgs(fid).WillReturnError(errors.New("boom"))
-		if _, _, err := r.FileByID(context.Background(), fid); err == nil {
+		if _, _, _, err := r.FileByID(context.Background(), fid); err == nil {
 			t.Fatal("a query error must propagate")
 		}
 	})
