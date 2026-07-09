@@ -305,24 +305,87 @@ func TestAuditInventoryTransientReadIsUnverifiable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a transient read reset must NOT be a sweep fault, got %v", err)
 	}
-	if a := rep.Targets[0]; !a.Unverifiable || a.Err != nil {
-		t.Fatalf("a transient mid-read reset must be unverifiable (not corrupt/fault): %+v", a)
+	a := rep.Targets[0]
+	if !a.Unverifiable || a.NoData || a.Err != nil {
+		t.Fatalf("a transient mid-read reset must be unverifiable + NoData=false (not corrupt/fault): %+v", a)
+	}
+	// A non-worm target's transient/broken read path FAILS (consistent with the probe-timeout case).
+	if rep.FailErr() == nil {
+		t.Fatal("a non-worm target with an unverifiable transient read must FAIL the audit")
 	}
 }
 
-// TestAuditInventoryCancelledIsBenign (delta re-review #1): a ctx cancellation during the read is
-// benign at the target level (NoData) — the audit's top-level ctx.Err() fold surfaces the abort, not
-// a spurious per-target corruption fault.
+// TestAuditInventoryProbeTimeoutFailsNonWorm (delta re-review): a per-target probe DEADLINE (a
+// wedged/black-holing target — child DeadlineExceeded while the PARENT ctx is still live) must NOT be
+// treated as a benign shutdown: it is Unverifiable with NoData=false, so a non-worm target FAILS
+// (the parent has no deadline, so the top-level ctx.Err() fold would otherwise let a 30s black-hole
+// read green).
+func TestAuditInventoryProbeTimeoutFailsNonWorm(t *testing.T) {
+	old := auditProbeTimeout
+	auditProbeTimeout = 50 * time.Millisecond
+	defer func() { auditProbeTimeout = old }()
+
+	// A sink whose LatestManifest never returns → the per-target tctx deadline fires while the parent
+	// (context.Background()) is live.
+	sink := &blockingManifestSink{stubSink: stubSink{name: "t"}, release: make(chan struct{}), closer: &trackedCloser{closed: make(chan struct{})}}
+	t.Cleanup(func() { close(sink.release) })
+	done := make(chan InventoryReport, 1)
+	go func() {
+		rep, _ := AuditInventory(context.Background(), newFakeLedger(), []Target{{Sink: sink}})
+		done <- rep
+	}()
+	select {
+	case rep := <-done:
+		a := rep.Targets[0]
+		if !a.Unverifiable || a.NoData {
+			t.Fatalf("a wedged non-worm target (probe timeout, parent live) must be unverifiable + NoData=false, got %+v", a)
+		}
+		if rep.FailErr() == nil {
+			t.Fatal("a wedged non-worm target must FAIL the audit — an incomplete integrity check must not read green")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AuditInventory HUNG on a wedged target — per-target deadline not enforced")
+	}
+}
+
+// TestClassifyInventoryErrShutdownVsProbeTimeout (delta re-review) pins the exact distinction: a
+// PARENT-cancel is benign (NoData=true, propagate); a per-target DeadlineExceeded with the parent
+// live is a wedged target → unverifiable, NoData=false (a non-worm target FAILS).
+func TestClassifyInventoryErrShutdownVsProbeTimeout(t *testing.T) {
+	// per-target probe timeout: parent LIVE + DeadlineExceeded → unverifiable, NoData=false, fails non-worm.
+	timeout := InventoryAudit{Target: "t"} // Worm=false
+	classifyInventoryErr(context.Background(), &timeout, "t", context.DeadlineExceeded)
+	if !timeout.Unverifiable || timeout.NoData || timeout.Err != nil || !timeout.Failed() {
+		t.Fatalf("a per-target probe timeout must be unverifiable + NoData=false + failing, got %+v", timeout)
+	}
+	// real shutdown: PARENT ctx cancelled → benign (NoData=true, not failing).
+	pctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	shutdown := InventoryAudit{Target: "t"}
+	classifyInventoryErr(pctx, &shutdown, "t", context.Canceled)
+	if !shutdown.Unverifiable || !shutdown.NoData || shutdown.Err != nil || shutdown.Failed() {
+		t.Fatalf("a parent SIGTERM must be benign (NoData=true, not failing), got %+v", shutdown)
+	}
+}
+
+// TestAuditInventoryCancelledIsBenign (delta re-review): a genuine parent-ctx cancellation (SIGTERM)
+// is benign at the target level (NoData) — the audit's top-level ctx.Err() fold surfaces the abort,
+// not a spurious per-target fault or a non-worm failure.
 func TestAuditInventoryCancelledIsBenign(t *testing.T) {
 	led := newFakeLedger()
 	storeOnTarget(t, led, hashOf("a"))
-	sink := ioErrManifestSink{stubSink: stubSink{name: "t"}, prefix: []byte(`{"externalID":"` + hashOf("a") + `"}` + "\n"), err: context.Canceled}
-	rep, err := AuditInventory(context.Background(), led, []Target{{Sink: sink}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the PARENT is cancelled (a real shutdown)
+	sink := manifestSink{stubSink: stubSink{name: "t"}, manifest: manifestOf(hashOf("a"))}
+	rep, err := AuditInventory(ctx, led, []Target{{Sink: sink}})
 	if err != nil {
-		t.Fatalf("a cancellation must not be a per-target sweep fault, got %v", err)
+		t.Fatalf("a shutdown must not be a per-target sweep fault, got %v", err)
 	}
 	if a := rep.Targets[0]; !a.Unverifiable || !a.NoData || a.Err != nil || a.Failed() {
-		t.Fatalf("a cancelled read must be benign (unverifiable+NoData, no fault), got %+v", a)
+		t.Fatalf("a shutdown must be benign (unverifiable+NoData, no fault, not failing), got %+v", a)
+	}
+	if rep.FailErr() != nil {
+		t.Fatalf("a shutdown-cancelled audit must not fail via the inventory verdict (the top-level ctx.Err() fold handles it), got %v", rep.FailErr())
 	}
 }
 

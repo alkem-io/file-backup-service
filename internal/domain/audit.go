@@ -14,9 +14,11 @@ import (
 // network RTT — e.g. an S3 StatObject HEAD — so a serial sweep is RTT-bound).
 const auditConcurrency = 16
 
-// auditProbeTimeout bounds one Exists probe so a black-holing backend can't stall the whole
-// integrity check (audit runs under signalContext, which has no deadline of its own).
-const auditProbeTimeout = 30 * time.Second
+// auditProbeTimeout bounds one probe (an Exists probe, or a per-target inventory fetch/read) so a
+// black-holing backend can't stall the whole integrity check (audit runs under signalContext, which
+// has no deadline of its own). A var (not const) only so tests can lower it to exercise the
+// per-target-timeout path without a 30s wait.
+var auditProbeTimeout = 30 * time.Second
 
 // TargetAudit is one target's audit outcome.
 type TargetAudit struct {

@@ -134,14 +134,14 @@ func auditInventoryTarget(ctx context.Context, led Ledger, t Target) (a Inventor
 	}
 	rc, err := fetchLatestManifest(tctx, ir)
 	if err != nil {
-		classifyInventoryErr(&a, name, err)
+		classifyInventoryErr(ctx, &a, name, err)
 		return a
 	}
 	defer func() { _ = rc.Close() }()
 
 	extra, missing, msize, merr := mergeInventory(manifestIterator(tctx, rc), ledgerStoredIterator(tctx, led, name))
 	if merr != nil {
-		classifyInventoryErr(&a, name, merr)
+		classifyInventoryErr(ctx, &a, name, merr)
 		return a
 	}
 	a.Extra, a.Missing, a.ManifestSize = extra, missing, msize
@@ -151,27 +151,30 @@ func auditInventoryTarget(ctx context.Context, led Ledger, t Target) (a Inventor
 
 // classifyInventoryErr folds a manifest fetch/read/diff error into the target's result — the ONE
 // classifier for BOTH the fetch and the merge paths, so the two can't diverge on what "corrupt" vs
-// "unverifiable" vs "cancelled" means:
+// "unverifiable" vs "cancelled" means. parentCtx is the AUDIT's ctx (NOT the per-target child), so a
+// real shutdown is told apart from a per-target probe timeout:
 //   - os.ErrNotExist → NoData (no manifest yet) — benign.
-//   - context.Canceled / DeadlineExceeded → benign this pass: a real shutdown is surfaced by the
-//     audit's top-level ctx.Err() fold, not a spurious per-target fault, and a per-target probe
-//     deadline just means "couldn't finish this pass".
+//   - the PARENT ctx is cancelled (a real SIGTERM — cancelledInFlight) → benign this pass; the
+//     audit's top-level ctx.Err() fold surfaces the abort, not a spurious per-target fault.
 //   - errCorruptManifest (a JSON parse error, bufio.ErrTooLong, or a non-ascending key) → a FAULT.
 //   - errLedgerRead (a genuine DB error) → a FAULT.
-//   - anything else (a read-denying credential, a transient mid-stream manifest read reset) →
-//     unverifiable (benign; a non-worm target's broken read path fails, per the unified policy).
-func classifyInventoryErr(a *InventoryAudit, name string, err error) {
+//   - anything else — a per-target probe DEADLINE (a wedged/black-holing target: DeadlineExceeded
+//     while the parent is STILL LIVE), a read-denying credential, or a transient read reset →
+//     Unverifiable with NoData=FALSE, so a non-worm target's wedged/broken read path FAILS the audit
+//     (an incomplete integrity check must not read green; the parent has no deadline, so the fold
+//     alone would let a 30s black-hole pass).
+func classifyInventoryErr(parentCtx context.Context, a *InventoryAudit, name string, err error) {
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		a.Unverifiable, a.NoData, a.Detail = true, true, "no manifest written yet (nothing to diff)"
-	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
-		a.Unverifiable, a.NoData, a.Detail = true, true, fmt.Sprintf("aborted mid-check (cancelled/deadline): %v", err)
+	case cancelledInFlight(parentCtx, err):
+		a.Unverifiable, a.NoData, a.Detail = true, true, fmt.Sprintf("aborted by shutdown: %v", err)
 	case errors.Is(err, errCorruptManifest):
 		a.Err = fmt.Errorf("manifest for %s: %w", name, err)
 	case errors.Is(err, errLedgerRead):
 		a.Err = fmt.Errorf("inventory diff for %s: %w", name, err)
 	default:
-		a.Unverifiable, a.Detail = true, fmt.Sprintf("manifest unreadable (read-denying credential or transient read fault): %v", err)
+		a.Unverifiable, a.Detail = true, fmt.Sprintf("manifest unverifiable (wedged/read-denying/transient): %v", err)
 	}
 }
 
