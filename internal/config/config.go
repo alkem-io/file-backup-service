@@ -14,6 +14,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -131,8 +132,16 @@ type Config struct {
 	ScratchDir string `yaml:"scratchDir"`
 }
 
-// PerObjectTimeout is the per-object backup deadline.
+// PerObjectTimeout is the per-object backup deadline. It returns 0 for a non-positive value OR one
+// so large that PerObjectTimeoutSec*time.Second would OVERFLOW int64 nanoseconds and wrap to a
+// positive near-instant (or negative) deadline — the single-object DR read paths (cmd's sourceOp /
+// restore current) do NOT run validateLimits, so a hostile/absurd perObjectTimeoutSec must degrade to
+// "use the default" (via domain.NormalizePerObjectTimeout downstream), never to an instant-expiry
+// deadline that fails every restore. A 0 return signals the caller to floor to the default.
 func (c *Config) PerObjectTimeout() time.Duration {
+	if c.PerObjectTimeoutSec <= 0 || int64(c.PerObjectTimeoutSec) > math.MaxInt64/int64(time.Second) {
+		return 0
+	}
 	return time.Duration(c.PerObjectTimeoutSec) * time.Second
 }
 
@@ -505,6 +514,17 @@ func (c *Config) validateLimits() error {
 }
 
 func validateTarget(i int, t Target, seen map[string]string) error {
+	if err := validateTargetName(i, t, seen); err != nil {
+		return err
+	}
+	return ValidateTargetFields(t)
+}
+
+// validateTargetName checks a target's NAME + the set-wide env-token collision guard (seen
+// accumulates the tokens seen so far). Split from the field validation so a single-source DR op can
+// run the collision guard over the whole set (a sibling must not have injected the chosen target's
+// secret) WITHOUT validating every other target's fields (Pillar 4c).
+func validateTargetName(i int, t Target, seen map[string]string) error {
 	if t.Name == "" {
 		return fmt.Errorf("target[%d]: name is required", i)
 	}
@@ -525,6 +545,14 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 		return fmt.Errorf("targets %q and %q collide on env-var namespace FBS_TARGET_%s_*", prev, t.Name, tok)
 	}
 	seen[tok] = t.Name
+	return nil
+}
+
+// ValidateTargetFields validates ONE target's structural fields (type, per-type required fields,
+// codec) independently of the set — the exported half the single-source DR build path uses so it can
+// validate + build ONLY the chosen target and not be blocked by an unrelated target's misconfig
+// (Pillar 4c).
+func ValidateTargetFields(t Target) error {
 	f, ok := targetFactories[t.Type]
 	if !ok {
 		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
@@ -536,6 +564,46 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 		return fmt.Errorf("target %q: %w", t.Name, err)
 	}
 	return nil
+}
+
+// CheckTargetCollisions validates only that at least one target exists and that no two target names
+// collide on the FBS_TARGET_<TOKEN>_* env namespace — the set-wide guard a single-source DR read runs
+// (so a sibling target can't have injected the chosen target's secret) WITHOUT validating every
+// target's fields. Returns nil for a well-named set.
+func (c *Config) CheckTargetCollisions() error {
+	if len(c.Targets) == 0 {
+		return errors.New("at least one target is required")
+	}
+	seen := make(map[string]string, len(c.Targets))
+	for i, t := range c.Targets {
+		if err := validateTargetName(i, t, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SelectReadTarget resolves which configured target a READ op (restore/verify/drill) should use: the
+// named `from` (honored as given — a WORM target IS allowed for an EXPLICIT choice, per Pillar 4b:
+// restoring from the SOLE surviving immutable copy must not be refused; a read-deny then surfaces as
+// a clear error), or, when `from` is empty, the FIRST readable (non-WORM) target — all readable
+// targets are symmetric holders of the same content. It resolves off the CONFIG (names + Worm flags),
+// so no sink is built for a target the op doesn't use (Pillar 4c).
+func SelectReadTarget(targets []Target, from string) (Target, error) {
+	if from != "" {
+		for _, t := range targets {
+			if t.Name == from {
+				return t, nil // explicit choice honored, incl. a WORM target
+			}
+		}
+		return Target{}, fmt.Errorf("target %q not found in config", from)
+	}
+	for _, t := range targets {
+		if !t.Worm {
+			return t, nil
+		}
+	}
+	return Target{}, errors.New("no readable (non-WORM) target configured by default — restore/drill needs a target it can read; name a WORM/immutable copy explicitly via --from to attempt an admin-credential read")
 }
 
 // validateS3Target checks the s3-specific required fields (split out of validateTarget to

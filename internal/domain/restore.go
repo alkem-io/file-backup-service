@@ -107,7 +107,7 @@ type RestoreAllStats struct {
 // per-object failure is counted and the pass continues; ctx cancellation stops it (a re-run
 // resumes from where it left off). concurrency<=0 floors to 1.
 func RestoreAll(ctx context.Context, led Ledger, src Sink, targetName, destDir string, concurrency int, perObjectTimeout time.Duration) (RestoreAllStats, error) {
-	perObjectTimeout = normalizePerObjectTimeout(perObjectTimeout)
+	perObjectTimeout = NormalizePerObjectTimeout(perObjectTimeout)
 	var st RestoreAllStats
 	var mu sync.Mutex
 	err := runBoundedPaced(ctx, concurrency, 0,

@@ -179,20 +179,24 @@ read the **ledger** to enumerate/sample objects; `restore current` needs the
 explicit `--hash` (a hash recovered from a DB point-in-time restore), which skips
 the lookup and needs only the target.
 
-**Read source (`--from`) must be readable.** For any read op (`restore`/`drill`) the
-`--from` target must be one the worker can **read**. A **WORM/PutObject-only** target
-(`worm: true`) is write-only and is **rejected loud** — whether named explicitly or
-picked as the default. With `--from` omitted, the default is the **first readable
-(non-WORM)** target. (Note: the infra-ops restore-drill CronJob ships `--from offsite`
-where `offsite` is the WORM copy — on un-suspend, point it at a readable target; the
-WORM copy's integrity is covered by `filebackup_immutability_ok` + `audit`.)
+**Read source (`--from`): default skips WORM, explicit WORM is allowed.** For a read op
+(`restore`/`drill`) with `--from` **omitted**, the default is the **first readable
+(non-WORM)** target. An **explicitly named** WORM/PutObject-only target (`worm: true`) is
+**attempted**, not refused — so a restore from the *sole surviving immutable copy*, using
+an admin/read-capable credential, is possible in a real DR. If the worker's write-only
+credential 403s, the read fails with a clear, actionable error (recover via a readable
+target, or supply the immutable copy's read-capable credential). Only the **one chosen
+source sink** is built — an unrelated misconfigured target can't block the op. (Note: the
+infra-ops restore-drill CronJob ships `--from offsite` where `offsite` is the WORM copy —
+on un-suspend, point it at a readable target; the WORM copy's integrity is covered by
+`filebackup_immutability_ok` + `audit`.)
 
 ### Subcommand flags (DR + ops)
 
 | Subcommand | Flags |
 |---|---|
 | `restore object` (or bare `restore`) | `--hash <externalID>` `--from <target>` `--to <dir>` (default `/storage`) |
-| `restore all` | `--from <target>` (default: first readable target) `--to <dir>` `--concurrency N` (default: `concurrency`) |
+| `restore all` | `--from <target>` (default: first readable target) `--to <dir>` `--concurrency N` (default: `concurrency`). Fails loud on **0 objects enumerated** (empty/wrong source); 0-restored-but-N-skipped (an idempotent re-run) stays success. |
 | `restore current` | `--file-id <uuid>` `--at <RFC3339>` `[--hash <externalID>]` `[--from <target>]` `[--to <dir>]` |
 | `verify` | `--hash <externalID>` `--from <target>` |
 | `audit` | `--sample N` (0 = all) `--inventory` (also run target→ledger + report WORM drift) |
@@ -227,6 +231,17 @@ restore + hash-verify (so a failing Job trips `kube_job_status_failed`). Because
 process is short-lived, set `--metrics-file` (or `FBS_DRILL_METRICS_FILE`) to a
 node-exporter textfile-collector path to also export
 `filebackup_restore_drill_pass` + `filebackup_drill_last_success_timestamp_seconds`.
+An **interrupted** drill (SIGTERM) writes **no** gauges — it neither records a red
+`restore_drill_pass=0` nor clobbers the prior `last_success` — so a clean shutdown
+can't page a week-long false failure; the exit code (nonzero) still reflects the abort.
+
+**Immutability drift signal.** `filebackup_immutability_ok{target}` is 1 (verified) / 0
+(drift), emitted only for a WORM target **verified this pass**. A target that turns
+**unverifiable** (a credential rotated to write-only, a wedged endpoint) has its `_ok`
+series **dropped** — never frozen stale-green — and raises
+`filebackup_immutability_unverifiable{target}=1` instead, so a later real drift can't be
+masked; alert on `_unverifiable == 1` sustained. A structurally-unreadable target (a
+filesystem WORM with no bucket object-lock) drops its series and raises no signal.
 
 ---
 

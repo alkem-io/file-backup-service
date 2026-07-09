@@ -544,31 +544,6 @@ func callWithCtx(ctx context.Context, fn func() error) error {
 		func(r any) error { return PanicErr("sink op", r) })
 }
 
-// RunAbandonableCleanup is RunAbandonable for a fn whose result OWNS a resource that must be
-// released even when the call is ABANDONED on ctx cancellation (e.g. an io.ReadCloser): on cancel
-// it returns onCancel() and, in a detached goroutine, waits for the abandoned fn's LATE result and
-// passes it to cleanup so the resource is freed — no leak. On the happy path cleanup is NOT called
-// (the caller owns the returned result). A panic in fn is mapped by onPanic. Built on the same
-// buffered-chan abandon primitive as RunAbandonable rather than a hand-rolled fork.
-func RunAbandonableCleanup[T any](ctx context.Context, fn func() T, onCancel func() T, onPanic func(recovered any) T, cleanup func(T)) T {
-	ch := make(chan T, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ch <- onPanic(r)
-			}
-		}()
-		ch <- fn()
-	}()
-	select {
-	case <-ctx.Done():
-		go func() { cleanup(<-ch) }() // free the abandoned fn's late-produced resource
-		return onCancel()
-	case res := <-ch:
-		return res
-	}
-}
-
 // storeWithCtx runs Sink.Store honoring ctx even when the sink cannot (a filesystem sink blocked
 // in a hung fsync/write on a wedged mount Go cannot interrupt by closing the fd): on ctx
 // cancellation it returns the ctx error and abandons the inner Store goroutine so wg.Wait / the

@@ -17,23 +17,25 @@ type DrillFailure struct {
 
 // DrillOutcome is a restore-drill result: it proves the end-to-end RESTORE PROCEDURE (fetch →
 // decode → hash-verify → write to disk), not just byte existence, for a random sample of the
-// objects the ledger records stored on the drilled target (FR-024/SC-009/T033).
+// objects the ledger records stored on the drilled target (FR-024/SC-009/T033). Only the two
+// INDEPENDENTLY-observed outcomes are stored (Passed, Failed); Checked is DERIVED, so no stored
+// field can drift out of lock-step with a counter that is actually recorded. A cancellation is
+// counted in NEITHER — the sweep surfaces an interruption as its returned error.
 type DrillOutcome struct {
 	Target   string
-	Checked  int // objects drilled (pass + GENUINE fail); a cancellation is NOT counted
+	Passed   int // objects that restored + hash-matched
 	Failed   int // GENUINE restore/verify failures (a real DR problem)
 	Failures []DrillFailure
 }
 
-// Passed is the count of objects that restored + hash-matched — derived (Checked − Failed), not
-// stored, so it can't drift out of lock-step with the two counters that are actually recorded.
-func (o DrillOutcome) Passed() int { return o.Checked - o.Failed }
+// Checked is the number of objects actually drilled — DERIVED (Passed + Failed), not stored.
+func (o DrillOutcome) Checked() int { return o.Passed + o.Failed }
 
 // Pass reports whether the drill PROVED the restore procedure: at least one object was drilled AND
 // none failed. A 0-checked drill is NOT a pass — it proved nothing, and a 0-count is itself a
 // SIGNAL (a renamed/misconfigured target, or an empty/wrong ledger, yields no sampled rows), so it
 // must not read green and mask that; the caller surfaces it as a distinct failure.
-func (o DrillOutcome) Pass() bool { return o.Checked > 0 && o.Failed == 0 }
+func (o DrillOutcome) Pass() bool { return o.Checked() > 0 && o.Failed == 0 }
 
 // Drill samples up to `sample` objects the ledger records stored on src's target (a random band,
 // so successive weekly drills cover different objects — sample<=0 drills every stored object) and,
@@ -46,7 +48,7 @@ func (o DrillOutcome) Pass() bool { return o.Checked > 0 && o.Failed == 0 }
 // run. Each object is bounded by perObjectTimeout. Returns the outcome; a non-nil error is an
 // enumeration failure OR a cancellation (an interrupted drill — the caller must not read it green).
 func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir string, sample int, perObjectTimeout time.Duration) (DrillOutcome, error) {
-	perObjectTimeout = normalizePerObjectTimeout(perObjectTimeout)
+	perObjectTimeout = NormalizePerObjectTimeout(perObjectTimeout)
 	out := DrillOutcome{Target: targetName}
 	var mu sync.Mutex
 	err := runBoundedPaced(ctx, 1, 0,
@@ -80,11 +82,12 @@ func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectT
 	if cancelledInFlight(ctx, err) {
 		return // interrupted mid-object — the sweep's cancellation error surfaces it, not a Failed count
 	}
-	out.Checked++
 	if err != nil {
 		out.Failed++
 		out.Failures = append(out.Failures, DrillFailure{Hash: hash, Err: err})
+		return
 	}
+	out.Passed++
 }
 
 // streamSampledStored yields up to `sample` externalIDs the ledger records stored on target, drawn

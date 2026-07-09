@@ -160,26 +160,29 @@ func TestIntegrationAuditInventory(t *testing.T) {
 	cfgPath, _, name, hashes, _ := seedBackedUp(t, 3, time.Now().Add(-time.Hour))
 
 	// Write a manifest snapshot to the target (serve does this periodically; do it directly here).
-	_, ledger, pool, targets, err := ledgerJob(ctx, cfgPath)
+	cfg, ledger, pool, err := ledgerJob(ctx, cfgPath)
 	if err != nil {
 		t.Fatalf("ledgerJob: %v", err)
+	}
+	targets, err := buildTargets(cfg.Targets)
+	if err != nil {
+		pool.Close()
+		t.Fatalf("buildTargets: %v", err)
 	}
 	if err := domain.WriteManifests(ctx, ledger, targets, domain.ManifestName(time.Now())); err != nil {
 		pool.Close()
 		t.Fatalf("write manifest: %v", err)
 	}
-	// Assert the target was actually VERIFIABLE (read its manifest) with no drift — not a
-	// vacuous unverifiable no-op that a bare nil check would also accept.
-	rep, err := domain.AuditInventory(ctx, ledger, targets)
+	// Assert the target was actually VERIFIED (read its manifest + diffed) with no drift — not a
+	// vacuous NoData/unverifiable no-op that a bare nil check would also accept.
+	rep := domain.AuditInventory(ctx, ledger, targets)
 	pool.Close()
-	if err != nil {
-		t.Fatalf("AuditInventory: %v", err)
+	v := rep.Targets[0]
+	if v.Status != domain.StatusVerified {
+		t.Fatalf("the target must be VERIFIED (its manifest read + diffed), got %+v", v)
 	}
-	if rep.Targets[0].Unverifiable {
-		t.Fatalf("the target must be VERIFIABLE (its manifest read + diffed), got %+v", rep.Targets[0])
-	}
-	if rep.Targets[0].Extra != 0 || rep.Targets[0].ManifestSize != 3 {
-		t.Fatalf("a matching manifest must show extra=0 over 3 objects, got %+v", rep.Targets[0])
+	if v.Extra != 0 || !strings.Contains(v.Detail, "manifest=3") {
+		t.Fatalf("a matching manifest must show extra=0 over 3 objects, got %+v", v)
 	}
 	if err := runAudit([]string{"--config", cfgPath, "--inventory"}); err != nil {
 		t.Fatalf("audit --inventory after a matching manifest must be clean, got %v", err)

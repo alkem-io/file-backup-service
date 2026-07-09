@@ -57,7 +57,7 @@ func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration,
 	// already-expired deadline, failing EVERY object immediately (a silent total-reconcile
 	// outage). Production callers pass a config-validated value, but these constructors are
 	// exported and directly callable, so floor it to a sane default rather than trust the caller.
-	perObjectTimeout = normalizePerObjectTimeout(perObjectTimeout)
+	perObjectTimeout = NormalizePerObjectTimeout(perObjectTimeout)
 	byName := make(map[string]Target, len(targets))
 	for _, t := range targets {
 		byName[t.Sink.Name()] = t

@@ -48,12 +48,16 @@ func bump(mu *sync.Mutex, counter *int) {
 
 // cancelledInFlight reports whether a per-object sweep error is a benign in-flight CANCELLATION
 // (the parent sweep ctx was cancelled — a SIGTERM aborted this object) rather than a GENUINE
-// failure. A per-object TIMEOUT while the parent ctx is still live (a slow/wedged source) is
-// GENUINE, not a cancellation — only the PARENT being cancelled is a shutdown. The ONE owner of
-// the cancel-vs-genuine distinction shared by restore-all + drill, so an interrupted DR sweep never
-// records a spurious "object failed" while a real failure that coincides with a SIGTERM still counts.
+// failure. The error MUST itself be a context.Canceled (the shutdown propagating through the
+// per-object ctx) AND the parent ctx MUST be cancelled: keying on `err != nil && parentCtx.Err()`
+// alone mis-buckets a GENUINE failure (a hash mismatch, a per-object DeadlineExceeded) that merely
+// COINCIDES with a SIGTERM as "cancelled", so `restore all` / `drill` would exit 0 on real
+// corruption. A per-object TIMEOUT while the parent is live (a slow/wedged source) is
+// DeadlineExceeded, not Canceled, so it correctly stays a genuine failure. The ONE owner of the
+// cancel-vs-genuine distinction shared by the restore-all + drill sweeps and the audit-direction
+// error classifiers.
 func cancelledInFlight(parentCtx context.Context, objErr error) bool {
-	return objErr != nil && parentCtx.Err() != nil
+	return errors.Is(objErr, context.Canceled) && parentCtx.Err() != nil
 }
 
 // runBoundedPaced dispatches each item `enumerate` yields to `work`, at up to `concurrency`
@@ -126,8 +130,8 @@ type Backfiller struct {
 // per-object fetch/store latency instead of running 1-at-a-time.
 func NewBackfiller(corpus CorpusEnumerator, p *Pipeline, perObjectTimeout time.Duration, concurrency int) *Backfiller {
 	// Floor a non-positive perObjectTimeout so backupOne's context.WithTimeout can't produce an
-	// already-expired deadline that fails every object (see normalizePerObjectTimeout).
-	return &Backfiller{corpus: corpus, p: p, perObjectT: normalizePerObjectTimeout(perObjectTimeout), concurrency: concurrency}
+	// already-expired deadline that fails every object (see NormalizePerObjectTimeout).
+	return &Backfiller{corpus: corpus, p: p, perObjectT: NormalizePerObjectTimeout(perObjectTimeout), concurrency: concurrency}
 }
 
 // defaultPerObjectTimeout is the fallback the sweep constructors floor a non-positive
@@ -135,10 +139,13 @@ func NewBackfiller(corpus CorpusEnumerator, p *Pipeline, perObjectTimeout time.D
 // caller that skips config validation still gets a sane bound instead of an all-fail pass.
 const defaultPerObjectTimeout = 30 * time.Minute
 
-// normalizePerObjectTimeout floors a non-positive per-object timeout to defaultPerObjectTimeout
-// so context.WithTimeout never yields an already-expired deadline. One owner, shared by
-// NewBackfiller and NewReconciler.
-func normalizePerObjectTimeout(d time.Duration) time.Duration {
+// NormalizePerObjectTimeout floors a non-positive per-object timeout to defaultPerObjectTimeout so
+// context.WithTimeout never yields an already-expired (or, via a config overflow that degraded to 0,
+// near-instant) deadline that would fail every object. The ONE owner of that floor, shared by the
+// batch sweeps (NewBackfiller / NewReconciler), the DR sweeps (Drill / RestoreAll), and the CLI's
+// single-object DR path (cmd's boundedRestoreCtx) — so no path can hand context.WithTimeout a bad
+// bound.
+func NormalizePerObjectTimeout(d time.Duration) time.Duration {
 	if d <= 0 {
 		return defaultPerObjectTimeout
 	}

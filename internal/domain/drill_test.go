@@ -40,7 +40,7 @@ func TestDrillAllPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Checked != 5 || out.Passed() != 5 || out.Failed != 0 || !out.Pass() {
+	if out.Checked() != 5 || out.Passed != 5 || out.Failed != 0 || !out.Pass() {
 		t.Fatalf("want checked=5 passed=5 failed=0 pass, got %+v", out)
 	}
 	// The drill removes each restored file — scratch must be empty after (bounded disk).
@@ -61,7 +61,7 @@ func TestDrillDetectsCorruptObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Failed != 1 || out.Passed() != 2 || out.Pass() {
+	if out.Failed != 1 || out.Passed != 2 || out.Pass() {
 		t.Fatalf("want failed=1 passed=2 !pass, got %+v", out)
 	}
 	if len(out.Failures) != 1 || out.Failures[0].Hash != hashes[1] {
@@ -77,7 +77,7 @@ func TestDrillZeroCheckedIsNotPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Checked != 0 {
+	if out.Checked() != 0 {
 		t.Fatalf("an empty target must sample 0, got %+v", out)
 	}
 	if out.Pass() {
@@ -93,8 +93,8 @@ func TestDrillHonoursSample(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Checked != 5 {
-		t.Fatalf("a --sample of 5 must drill exactly 5 objects, got %d", out.Checked)
+	if out.Checked() != 5 {
+		t.Fatalf("a --sample of 5 must drill exactly 5 objects, got %d", out.Checked())
 	}
 }
 
@@ -171,7 +171,7 @@ func TestDrillContainsPoisonObject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a contained poison object must not abort the drill, got %v", err)
 	}
-	if out.Checked != 1 || out.Failed != 1 || out.Pass() {
+	if out.Checked() != 1 || out.Failed != 1 || out.Pass() {
 		t.Fatalf("a panicking-Fetch object must be one contained failure, got %+v", out)
 	}
 }

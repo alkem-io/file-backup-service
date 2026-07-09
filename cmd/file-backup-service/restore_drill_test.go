@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alkem-io/file-backup-service/internal/config"
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
@@ -39,31 +40,61 @@ func TestRestoreAllVerdict(t *testing.T) {
 	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5}, nil); err != nil {
 		t.Fatalf("a clean run must return nil, got %v", err)
 	}
+	// 0 objects enumerated on a clean pass (empty/wrong source) → fail (Pillar 4d), like drill's 0-sampled.
+	if err := restoreAllVerdict(domain.RestoreAllStats{}, nil); err == nil ||
+		!strings.Contains(err.Error(), "enumerated 0") {
+		t.Fatalf("a 0-enumerated restore-all must fail loud, got %v", err)
+	}
+	// 0 restored but N skipped (an idempotent re-run) stays success.
+	if err := restoreAllVerdict(domain.RestoreAllStats{Skipped: 3}, nil); err != nil {
+		t.Fatalf("a 0-restored-but-skipped run must stay success, got %v", err)
+	}
 }
 
-// TestPickReadableTarget (review Cluster 5): the default source SKIPS WORM (write-only) targets;
-// an explicit WORM --from is rejected loud; an all-WORM config has no readable source.
-func TestPickReadableTarget(t *testing.T) {
-	worm := domain.Target{Sink: &fakeSink{name: "offsite"}, Worm: true}
-	readable := domain.Target{Sink: &fakeSink{name: "local"}}
+// TestSelectReadTarget (Pillar 4b): the default source SKIPS WORM (write-only) targets; an EXPLICIT
+// WORM --from is now ALLOWED (restoring from the sole surviving immutable copy must not be refused);
+// an all-WORM config has no default readable source; an unknown --from is not-found.
+func TestSelectReadTarget(t *testing.T) {
+	worm := config.Target{Name: "offsite", Worm: true}
+	readable := config.Target{Name: "local"}
 	// default (--from "") skips the WORM target, picks the readable one.
-	if _, name, err := pickReadableTarget([]domain.Target{worm, readable}, ""); err != nil || name != "local" {
-		t.Fatalf("default must pick the readable target, got %q err=%v", name, err)
+	if got, err := config.SelectReadTarget([]config.Target{worm, readable}, ""); err != nil || got.Name != "local" {
+		t.Fatalf("default must pick the readable target, got %q err=%v", got.Name, err)
 	}
-	// explicit WORM --from → rejected.
-	if _, _, err := pickReadableTarget([]domain.Target{worm, readable}, "offsite"); err == nil ||
-		!strings.Contains(err.Error(), "write-only") {
-		t.Fatalf("an explicit WORM --from must be rejected, got %v", err)
+	// explicit WORM --from → ALLOWED (honored as chosen).
+	if got, err := config.SelectReadTarget([]config.Target{worm, readable}, "offsite"); err != nil || got.Name != "offsite" || !got.Worm {
+		t.Fatalf("an explicit WORM --from must be allowed, got %+v err=%v", got, err)
 	}
-	// all-WORM config → no readable source.
-	if _, _, err := pickReadableTarget([]domain.Target{worm}, ""); err == nil ||
+	// all-WORM config, default → no readable source.
+	if _, err := config.SelectReadTarget([]config.Target{worm}, ""); err == nil ||
 		!strings.Contains(err.Error(), "no readable") {
-		t.Fatalf("an all-WORM config must fail loud, got %v", err)
+		t.Fatalf("an all-WORM config default must fail loud, got %v", err)
 	}
 	// unknown --from → not found.
-	if _, _, err := pickReadableTarget([]domain.Target{readable}, "nope"); err == nil ||
+	if _, err := config.SelectReadTarget([]config.Target{readable}, "nope"); err == nil ||
 		!strings.Contains(err.Error(), "not found") {
 		t.Fatalf("an unknown --from must be not-found, got %v", err)
+	}
+}
+
+// TestBuildReadSourceWormAnnotatesFetch (Pillar 4b): an EXPLICIT WORM source is built + wrapped so a
+// read failure carries the actionable WORM-recovery hint (rather than a raw error).
+func TestBuildReadSourceWormAnnotatesFetch(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeConfig(t, dir,
+		"targets:\n  - name: offsite\n    type: filesystem\n    worm: true\n    path: "+filepath.Join(dir, "store")+"\n")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	src, name, err := buildReadSource(cfg, "offsite")
+	if err != nil || name != "offsite" {
+		t.Fatalf("an explicit WORM --from must build, got %q err=%v", name, err)
+	}
+	// A Fetch of a never-stored object fails; the error must carry the WORM recovery hint.
+	if _, ferr := src.Fetch(context.Background(), sha3hex([]byte("absent"))); ferr == nil ||
+		!strings.Contains(ferr.Error(), "WORM/write-only") {
+		t.Fatalf("a WORM source read failure must be annotated, got %v", ferr)
 	}
 }
 
@@ -192,6 +223,15 @@ func TestRunRestoreVersionHashDefaultsToFirstTarget(t *testing.T) {
 
 // ---- config-error paths of the ledger-backed restore/drill subcommands ----
 // Each fails on ValidateDR (fsConfig has no ledgerDB) BEFORE opening a pool.
+
+// TestRunRestoreVersionVerbRenamed: the old `restore version` verb errors loud pointing at
+// `restore current` (Pillar 7), rather than silently falling through to the bare-hash alias.
+func TestRunRestoreVersionVerbRenamed(t *testing.T) {
+	err := runRestore([]string{"version", "--file-id", "x", "--at", "y"})
+	if err == nil || !strings.Contains(err.Error(), "renamed to `restore current`") {
+		t.Fatalf("`restore version` must error pointing at `restore current`, got %v", err)
+	}
+}
 
 func TestRunRestoreAllInvalidConfig(t *testing.T) {
 	// fsConfig has a target but no ledgerDB → ledgerJob's ValidateDR fails before any pool opens.
