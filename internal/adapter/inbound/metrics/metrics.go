@@ -118,6 +118,13 @@ func (m *Metrics) SetImmutabilityOK(target string, ok bool) {
 	m.immutabilityOK.WithLabelValues(target).Set(b2f(ok))
 }
 
+// ClearImmutabilityOK removes target's drift series (used when it becomes unverifiable), so a
+// formerly-green target that turns unreadable drops to NO series rather than freezing stale at 1.
+// Deleting an absent series is a no-op, so an always-unverifiable target simply never appears.
+func (m *Metrics) ClearImmutabilityOK(target string) {
+	m.immutabilityOK.DeleteLabelValues(target)
+}
+
 // b2f maps a bool to the Prometheus 1/0 gauge convention.
 func b2f(b bool) float64 {
 	if b {

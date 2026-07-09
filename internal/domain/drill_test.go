@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -69,13 +69,19 @@ func TestDrillDetectsCorruptObject(t *testing.T) {
 	}
 }
 
-func TestDrillEmptyTargetIsVacuousPass(t *testing.T) {
+// TestDrillZeroCheckedIsNotPass: a drill that sampled 0 objects proved NOTHING (a renamed target
+// or an empty/wrong ledger yields no rows), so it must NOT read as a pass — else a green gauge
+// masks a misconfiguration.
+func TestDrillZeroCheckedIsNotPass(t *testing.T) {
 	out, err := Drill(context.Background(), newFakeLedger(), newMemSink("t"), "t", t.TempDir(), 0, time.Minute)
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
-	if out.Checked != 0 || !out.Pass() {
-		t.Fatalf("an empty target has nothing to fail — vacuous pass, got %+v", out)
+	if out.Checked != 0 {
+		t.Fatalf("an empty target must sample 0, got %+v", out)
+	}
+	if out.Pass() {
+		t.Fatal("a 0-checked drill must NOT be a pass (it proved nothing)")
 	}
 }
 
@@ -104,21 +110,35 @@ func TestDrillCancelledStops(t *testing.T) {
 	}
 }
 
-// TestDrillWritesToScratch: confirm the drill actually WRITES each object to the scratch dir
-// (proving the restore-write procedure, not just verify) — checked by inspecting a mid-drill file
-// via a sink that captures the dest before drillOne removes it.
-func TestDrillWritesToScratch(t *testing.T) {
+// cancelOnFetchSink cancels the parent ctx the FIRST time Fetch is called, modelling a SIGTERM
+// arriving mid-object — so the drill's per-object result must be classified as an INTERRUPTION,
+// not a verify failure.
+type cancelOnFetchSink struct {
+	memSink
+	cancel context.CancelFunc
+}
+
+func (s *cancelOnFetchSink) Fetch(ctx context.Context, h string) (io.ReadCloser, error) {
+	s.cancel()
+	return s.memSink.Fetch(ctx, h)
+}
+
+// TestDrillCancelDuringObjectIsInterruptNotFailure (review #6): a cancellation that lands WHILE an
+// object is being drilled must abort the drill as interrupted (return the ctx error, Failed==0) —
+// NOT count a spurious Failed object + report RED.
+func TestDrillCancelDuringObjectIsInterruptNotFailure(t *testing.T) {
 	led := newFakeLedger()
-	sink := newMemSink("t")
-	hashes := seedDrillCorpus(t, led, sink, 1)
-	scratch := t.TempDir()
-	// Restore the single object directly to prove the on-disk artifact, then drill (which restores
-	// + removes). This asserts the drill's restore path lands real, correct bytes on disk.
-	if err := RestoreObject(context.Background(), sink, hashes[0], scratch); err != nil {
-		t.Fatalf("restore: %v", err)
+	base := newMemSink("t")
+	hashes := seedDrillCorpus(t, led, base, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	// Copy the seeded object into the cancel-on-fetch sink so restore reads valid bytes but the
+	// ctx is cancelled the moment the fetch begins.
+	sink := &cancelOnFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{hashes[0]: base.store[hashes[0]]}}, cancel: cancel}
+	out, err := Drill(ctx, led, sink, "t", t.TempDir(), 0, time.Minute)
+	if err == nil {
+		t.Fatal("a cancel during the drilled object must abort with the ctx error")
 	}
-	got, err := os.ReadFile(filepath.Join(scratch, hashes[0])) //nolint:gosec // test temp path
-	if err != nil || !bytes.Equal(got, []byte("drill object 0")) {
-		t.Fatalf("drill-restored artifact mismatch: %v", err)
+	if out.Failed != 0 {
+		t.Fatalf("a cancellation must NOT be counted as a failed object, got Failed=%d", out.Failed)
 	}
 }

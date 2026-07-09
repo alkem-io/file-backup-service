@@ -83,8 +83,9 @@ every field, env var, default, and constraint — is in
   node-exporter textfile-collector convention); its primary signal is the exit code
   (a failing drill Job trips `kube_job_status_failed`, like the audit job).
 - **Restore a past version (`restore version`):** the live `file` table holds only
-  each file's *current* version, so `--at` is best-effort — if the current version
-  became live at/before `--at` it is restored, otherwise you must recover the
+  each file's *current* version, resolved by its **last-modified** time
+  (`updatedDate`). It **fails loud** (never guesses): if the current version was
+  last-modified after `--at`, or `updatedDate` is NULL, you must recover the
   historical `file.externalID` from a **DB point-in-time restore** and pass it via
   `--hash`. See [`restore-and-ops.md`](../agents-hq/specs/008-continuous-file-backup/contracts/restore-and-ops.md).
 

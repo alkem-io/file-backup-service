@@ -78,14 +78,27 @@ func TestCheckImmutabilityNoCapabilityIsUnverifiable(t *testing.T) {
 	}
 }
 
-// fakeImmGauge records SetImmutabilityOK calls so the sampler's skip-unverifiable POLICY is
-// testable without a live registry.
-type fakeImmGauge struct{ set map[string]bool }
+// fakeImmGauge records SetImmutabilityOK + ClearImmutabilityOK calls so the sampler's
+// emit-verifiable / clear-unverifiable POLICY is testable without a live registry.
+type fakeImmGauge struct {
+	set     map[string]bool
+	cleared map[string]bool
+}
 
-func (g *fakeImmGauge) SetImmutabilityOK(target string, ok bool) { g.set[target] = ok }
+func newFakeImmGauge() *fakeImmGauge {
+	return &fakeImmGauge{set: map[string]bool{}, cleared: map[string]bool{}}
+}
+func (g *fakeImmGauge) SetImmutabilityOK(target string, ok bool) {
+	g.set[target] = ok
+	delete(g.cleared, target)
+}
+func (g *fakeImmGauge) ClearImmutabilityOK(target string) {
+	g.cleared[target] = true
+	delete(g.set, target)
+}
 
 func TestImmutabilitySamplerEmitsOnlyVerifiable(t *testing.T) {
-	g := &fakeImmGauge{set: map[string]bool{}}
+	g := newFakeImmGauge()
 	s := NewImmutabilitySampler([]Target{
 		wormTarget(immSink{stubSink: stubSink{name: "ok"}, lock: true, versioning: true}),
 		wormTarget(immSink{stubSink: stubSink{name: "drift"}, lock: false, versioning: true}),
@@ -104,9 +117,51 @@ func TestImmutabilitySamplerEmitsOnlyVerifiable(t *testing.T) {
 	if _, ok := g.set["denied"]; ok {
 		t.Fatal("a read-denying (unverifiable) target must NOT emit a gauge series (else `== 0` false-fires)")
 	}
+	if !g.cleared["denied"] {
+		t.Fatal("an unverifiable target must CLEAR its series (else a formerly-green target stays stale-green)")
+	}
 	if _, ok := g.set["plain"]; ok {
 		t.Fatal("a non-Worm target must not be sampled")
 	}
+}
+
+// TestImmutabilitySamplerClearsStaleGreen: a target that was verifiable-green then becomes
+// unverifiable must have its series CLEARED on the next pass — not frozen at 1 (which would mask
+// a real drift behind a stale-green gauge).
+func TestImmutabilitySamplerClearsStaleGreen(t *testing.T) {
+	g := newFakeImmGauge()
+	// Pass 1: verifiable + ok → series set to true.
+	ok := &toggleImmSink{stubSink: stubSink{name: "flip"}, lock: true, versioning: true}
+	s := NewImmutabilitySampler([]Target{wormTarget(ok)}, g)
+	if err := s.Sample(context.Background()); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if v, present := g.set["flip"]; !present || !v {
+		t.Fatalf("pass 1 must set the series green, got %v/%v", v, present)
+	}
+	// Pass 2: the target's credential now can't read (unverifiable) → the series must be cleared.
+	ok.err = errors.New("AccessDenied")
+	if err := s.Sample(context.Background()); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if _, present := g.set["flip"]; present {
+		t.Fatal("a now-unverifiable target must NOT keep its green series")
+	}
+	if !g.cleared["flip"] {
+		t.Fatal("a now-unverifiable target's series must be cleared")
+	}
+}
+
+// toggleImmSink is an immSink whose verdict can be flipped between passes (its err set to make it
+// unverifiable).
+type toggleImmSink struct {
+	stubSink
+	lock, versioning bool
+	err              error
+}
+
+func (s *toggleImmSink) CheckImmutability(context.Context) (bool, bool, error) {
+	return s.lock, s.versioning, s.err
 }
 
 func TestImmutabilitySamplerCancelled(t *testing.T) {

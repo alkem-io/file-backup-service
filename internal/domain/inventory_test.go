@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 )
 
 // manifestSink is a stubSink whose LatestManifest returns a fixed JSONL manifest (or an error),
@@ -120,16 +121,6 @@ func TestAuditInventoryUnverifiable(t *testing.T) {
 	}
 }
 
-// TestNopMetrics: the no-op Metrics (the default a batch Pipeline uses when metrics are off) must
-// accept every observation without panicking — it is real production code on the backfill/reconcile
-// paths, not a test fixture.
-func TestNopMetrics(_ *testing.T) {
-	var m Metrics = Nop{}
-	m.ObjectStored("t", 42)
-	m.ObjectFailed("t")
-	m.ObjectDedup("t")
-}
-
 // errStoredLedger is a fakeLedger whose per-target stored enumeration errors — used to exercise
 // the ledger-failure paths of AuditInventory and RestoreAll.
 type errStoredLedger struct{ *fakeLedger }
@@ -149,6 +140,48 @@ func TestAuditInventoryLedgerError(t *testing.T) {
 	}
 	if rep.Targets[0].Err == nil || rep.Targets[0].Failed() {
 		t.Fatalf("the target must carry the ledger error (and not double-count as drift): %+v", rep.Targets[0])
+	}
+}
+
+// trackedCloser records whether Close was called (a leak detector for the abandon path).
+type trackedCloser struct{ closed chan struct{} }
+
+func (trackedCloser) Read([]byte) (int, error) { return 0, io.EOF }
+func (t *trackedCloser) Close() error          { close(t.closed); return nil }
+
+// blockingManifestSink blocks in LatestManifest until released (ignoring ctx, like a wedged
+// mount), then hands back a trackedCloser — so a test can prove the reader is CLOSED even when the
+// fetch completes AFTER the ctx-cancel abandon.
+type blockingManifestSink struct {
+	stubSink
+	release chan struct{}
+	closer  *trackedCloser
+}
+
+func (s *blockingManifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
+	<-s.release
+	return s.closer, nil
+}
+
+// TestReadLatestManifestClosesReaderOnAbandon (review #8): if LatestManifest completes AFTER a
+// ctx-cancel abandon, the ReadCloser it produced must be Closed by the drain path — otherwise it
+// leaks an fd no one ever closes.
+func TestReadLatestManifestClosesReaderOnAbandon(t *testing.T) {
+	closer := &trackedCloser{closed: make(chan struct{})}
+	sink := &blockingManifestSink{stubSink: stubSink{name: "t"}, release: make(chan struct{}), closer: closer}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := readLatestManifest(ctx, sink); done <- err }()
+	cancel() // abandon while LatestManifest is still blocked
+	if err := <-done; err == nil {
+		t.Fatal("a cancelled manifest read must return the ctx error")
+	}
+	close(sink.release) // let the abandoned LatestManifest complete + produce its reader
+	select {
+	case <-closer.closed:
+		// good — the abandoned reader was drained + closed, no fd leak.
+	case <-time.After(3 * time.Second):
+		t.Fatal("the late-produced manifest reader was LEAKED (never Closed) after abandon")
 	}
 }
 

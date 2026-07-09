@@ -365,11 +365,25 @@ func runRestoreAll(args []string) error {
 	}
 	st, rerr := domain.RestoreAll(ctx, ledger, src, name, *to, conc, cfg.PerObjectTimeout())
 	fmt.Printf("restore all (%s -> %s): restored=%d skipped=%d failed=%d\n", name, *to, st.Restored, st.Skipped, st.Failed)
-	if err := onShutdownOK(rerr); err != nil {
-		return err // enumeration error (a clean SIGTERM maps to nil — resumable on re-run)
+	return restoreAllVerdict(st, rerr, ctx.Err())
+}
+
+// restoreAllVerdict maps a restore-all outcome to an exit error — extracted so the SIGTERM policy
+// is unit-testable. An enumeration error (rerr) maps through onShutdownOK (a clean SIGTERM → nil,
+// resumable on re-run). A clean SIGTERM that cancelled in-flight objects AFTER enumeration finished
+// (rerr==nil, ctxErr!=nil) counts those cancellations in st.Failed, but they are NOT genuine
+// failures, so the run is suppressed (mirrors backfill/reconcile). Only a run that completed
+// WITHOUT cancellation and still has failures is a real problem (a source read/verify error, a
+// per-object timeout, or a recovered panic — so the message is deliberately generic).
+func restoreAllVerdict(st domain.RestoreAllStats, rerr, ctxErr error) error {
+	if rerr != nil {
+		return onShutdownOK(rerr)
+	}
+	if ctxErr != nil {
+		return nil
 	}
 	if st.Failed > 0 {
-		return fmt.Errorf("restore all left %d object(s) unrestored (hash-mismatch / unreadable source)", st.Failed)
+		return fmt.Errorf("restore all left %d object(s) unrestored (a source read/verify failed, timed out, or panicked)", st.Failed)
 	}
 	return nil
 }
@@ -457,6 +471,13 @@ func resolveVersionHash(ctx context.Context, cfg *config.Config, fid uuid.UUID, 
 	}
 	if !found {
 		return "", fmt.Errorf("file %s has no current content hash in the live file table — recover its externalID as of %s from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)", fid, at.Format(time.RFC3339))
+	}
+	// FAIL LOUD when the version time is unknowable: a NULL updatedDate means we cannot prove the
+	// current version was the one in effect at --at, so we MUST NOT guess (returning the current
+	// hash could restore the wrong version of a since-replaced file). Direct the operator to PITR.
+	if versionTime.IsZero() {
+		return "", fmt.Errorf("file %s has a NULL updatedDate — cannot determine which version was in effect at %s; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
+			fid, at.Format(time.RFC3339))
 	}
 	if versionTime.After(at) {
 		return "", fmt.Errorf("file %s current version became live at %s, AFTER --at %s — the historical version is not in the live file table; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
@@ -710,11 +731,11 @@ func runAudit(args []string) error {
 	// ledger→target (silent loss), the WORM immutability drift-check, and (opt-in) target→ledger.
 	verdicts := []error{rep.FailErr(), auditImmutability(ctx, targets)}
 	if *inventory {
+		// JOIN the inventory sweep error with the other verdicts — do NOT early-return it: a
+		// corrupt-manifest read error must not MASK a genuine silent-loss (ledger→target) or
+		// immutability-drift finding computed above. errors.Join drops the nils.
 		invErr, sweepErr := auditInventory(ctx, ledger, targets)
-		if sweepErr != nil {
-			return sweepErr // a ledger/manifest read error is a run failure, not a drift verdict
-		}
-		verdicts = append(verdicts, invErr)
+		verdicts = append(verdicts, invErr, sweepErr)
 	}
 	return errors.Join(verdicts...)
 }
@@ -808,6 +829,11 @@ func runDrill(args []string) error {
 	}
 	if derr != nil {
 		return derr // interrupted (ctx) or an enumeration error — nonzero exit, never a clean pass
+	}
+	// A 0-checked drill proved nothing: it is a distinct failure (a renamed/misconfigured --from
+	// target, or an empty/wrong ledger), NOT a green "everything's fine" — so call it out.
+	if outcome.Checked == 0 {
+		return fmt.Errorf("restore drill sampled 0 objects on %s — nothing to drill (renamed/misconfigured target, or an empty/wrong ledger?)", name)
 	}
 	if !outcome.Pass() {
 		return fmt.Errorf("restore drill FAILED: %d of %d sampled objects did not restore+verify on %s", outcome.Failed, outcome.Checked, name)

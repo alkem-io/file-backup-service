@@ -123,23 +123,49 @@ type manifestFetch struct {
 	err error
 }
 
+// fetchLatestManifest runs LatestManifest in its own goroutine and honors ctx even when the sink
+// can't (a filesystem os.ReadDir/os.Open on a WEDGED MOUNT is uninterruptible — the same hazard
+// the write path guards with callWithCtx): on ctx cancellation it returns ctx.Err() and ABANDONS
+// the goroutine. Crucially, unlike the generic RunAbandonable it OWNS the result channel, so a
+// LatestManifest that completes AFTER the abandon has its produced ReadCloser DRAINED AND CLOSED
+// (in a detached goroutine) — otherwise the reader leaks an fd no one ever closes. A driver panic
+// becomes an error. The channel is buffered (cap 1) so neither the abandoned nor the drain send
+// ever blocks.
+func fetchLatestManifest(ctx context.Context, ir inventoryReader) (io.ReadCloser, error) {
+	ch := make(chan manifestFetch, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- manifestFetch{err: PanicErr("latest manifest", r)}
+			}
+		}()
+		rc, err := ir.LatestManifest(ctx)
+		ch <- manifestFetch{rc: rc, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		// Abandon the goroutine, but drain its (buffered) result and close any reader it produced
+		// late, so a wedged-then-completing LatestManifest can't leak an open fd.
+		go func() {
+			if res := <-ch; res.rc != nil {
+				_ = res.rc.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.rc, res.err
+	}
+}
+
 // readLatestManifest reads a target's newest manifest snapshot into a set of externalIDs. The
 // manifest is JSONL (one manifestLine per row) written RAW (no codec), so it is parsed directly.
 // A malformed line stops the parse (a truncated/corrupt manifest is a real fault, not silently
 // under-counted). The reader is always closed.
-//
-// The LatestManifest CALL is run through RunAbandonable so a filesystem sink's os.ReadDir/os.Open
-// on a WEDGED MOUNT (uninterruptible, ctx-ignoring — the same hazard the write path guards with
-// callWithCtx) can't hang the audit past ctx; a driver panic becomes an error too.
 func readLatestManifest(ctx context.Context, ir inventoryReader) (map[string]bool, error) {
-	res := RunAbandonable(ctx,
-		func() manifestFetch { rc, err := ir.LatestManifest(ctx); return manifestFetch{rc: rc, err: err} },
-		func() manifestFetch { return manifestFetch{err: ctx.Err()} },
-		func(r any) manifestFetch { return manifestFetch{err: PanicErr("latest manifest", r)} })
-	if res.err != nil {
-		return nil, res.err
+	rc, err := fetchLatestManifest(ctx, ir)
+	if err != nil {
+		return nil, err
 	}
-	rc := res.rc
 	defer func() { _ = rc.Close() }()
 	set := map[string]bool{}
 	// A manifest can be large (one line per object); scan line-by-line with a generous max token

@@ -75,12 +75,28 @@ func TestFileByID(t *testing.T) {
 
 	t.Run("found", func(t *testing.T) {
 		r, mock := newMockFiles(t)
-		mock.ExpectQuery("FROM file WHERE id").WithArgs(fid).
-			WillReturnRows(pgxmock.NewRows([]string{"externalID", "versionTime"}).
+		mock.ExpectQuery(`"externalID", "updatedDate" FROM file WHERE id`).WithArgs(fid).
+			WillReturnRows(pgxmock.NewRows([]string{"externalID", "updatedDate"}).
 				AddRow(pgtype.Text{String: "hashZ", Valid: true}, pgtype.Timestamptz{Time: ver, Valid: true}))
 		ext, vt, found, err := r.FileByID(context.Background(), fid)
 		if err != nil || !found || ext != "hashZ" || !vt.Equal(ver) {
 			t.Fatalf("found file: ext=%q vt=%v found=%v err=%v", ext, vt, found, err)
+		}
+	})
+
+	t.Run("null-updatedDate", func(t *testing.T) {
+		r, mock := newMockFiles(t)
+		// A NULL updatedDate must NOT be coalesced to createdDate — it returns a ZERO versionTime so
+		// the caller (resolveVersionHash) fails loud rather than misdating a replaced file.
+		mock.ExpectQuery(`"externalID", "updatedDate" FROM file WHERE id`).WithArgs(fid).
+			WillReturnRows(pgxmock.NewRows([]string{"externalID", "updatedDate"}).
+				AddRow(pgtype.Text{String: "hashZ", Valid: true}, pgtype.Timestamptz{}))
+		ext, vt, found, err := r.FileByID(context.Background(), fid)
+		if err != nil || !found || ext != "hashZ" {
+			t.Fatalf("a NULL updatedDate must still return the row: ext=%q found=%v err=%v", ext, found, err)
+		}
+		if !vt.IsZero() {
+			t.Fatalf("a NULL updatedDate must be a ZERO versionTime (not coalesced), got %v", vt)
 		}
 	})
 

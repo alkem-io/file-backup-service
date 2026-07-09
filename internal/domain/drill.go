@@ -25,10 +25,11 @@ type DrillOutcome struct {
 	Failures []DrillFailure
 }
 
-// Pass reports whether every drilled object restored + verified. An EMPTY drill (Checked==0,
-// nothing stored on the target yet) is a vacuous pass — there is nothing to prove — which is
-// correct: a fresh target with no objects has no restore to fail.
-func (o DrillOutcome) Pass() bool { return o.Failed == 0 }
+// Pass reports whether the drill PROVED the restore procedure: at least one object was drilled AND
+// none failed. A 0-checked drill is NOT a pass — it proved nothing, and a 0-count is itself a
+// SIGNAL (a renamed/misconfigured target, or an empty/wrong ledger, yields no sampled rows), so it
+// must not read green and mask that; the caller surfaces it as a distinct failure.
+func (o DrillOutcome) Pass() bool { return o.Checked > 0 && o.Failed == 0 }
 
 // Drill samples up to `sample` objects the ledger records stored on src's target (a random band,
 // so successive weekly drills cover different objects — sample<=0 drills every stored object) and,
@@ -48,10 +49,18 @@ func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir str
 	}
 	for _, h := range hashes {
 		if err := ctx.Err(); err != nil {
-			return out, err // interrupted — the partial outcome is returned alongside the error
+			return out, err // interrupted before this object — the partial outcome rides along
+		}
+		derr := drillOne(ctx, src, h, scratchDir, perObjectTimeout)
+		// A cancellation DURING this object (parent ctx now cancelled) is an INTERRUPTION, not a
+		// failed object: abort the drill (returning the ctx error) rather than counting a spurious
+		// Failed + reporting RED. A per-object TIMEOUT (parent ctx still live) or a verify mismatch
+		// IS a real failure and falls through to Failed below.
+		if derr != nil && ctx.Err() != nil {
+			return out, ctx.Err()
 		}
 		out.Checked++
-		if derr := drillOne(ctx, src, h, scratchDir, perObjectTimeout); derr != nil {
+		if derr != nil {
 			out.Failed++
 			out.Failures = append(out.Failures, DrillFailure{Hash: h, Err: derr})
 			continue

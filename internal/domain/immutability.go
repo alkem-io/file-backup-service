@@ -126,6 +126,10 @@ type ImmutabilityGauge interface {
 	// SetImmutabilityOK sets target's drift gauge (true = ok, false = drift). It is called
 	// ONLY for a verifiable target — the sampler never emits a series for an unverifiable one.
 	SetImmutabilityOK(target string, ok bool)
+	// ClearImmutabilityOK drops target's gauge series (used when the target becomes
+	// UNVERIFIABLE) so a previously-green target that turns unreadable can't freeze STALE-GREEN
+	// at 1 and mask a real drift — the absent series reads as "no signal", not "ok".
+	ClearImmutabilityOK(target string)
 }
 
 // ImmutabilitySampler drives the filebackup_immutability_ok gauge from serve: it periodically
@@ -152,7 +156,10 @@ func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 	}
 	for _, r := range CheckImmutability(ctx, s.targets) {
 		if r.Unverifiable {
-			continue // no series → the `== 0` alert can't fire on an inherently unverifiable target
+			// Drop any prior series so a formerly-green target that becomes unreadable doesn't
+			// stay stuck at 1 (masking drift); an absent series can't fire the `== 0` alert either.
+			s.gauge.ClearImmutabilityOK(r.Target)
+			continue
 		}
 		s.gauge.SetImmutabilityOK(r.Target, r.OK)
 	}

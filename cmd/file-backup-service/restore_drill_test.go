@@ -2,11 +2,44 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
+
+// ---- restore all SIGTERM verdict (review #3) ------------------------------
+
+// TestRestoreAllVerdict: a clean SIGTERM must NOT be reported as a restore failure. An
+// enumeration-cancel (rerr=Canceled) → nil; a post-enumeration cancel with in-flight cancels
+// counted as Failed (ctxErr!=nil) → nil; only failures on an un-cancelled run → error.
+func TestRestoreAllVerdict(t *testing.T) {
+	// enumeration cancelled → clean.
+	if err := restoreAllVerdict(domain.RestoreAllStats{Failed: 3}, context.Canceled, context.Canceled); err != nil {
+		t.Fatalf("a cancelled enumeration must map to a clean exit, got %v", err)
+	}
+	// enumeration ok, but SIGTERM cancelled in-flight objects (counted Failed) → clean.
+	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 2, Failed: 4}, nil, context.Canceled); err != nil {
+		t.Fatalf("a clean SIGTERM's in-flight cancels must not be a failure, got %v", err)
+	}
+	// enumeration error (not a cancel) → surfaced.
+	if err := restoreAllVerdict(domain.RestoreAllStats{}, errors.New("ledger down"), nil); err == nil {
+		t.Fatal("a genuine enumeration error must surface")
+	}
+	// genuine failures on an un-cancelled run → error (and NOT the old hardcoded hash-mismatch text).
+	err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5, Failed: 1}, nil, nil)
+	if err == nil || strings.Contains(err.Error(), "hash-mismatch / unreadable source") {
+		t.Fatalf("un-cancelled failures must error with a generic message, got %v", err)
+	}
+	// a clean, complete run → nil.
+	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5}, nil, nil); err != nil {
+		t.Fatalf("a clean run must return nil, got %v", err)
+	}
+}
 
 // ---- restore sub-verb dispatch (no DB) ------------------------------------
 

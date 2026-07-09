@@ -214,18 +214,33 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // immutable off-site copy's write-only credential legitimately can't read its own config.
 func (s *Sink) CheckImmutability(ctx context.Context) (objectLock, versioning bool, err error) {
 	lockStatus, _, _, _, lerr := s.client.GetObjectLockConfig(ctx, s.bucket)
+	lockEnabled := false
 	if lerr != nil {
-		return false, false, fmt.Errorf("object-lock config %q: %w", s.bucket, lerr)
+		// A DEFINITIVE "object-lock is not configured" answer — ObjectLockConfigurationNotFoundError
+		// / HTTP 404 — is DRIFT (a WORM bucket that LOST its lock config), NOT unverifiable: report
+		// lock=false so the caller flags it, rather than masking the loss as "couldn't read". Only a
+		// 403 / transient / other error is unverifiable (we genuinely couldn't determine it — e.g. a
+		// PutObject-only WORM credential that can't read its own config).
+		resp := minio.ToErrorResponse(lerr)
+		if resp.Code == "ObjectLockConfigurationNotFoundError" || resp.StatusCode == http.StatusNotFound {
+			lockEnabled = false
+		} else {
+			return false, false, fmt.Errorf("object-lock config %q: %w", s.bucket, lerr)
+		}
+	} else {
+		// GetObjectLockConfig returns the bucket's ObjectLockEnabled value ("Enabled" when the
+		// bucket was created with object-lock).
+		lockEnabled = strings.EqualFold(lockStatus, "Enabled")
 	}
 	ver, verr := s.client.GetBucketVersioning(ctx, s.bucket)
 	if verr != nil {
 		return false, false, fmt.Errorf("versioning config %q: %w", s.bucket, verr)
 	}
-	// GetObjectLockConfig returns the bucket's ObjectLockEnabled value ("Enabled" when the
-	// bucket was created with object-lock). Versioning is a hard prerequisite S3 enforces for
-	// object-lock, but check it explicitly so a manual Suspend (which silently defeats WORM) is
-	// caught as drift, not masked by the lock flag alone.
-	return strings.EqualFold(lockStatus, "Enabled"), ver.Enabled(), nil
+	// Versioning is a hard prerequisite S3 enforces for object-lock, but check it explicitly so a
+	// manual Suspend (which silently defeats WORM) is caught as drift, not masked by the lock flag
+	// alone. A bucket with versioning never/no-longer enabled returns an empty config (Status="",
+	// Enabled()=false), so a suspended/absent versioning surfaces as drift, not an error.
+	return lockEnabled, ver.Enabled(), nil
 }
 
 // LatestManifest returns the newest ledger-snapshot manifest object under _manifest/ — the s3

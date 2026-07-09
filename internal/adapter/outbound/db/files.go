@@ -75,19 +75,19 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 }
 
 // FileByID resolves a file's CURRENT content hash (externalID) and the time its CURRENT version
-// became live (COALESCE("updatedDate","createdDate") — last-modified, so a file that was REPLACED
-// in place, same id + new externalID, reports the REPLACE time, not its original creation), so
-// `restore version` can map a --file-id to the hash to restore. The `file` table holds only the
-// CURRENT version, not its history — so `restore version --at <past>` uses it best-effort: if the
-// current version became live at/before <at> it IS the version as of <at>; if it was replaced
-// AFTER <at>, the historical hash is NOT in the live table (it needs DB PITR — see
-// contracts/restore-and-ops.md), and the caller directs the operator to pass the PITR-recovered
-// hash via --hash. found=false when no such file row (or a NULL/empty externalID — a not-yet-
-// stored file has no backup key). Uses the last-modified time (fail-loud if `updatedDate` is
-// absent) rather than createdDate, so a replaced file can't SILENTLY resolve to the wrong (current)
-// version for a past --at. Hand-written pgx (§IV waiver: `file` is the foreign, server-owned table).
+// became live — `file.updatedDate`, read DIRECTLY (NOT coalesced to createdDate): a file REPLACED
+// in place (same id + new externalID) updates updatedDate to the replace time, so this is the
+// timestamp `restore version --at` must compare against. A NULL updatedDate is returned as a ZERO
+// versionTime so the caller FAILS LOUD (directs the operator to a DB PITR + --hash) rather than
+// silently falling back to createdDate, which would misdate a replaced file and resolve a past
+// --at to the WRONG (current) version. found=false when no such file row (or a NULL/empty
+// externalID — a not-yet-stored file has no backup key); versionTime is still returned so the
+// caller can distinguish "NULL updatedDate" from "row absent". The `file` table holds only the
+// CURRENT version (no history), so a --at predating the current version's updatedDate is not
+// resolvable here — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver: `file` is the
+// foreign, server-owned table).
 func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, versionTime time.Time, found bool, err error) {
-	const q = `SELECT "externalID", COALESCE("updatedDate", "createdDate") FROM file WHERE id = $1`
+	const q = `SELECT "externalID", "updatedDate" FROM file WHERE id = $1`
 	var ext pgtype.Text
 	var vt pgtype.Timestamptz
 	if serr := r.p.QueryRow(ctx, q, id).Scan(&ext, &vt); serr != nil {

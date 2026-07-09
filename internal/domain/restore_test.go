@@ -212,6 +212,25 @@ func TestRestoreAllEnumerationError(t *testing.T) {
 	}
 }
 
+// TestRestoreAllCancelledReturnsCtxError (review #3): a cancelled whole-store restore returns the
+// ctx error (which the CLI maps to a clean exit — a resumable interruption, not a failure), rather
+// than swallowing the cancellation and reporting the in-flight cancels as genuine failures.
+func TestRestoreAllCancelledReturnsCtxError(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	for i := 0; i < 5; i++ {
+		content := []byte("cancel me " + string(rune('a'+i)))
+		h, _ := sum(bytes.NewReader(content))
+		sink.store[h] = content
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := RestoreAll(ctx, led, sink, "t", t.TempDir(), 1, time.Minute); err == nil {
+		t.Fatal("a cancelled restore-all must return the ctx error so the CLI can map it to a clean, resumable exit")
+	}
+}
+
 // ioErrSink serves prefix bytes then a transient I/O error — modelling an S3 reset/timeout
 // mid-stream. prefix must begin with the zstd magic so decodeStream takes the zstd path.
 type ioErrSink struct {

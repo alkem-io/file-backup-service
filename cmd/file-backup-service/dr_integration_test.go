@@ -151,11 +151,13 @@ func TestIntegrationRestoreVersion(t *testing.T) {
 	}
 }
 
-// TestIntegrationAuditInventory (T032): after writing a manifest that matches the ledger, the
-// target→ledger direction reports no drift (extra=0) and audit --inventory exits clean.
+// TestIntegrationAuditInventory (T032/review #9): the target→ledger direction must actually
+// VERIFY (not no-op): after a matching manifest it reports the target verifiable + extra=0 (clean);
+// after DELETING a ledger record the manifest still lists (an orphan), it detects extra>0 and
+// fails.
 func TestIntegrationAuditInventory(t *testing.T) {
 	ctx := context.Background()
-	cfgPath, _, name, _, _ := seedBackedUp(t, 3, time.Now().Add(-time.Hour))
+	cfgPath, _, name, hashes, _ := seedBackedUp(t, 3, time.Now().Add(-time.Hour))
 
 	// Write a manifest snapshot to the target (serve does this periodically; do it directly here).
 	_, ledger, pool, targets, err := ledgerJob(ctx, cfgPath)
@@ -166,12 +168,91 @@ func TestIntegrationAuditInventory(t *testing.T) {
 		pool.Close()
 		t.Fatalf("write manifest: %v", err)
 	}
+	// Assert the target was actually VERIFIABLE (read its manifest) with no drift — not a
+	// vacuous unverifiable no-op that a bare nil check would also accept.
+	rep, err := domain.AuditInventory(ctx, ledger, targets)
 	pool.Close()
-
-	// --inventory diffs the target's manifest against the ledger; a fresh manifest ⊆ ledger, so
-	// extra=0 → clean exit.
+	if err != nil {
+		t.Fatalf("AuditInventory: %v", err)
+	}
+	if rep.Targets[0].Unverifiable {
+		t.Fatalf("the target must be VERIFIABLE (its manifest read + diffed), got %+v", rep.Targets[0])
+	}
+	if rep.Targets[0].Extra != 0 || rep.Targets[0].ManifestSize != 3 {
+		t.Fatalf("a matching manifest must show extra=0 over 3 objects, got %+v", rep.Targets[0])
+	}
 	if err := runAudit([]string{"--config", cfgPath, "--inventory"}); err != nil {
 		t.Fatalf("audit --inventory after a matching manifest must be clean, got %v", err)
 	}
-	_ = name
+
+	// Inject an ORPHAN: delete one ledger target_status row so the manifest lists an object the
+	// ledger no longer records stored on the target → extra>0 → audit --inventory must FAIL.
+	if err := harness.Exec(ctx, harness.LedgerDB,
+		`DELETE FROM file_backup_target_status WHERE target=$1 AND "externalID"=$2`, name, hashes[0]); err != nil {
+		t.Fatalf("inject orphan: %v", err)
+	}
+	if err := runAudit([]string{"--config", cfgPath, "--inventory"}); err == nil {
+		t.Fatal("audit --inventory must FAIL when a target's manifest holds an object the ledger no longer records (orphan)")
+	}
+}
+
+// TestIntegrationAuditJoinsVerdicts (review #7): a corrupt-manifest sweep error must NOT mask a
+// genuine silent-loss (ledger→target) finding — both must surface.
+func TestIntegrationAuditJoinsVerdicts(t *testing.T) {
+	cfgPath, targetDir, _, hashes, _ := seedBackedUp(t, 1, time.Now().Add(-time.Hour))
+
+	// Silent loss: the ledger records the object stored, but delete it from disk so Exists reports
+	// absent (ledger→target missing).
+	if err := os.Remove(storedPath(targetDir, hashes[0])); err != nil {
+		t.Fatalf("delete stored object: %v", err)
+	}
+	// Corrupt the target's newest manifest so the inventory sweep errors.
+	mdir := filepath.Join(targetDir, "_manifest")
+	if err := os.MkdirAll(mdir, 0o750); err != nil {
+		t.Fatalf("mkdir manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mdir, "9999-01-01T000000.000000000Z.jsonl"), []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatalf("write corrupt manifest: %v", err)
+	}
+
+	err := runAudit([]string{"--config", cfgPath, "--inventory"})
+	if err == nil {
+		t.Fatal("audit --inventory must fail (silent loss AND corrupt manifest)")
+	}
+	if !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("the silent-loss (missing) finding must NOT be masked by the corrupt-manifest error: %v", err)
+	}
+}
+
+// TestIntegrationRunDrillZeroSampled (review #4): a drill against a target the ledger has no rows
+// for must FAIL (0 sampled proves nothing), not report a vacuous green pass.
+func TestIntegrationRunDrillZeroSampled(t *testing.T) {
+	cfgPath, _, name := drConfig(t, "http://unused") // a unique target with nothing backed up to it
+	err := runDrill([]string{"--config", cfgPath, "--from", name, "--to", t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "0 objects") {
+		t.Fatalf("a drill sampling 0 objects must fail with a 'nothing to drill' error, got %v", err)
+	}
+}
+
+// TestIntegrationRestoreVersionNullUpdatedDate (review #1): a file with a NULL updatedDate cannot
+// have its version time determined — restore version (no --hash) must FAIL LOUD (direct to PITR),
+// never silently return the current hash.
+func TestIntegrationRestoreVersionNullUpdatedDate(t *testing.T) {
+	ctx := context.Background()
+	content := []byte("null updatedDate object")
+	h := sha3hex(content)
+	fid := uuid.New()
+	// Insert with createdDate set but updatedDate NULL (omitted).
+	if err := harness.Exec(ctx, harness.AlkemioDB,
+		`INSERT INTO file (id,"externalID",size,"temporaryLocation","createdDate") VALUES ($1,$2,$3,false,now())`,
+		fid, h, int64(len(content))); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	cfgPath, _ := harnessConfig(t, "http://unused")
+	err := runRestoreVersion([]string{
+		"--config", cfgPath, "--file-id", fid.String(), "--at", time.Now().Format(time.RFC3339), "--from", "local",
+	})
+	if err == nil || !strings.Contains(err.Error(), "NULL updatedDate") {
+		t.Fatalf("a NULL updatedDate must fail loud toward PITR/--hash, got %v", err)
+	}
 }

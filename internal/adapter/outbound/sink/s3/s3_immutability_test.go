@@ -31,7 +31,16 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	switch {
 	case r.Method == http.MethodGet && q.Has("object-lock"):
-		if s.lockStatus != http.StatusOK {
+		switch s.lockStatus {
+		case http.StatusOK:
+			// fall through to the enabled/disabled body below
+		case http.StatusNotFound:
+			// object-lock is NOT configured — the definitive DRIFT signal (a WORM bucket that lost
+			// its lock config), returned with the real S3 error code so the sink can distinguish it.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `<Error><Code>ObjectLockConfigurationNotFoundError</Code><Message>Object Lock configuration does not exist for this bucket</Message></Error>`)
+			return
+		default:
 			w.WriteHeader(s.lockStatus) // e.g. 403 AccessDenied — a read-denying credential
 			return
 		}
@@ -116,6 +125,23 @@ func TestCheckImmutabilityReadDeniedErrors(t *testing.T) {
 	sink := newWormSink(t, &wormStub{lockStatus: http.StatusForbidden})
 	if _, _, err := sink.CheckImmutability(context.Background()); err == nil {
 		t.Fatal("a 403 on the object-lock config must return an error (→ unverifiable), not (false,false,nil)")
+	}
+}
+
+// TestCheckImmutabilityObjectLockRemovedIsDrift (review #2): a definitive
+// ObjectLockConfigurationNotFoundError (HTTP 404) means the WORM bucket LOST its object-lock — this
+// is DRIFT (objectLock=false, no error), NOT "unverifiable". It must not be masked as unreadable.
+func TestCheckImmutabilityObjectLockRemovedIsDrift(t *testing.T) {
+	sink := newWormSink(t, &wormStub{lockStatus: http.StatusNotFound, versioningStatus: "Enabled"})
+	lock, ver, err := sink.CheckImmutability(context.Background())
+	if err != nil {
+		t.Fatalf("a 404 object-lock (removed) must NOT error (it's a definitive drift answer), got %v", err)
+	}
+	if lock {
+		t.Fatal("object-lock removed (404) must report objectLock=false (drift)")
+	}
+	if !ver {
+		t.Fatal("versioning was still enabled — must report true")
 	}
 }
 

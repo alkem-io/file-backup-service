@@ -193,13 +193,20 @@ the lookup and needs only the target.
 | `drill` | `--from <target>` (default: first target) `--sample N` (default 20, 0 = all) `--to <scratchdir>` (default: `scratchDir`, else OS temp) `--metrics-file <path>` (also `FBS_DRILL_METRICS_FILE`) |
 
 **Restoring a past version.** `restore version` maps `--file-id` + `--at` to the
-content hash to restore. The live `file` table holds only each file's *current*
-version, so it is **best-effort**: if the current version became live (last-modified)
-at/before `--at`, it IS the version as of `--at` and is restored; if the file was
-replaced **after** `--at`, the historical hash is not in the live table and the
-command errors, directing you to recover `file.externalID` as of `--at` from a **DB
-point-in-time restore / backup** and pass it via `--hash` (which restores it
-directly, needing only the target). See `contracts/restore-and-ops.md`.
+content hash to restore, comparing against the file's **last-modified** time
+(`file.updatedDate`, read directly — *not* coalesced to `createdDate`, so an
+in-place replace is dated correctly). The live `file` table holds only each file's
+*current* version, so the command **fails loud** rather than ever guessing:
+- current version last-modified **at/before** `--at` → it IS the version as of
+  `--at` → restored;
+- last-modified **after** `--at` (a replacement happened since) → **error** (the
+  historical version isn't in the live table);
+- `updatedDate` is **NULL** (version time unknowable) → **error** (won't risk
+  returning the wrong version).
+
+In the error cases, recover `file.externalID` as of `--at` from a **DB point-in-time
+restore / backup** and pass it via `--hash` (which restores it directly, needing only
+the target). See `contracts/restore-and-ops.md`.
 
 **Restore-drill metrics.** `drill` exits nonzero if any sampled object fails to
 restore + hash-verify (so a failing Job trips `kube_job_status_failed`). Because the
