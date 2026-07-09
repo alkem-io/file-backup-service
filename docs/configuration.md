@@ -126,6 +126,8 @@ FBS_TARGET_LOCAL_PATH=/storage
 | `type` | `FBS_TARGET_<N>_TYPE` | all | `s3` or `filesystem`. |
 | `compression` | `FBS_TARGET_<N>_COMPRESSION` | all | `""`/`none` or `zstd` (per-target). |
 | `worm` | `FBS_TARGET_<N>_WORM` | all | `true` for a write-once, read-denying (PutObject-only) target; audit expects its `Exists` to deny and won't alert. |
+| `auditAccessKey` | `FBS_TARGET_<N>_AUDITACCESSKEY` | s3 | **Optional** read/audit credential for a WORM target — the worker's own PutObject-only credential can't read `GetObjectLockConfiguration`, so the immutability drift-check needs this to actually run. Set **both** audit keys → the drift-check runs (`filebackup_immutability_ok` = 1/0); unset → the drift-check is N/A (silent — no series, no alert, no false pass; the immutability is then asserted by object-lock + the audit + `never_verified`). |
+| `auditSecretKey` | `FBS_TARGET_<N>_AUDITSECRETKEY` | s3 | Secret pair for `auditAccessKey` (inject via env). |
 | `path` | `FBS_TARGET_<N>_PATH` | filesystem | Root directory (**required** for `filesystem`). Sharded two levels by hash. |
 | `endpoint` | `FBS_TARGET_<N>_ENDPOINT` | s3 | S3 endpoint host (**required**). |
 | `region` | `FBS_TARGET_<N>_REGION` | s3 | Region (**required** — PutObject-only creds can't auto-discover it; SigV4 signs it). |
@@ -206,20 +208,21 @@ on un-suspend, point it at a readable target; the WORM copy's integrity is cover
 
 **Restoring by point-in-time (`restore current`).** The live `file` table holds only
 each file's **current** version — there is **no version history** — so this restores
-the CURRENT backed-up version, *guarded* by `--at`: it succeeds only if the current
-version was already the one in effect at `--at`. It compares the file's **last-modified**
-time (`file.updatedDate`, read directly — *not* coalesced to `createdDate`, so an
-in-place replace is dated correctly) and **fails loud** rather than ever guessing:
-- current version last-modified **at/before** `--at` → it IS the version as of
-  `--at` → restored;
-- last-modified **after** `--at` (a replacement happened since) → **error** (the
-  version at `--at` isn't in the live table);
-- `updatedDate` is **NULL** (version time unknowable) → **error** (won't risk
-  returning the wrong version).
+the CURRENT backed-up version, *guarded* by `--at`. The effective-time decision keys on
+the **content version's own timeline** — the ledger's `firstSeenAt` for the current
+`externalID` (when the backup service first backed that content up) — **NOT** the mutable
+`file.updatedDate` (a metadata-only edit bumps `updatedDate` without changing the content,
+which would wrongly refuse a legitimate content restore). It **fails loud** rather than guess:
+- the current content was first backed up **at/before** `--at` → it IS the version as
+  of `--at` → restored;
+- first backed up **after** `--at` → **error** (the version at `--at` isn't the current one);
+- the current content is **not in the backup ledger** (never backed up) → **error** (no
+  timeline to verify against).
 
-To recover a genuinely HISTORICAL version, recover `file.externalID` as of `--at` from
-a **DB point-in-time restore / backup** and pass it via `--hash` (which restores it
-directly, needing only the target). See `contracts/restore-and-ops.md`.
+It needs BOTH the alkemio DB (the file→hash mapping) and the ledger DB (the content
+timeline). To recover a genuinely HISTORICAL version, recover `file.externalID` as of
+`--at` from a **DB point-in-time restore / backup** and pass it via `--hash` (which restores
+it directly, needing only the target). See `contracts/restore-and-ops.md`.
 
 **`restore all` completeness.** It restores only what the `--from` source holds, so
 before restoring it prints each configured target's stored-object count (marking the
@@ -236,12 +239,15 @@ An **interrupted** drill (SIGTERM) writes **no** gauges — it neither records a
 can't page a week-long false failure; the exit code (nonzero) still reflects the abort.
 
 **Immutability drift signal.** `filebackup_immutability_ok{target}` is 1 (verified) / 0
-(drift), emitted only for a WORM target **verified this pass**. A target that turns
-**unverifiable** (a credential rotated to write-only, a wedged endpoint) has its `_ok`
-series **dropped** — never frozen stale-green — and raises
-`filebackup_immutability_unverifiable{target}=1` instead, so a later real drift can't be
-masked; alert on `_unverifiable == 1` sustained. A structurally-unreadable target (a
-filesystem WORM with no bucket object-lock) drops its series and raises no signal.
+(drift), emitted only for a WORM target the worker can actually **read** this pass — i.e.
+one with an **audit credential** (`auditAccessKey`/`auditSecretKey`). A WORM target WITHOUT
+an audit credential (the standard immutable prod config — a PutObject-only worker cred) is
+**N/A → silent**: no `_ok` series, no alert, no false pass; its immutability is asserted by
+object-lock + the audit path + `never_verified`, not this serve-time probe. A **read-capable**
+target (has an audit cred) that fails its read this pass drops its `_ok` series and raises
+`filebackup_immutability_unverifiable{target}=1` (a genuinely unexpected fault) — alert on
+`_unverifiable == 1` sustained. A restore from an immutable copy uses an EXPLICIT `--from`
+(Pillar 4b); reading it needs a read-capable credential.
 
 ---
 

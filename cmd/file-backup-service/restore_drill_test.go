@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,33 +23,34 @@ import (
 // run exits clean.
 func TestRestoreAllVerdict(t *testing.T) {
 	// genuine failures + a coincident SIGTERM enumeration-cancel → STILL nonzero (Cluster 1).
-	if err := restoreAllVerdict(domain.RestoreAllStats{Failed: 1, Cancelled: 2}, context.Canceled); err == nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{Failed: 1, Cancelled: 2}, context.Canceled, "t"); err == nil {
 		t.Fatal("a genuine failure that coincides with a SIGTERM must still exit nonzero")
 	}
 	// purely cancelled (no genuine failures) → clean, resumable.
-	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 2, Cancelled: 4}, context.Canceled); err != nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 2, Cancelled: 4}, context.Canceled, "t"); err != nil {
 		t.Fatalf("a purely-cancelled run must exit cleanly (resumable), got %v", err)
 	}
 	// enumeration error (not a cancel) → surfaced.
-	if err := restoreAllVerdict(domain.RestoreAllStats{}, errors.New("ledger down")); err == nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{}, errors.New("ledger down"), "t"); err == nil {
 		t.Fatal("a genuine enumeration error must surface")
 	}
 	// genuine failures on an un-cancelled run → error (and NOT the old hardcoded hash-mismatch text).
-	err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5, Failed: 1}, nil)
+	err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5, Failed: 1}, nil, "t")
 	if err == nil || strings.Contains(err.Error(), "hash-mismatch / unreadable source") {
 		t.Fatalf("un-cancelled failures must error with a generic message, got %v", err)
 	}
 	// a clean, complete run → nil.
-	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5}, nil); err != nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{Restored: 5}, nil, "t"); err != nil {
 		t.Fatalf("a clean run must return nil, got %v", err)
 	}
-	// 0 objects enumerated on a clean pass (empty/wrong source) → fail (Pillar 4d), like drill's 0-sampled.
-	if err := restoreAllVerdict(domain.RestoreAllStats{}, nil); err == nil ||
-		!strings.Contains(err.Error(), "enumerated 0") {
-		t.Fatalf("a 0-enumerated restore-all must fail loud, got %v", err)
+	// 0 objects enumerated on a clean pass → fail with an UNAMBIGUOUS message that names the source and
+	// says the ledger holds 0 for it (E4: not conflated with a data fault), like drill's 0-sampled.
+	if err := restoreAllVerdict(domain.RestoreAllStats{}, nil, "offsite"); err == nil ||
+		!strings.Contains(err.Error(), `0 objects stored on target "offsite"`) {
+		t.Fatalf("a 0-enumerated restore-all must fail loud naming the target, got %v", err)
 	}
 	// 0 restored but N skipped (an idempotent re-run) stays success.
-	if err := restoreAllVerdict(domain.RestoreAllStats{Skipped: 3}, nil); err != nil {
+	if err := restoreAllVerdict(domain.RestoreAllStats{Skipped: 3}, nil, "t"); err != nil {
 		t.Fatalf("a 0-restored-but-skipped run must stay success, got %v", err)
 	}
 }
@@ -97,6 +99,21 @@ func TestBuildReadSourceWormAnnotatesFetch(t *testing.T) {
 	if _, ferr := src.Fetch(context.Background(), sha3hex([]byte("absent"))); ferr == nil ||
 		!strings.Contains(ferr.Error(), "WORM/write-only") {
 		t.Fatalf("a WORM source read failure must be annotated, got %v", ferr)
+	}
+	// A Fetch of a PRESENT object succeeds (the wrapper is transparent on the happy path): stage an
+	// object via the wrapped sink's Store, then read it back byte-for-byte.
+	content := []byte("recovered from the immutable copy via an admin credential")
+	h := sha3hex(content)
+	if _, serr := src.Store(context.Background(), h, bytes.NewReader(content)); serr != nil {
+		t.Fatalf("store on the worm-wrapped sink: %v", serr)
+	}
+	rc, ferr := src.Fetch(context.Background(), h)
+	if ferr != nil {
+		t.Fatalf("a WORM source read of a present object must succeed, got %v", ferr)
+	}
+	defer func() { _ = rc.Close() }()
+	if got, _ := io.ReadAll(rc); !bytes.Equal(got, content) {
+		t.Fatalf("worm source read mismatch: %q", got)
 	}
 }
 

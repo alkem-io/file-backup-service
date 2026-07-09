@@ -50,9 +50,17 @@ type Target struct {
 	Compression string `yaml:"compression,omitempty"` // "" | "none" | "zstd"
 	AccessKey   string `yaml:"accessKey,omitempty"`   // secret — normally injected via env
 	SecretKey   string `yaml:"secretKey,omitempty"`   // secret — normally injected via env
-	UseSSL      bool   `yaml:"useSSL,omitempty"`
-	SSE         bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
-	Insecure    bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
+	// AuditAccessKey/AuditSecretKey are an OPTIONAL read/audit credential for a WORM target: the
+	// worker's own credential is PutObject-only (can't read GetObjectLockConfig), so the immutability
+	// drift-check needs a read-capable credential to actually run. When BOTH are set the drift-check
+	// runs (Verified/Drift); when unset it is legitimately N/A → SILENT (no series, no alert, no false
+	// pass) — the immutability is then asserted by object-lock + the audit + never_verified. Secrets,
+	// injected via FBS_TARGET_<NAME>_AUDITACCESSKEY / _AUDITSECRETKEY.
+	AuditAccessKey string `yaml:"auditAccessKey,omitempty"`
+	AuditSecretKey string `yaml:"auditSecretKey,omitempty"`
+	UseSSL         bool   `yaml:"useSSL,omitempty"`
+	SSE            bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
+	Insecure       bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
 	// Worm marks a write-once target whose credential can't read (PutObject-only, e.g. the
 	// immutable off-site copy): audit EXPECTS its Exists to always deny, so it isn't an
 	// alert — whereas a normally-readable target that suddenly can't be verified IS.
@@ -294,6 +302,8 @@ func (c *Config) applyTargetEnv() error {
 		setStr(&c.Targets[i].Compression, p+"COMPRESSION")
 		setStr(&c.Targets[i].AccessKey, p+"ACCESSKEY")
 		setStr(&c.Targets[i].SecretKey, p+"SECRETKEY")
+		setStr(&c.Targets[i].AuditAccessKey, p+"AUDITACCESSKEY")
+		setStr(&c.Targets[i].AuditSecretKey, p+"AUDITSECRETKEY")
 		errs = append(errs,
 			setBool(&c.Targets[i].UseSSL, p+"USESSL"),
 			setBool(&c.Targets[i].SSE, p+"SSE"),
@@ -388,16 +398,25 @@ func (c *Config) Validate() error {
 	return c.ValidateTargets()
 }
 
-// ValidateDR is the check the ledger-DB DR subcommands (reconcile/audit) need: the
-// numeric limits (so a huge perObjectTimeoutSec can't overflow to a negative Duration on
-// this path), the LedgerDB (they connect to it — so a malformed DSN fails with a clear
-// 'ledgerDB.host is required' here, not an opaque pgx parse error later), PLUS the target
-// set — but NOT fileServiceBase/outbox, so it still runs in the degraded/DR environment.
-func (c *Config) ValidateDR() error {
+// ValidateDRLimits validates the DR common config every ledger-DB subcommand needs: the numeric
+// limits (so a huge perObjectTimeoutSec can't overflow to a negative Duration on this path) and the
+// LedgerDB DSN (a malformed DSN fails with a clear 'ledgerDB.host is required' here, not an opaque pgx
+// parse error later) — but NOT fileServiceBase/outbox (it runs in the degraded/DR environment) and
+// NOT the target set. The SINGLE-source DR ops (restore-all / drill) use only this plus their ONE
+// source target's validation (config.SelectReadTarget + ValidateTargetFields), so an UNRELATED
+// misconfigured target can't block a restore/drill from a healthy --from (Pillar 4c — extended from
+// build-time to validation-time).
+func (c *Config) ValidateDRLimits() error {
 	if err := c.validateLimits(); err != nil {
 		return err
 	}
-	if err := c.LedgerDB.Validate("ledgerDB"); err != nil {
+	return c.LedgerDB.Validate("ledgerDB")
+}
+
+// ValidateDR is ValidateDRLimits PLUS the full target set — for the DR ops that touch EVERY target
+// (audit probes all, reconcile repairs across all).
+func (c *Config) ValidateDR() error {
+	if err := c.ValidateDRLimits(); err != nil {
 		return err
 	}
 	return c.ValidateTargets()
@@ -669,5 +688,6 @@ func buildS3Sink(t Target) (domain.Sink, error) {
 	return s3.New(s3.Config{
 		Name: t.Name, Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket, Prefix: t.Prefix,
 		AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,
+		AuditAccessKey: t.AuditAccessKey, AuditSecretKey: t.AuditSecretKey,
 	})
 }

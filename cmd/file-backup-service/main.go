@@ -415,7 +415,7 @@ func runRestoreAll(args []string) error {
 	}
 	st, rerr := domain.RestoreAll(ctx, ledger, src, name, *to, conc, cfg.PerObjectTimeout())
 	fmt.Printf("restore all (%s -> %s): restored=%d skipped=%d failed=%d cancelled=%d\n", name, *to, st.Restored, st.Skipped, st.Failed, st.Cancelled)
-	return restoreAllVerdict(st, rerr)
+	return restoreAllVerdict(st, rerr, name)
 }
 
 // printTargetStoredSizes prints each configured target's stored-object count (marking the restore
@@ -445,16 +445,19 @@ func printTargetStoredSizes(ctx context.Context, ledger *db.LedgerRepo, targets 
 // is unit-testable. GENUINE per-object failures (st.Failed — a source read/verify error, a
 // per-object timeout, or a recovered panic; cancellations are separated into st.Cancelled by
 // RestoreAll) exit NONZERO even when a SIGTERM coincides. A run that ENUMERATED zero objects on a
-// clean pass (an empty/wrong source, or a renamed target) is ALSO a failure — like drill's 0-sampled
-// case, a "restored 0" that proved nothing must not read as a green success. A 0-restored run with
-// objects merely SKIPPED (an idempotent re-run) stays success. Otherwise an enumeration error maps
-// through onShutdownOK (a clean SIGTERM → nil, resumable) and a clean run exits 0.
-func restoreAllVerdict(st domain.RestoreAllStats, rerr error) error {
+// clean pass also exits nonzero (a restore-all that restored nothing is worth flagging) — but with an
+// UNAMBIGUOUS message that names the source target and says the LEDGER holds 0 objects for it (a
+// new/empty target, or the wrong --from among the configured targets — the --from name was already
+// validated, so this is NOT a data-fault/corruption exit and the per-target stored counts printed
+// above disambiguate). A 0-restored run with objects merely SKIPPED (an idempotent re-run) stays
+// success. Otherwise an enumeration error maps through onShutdownOK (a clean SIGTERM → nil) and a
+// clean run exits 0.
+func restoreAllVerdict(st domain.RestoreAllStats, rerr error, source string) error {
 	if st.Failed > 0 {
 		return fmt.Errorf("restore all left %d object(s) unrestored (a source read/verify failed, timed out, or panicked)", st.Failed)
 	}
 	if rerr == nil && st.Restored+st.Skipped+st.Failed+st.Cancelled == 0 {
-		return errors.New("restore all enumerated 0 objects — nothing to restore (an empty/wrong source, a renamed/misconfigured --from, or an empty/wrong ledger?)")
+		return fmt.Errorf("restore all: the ledger records 0 objects stored on target %q — nothing to restore (a new/empty target, or the wrong --from among the configured targets; see the per-target stored counts above)", source)
 	}
 	return onShutdownOK(rerr)
 }
@@ -516,38 +519,51 @@ func runRestoreCurrent(args []string) error {
 	return nil
 }
 
-// resolveCurrentHash maps (file-id, at) to the content hash to restore, using the live `file` table
-// (which holds only the current version). It needs the alkemio DB, so it validates + opens it here.
-// It returns the current hash ONLY when that version was in effect at `at` (last-modified at/before
-// `at`); otherwise the version at `at` is not resolvable live and the operator must recover it via a
-// DB PITR + --hash (see contracts/restore-and-ops.md).
+// resolveCurrentHash maps (file-id, at) to the content hash to restore: it reads the file's CURRENT
+// externalID from the alkemio `file` table, then decides whether that CONTENT version was already in
+// effect at --at using the CONTENT's OWN timeline — the ledger's FirstSeenAt (when this service first
+// backed the content up) — NOT the mutable file.updatedDate (a metadata-only edit bumps updatedDate
+// without changing the content, which would refuse a legitimate content restore). It needs BOTH the
+// alkemio DB (the file→hash mapping) and the ledger DB (the content timeline), so it validates +
+// opens both here. It returns the current hash ONLY when the content was first seen at/before --at;
+// otherwise the version at --at is not resolvable live and the operator must recover it via a DB PITR
+// + --hash (see contracts/restore-and-ops.md).
 func resolveCurrentHash(ctx context.Context, cfg *config.Config, fid uuid.UUID, at time.Time) (string, error) {
 	if err := cfg.AlkemioDB.Validate("alkemioDB"); err != nil {
 		return "", fmt.Errorf("invalid config (resolving --file-id needs alkemioDB; or pass --hash from a PITR query): %w", err)
 	}
-	pool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "alkemio")
+	if err := cfg.LedgerDB.Validate("ledgerDB"); err != nil {
+		return "", fmt.Errorf("invalid config (resolving --file-id also needs ledgerDB for the content's backup timeline; or pass --hash): %w", err)
+	}
+	apool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "alkemio")
 	if err != nil {
 		return "", err
 	}
-	defer pool.Close()
-	files := db.NewFileRepo(pool)
-	hash, versionTime, found, err := files.FileByID(ctx, fid)
+	defer apool.Close()
+	lpool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "ledger")
+	if err != nil {
+		return "", err
+	}
+	defer lpool.Close()
+
+	hash, found, err := db.NewFileRepo(apool).FileByID(ctx, fid)
 	if err != nil {
 		return "", fmt.Errorf("resolve file %s: %w", fid, err)
 	}
 	if !found {
 		return "", fmt.Errorf("file %s has no current content hash in the live file table — recover its externalID as of %s from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)", fid, at.Format(time.RFC3339))
 	}
-	// FAIL LOUD when the version time is unknowable: a NULL updatedDate means we cannot prove the
-	// current version was the one in effect at --at, so we MUST NOT guess (returning the current
-	// hash could restore the wrong version of a since-replaced file). Direct the operator to PITR.
-	if versionTime.IsZero() {
-		return "", fmt.Errorf("file %s has a NULL updatedDate — cannot determine which version was in effect at %s; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
-			fid, at.Format(time.RFC3339))
+	// The content version's OWN timeline: when the backup service first saw this externalID.
+	firstSeen, seen, err := db.NewLedgerRepo(lpool).FirstSeenAt(ctx, hash)
+	if err != nil {
+		return "", fmt.Errorf("resolve content timeline for %s: %w", hash, err)
 	}
-	if versionTime.After(at) {
-		return "", fmt.Errorf("file %s current version became live at %s, AFTER --at %s — the historical version is not in the live file table; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
-			fid, versionTime.Format(time.RFC3339), at.Format(time.RFC3339))
+	if !seen {
+		return "", fmt.Errorf("file %s current content %s is not recorded in the backup ledger — cannot verify it existed at %s; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)", fid, hash, at.Format(time.RFC3339))
+	}
+	if firstSeen.After(at) {
+		return "", fmt.Errorf("file %s current content %s was first backed up at %s, AFTER --at %s — the version in effect at --at is not the current one; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
+			fid, hash, firstSeen.Format(time.RFC3339), at.Format(time.RFC3339))
 	}
 	return hash, nil
 }
@@ -591,7 +607,10 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("load config: %w", err)
 	}
-	if err := cfg.ValidateDR(); err != nil {
+	// Validate only the DR limits + the ledger DSN here — NOT the target SET: the single-source ops
+	// (restore-all/drill) validate only their one source target (buildReadSource), so a sibling
+	// misconfig can't block them (Pillar 4c). Audit/reconcile add cfg.ValidateTargets() themselves.
+	if err := cfg.ValidateDRLimits(); err != nil {
 		return nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
 	pool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "ledger")
@@ -621,6 +640,11 @@ func runReconcile(args []string) error {
 		return err
 	}
 	defer pool.Close()
+	// reconcile repairs across EVERY target, so validate the whole set (ledgerJob validated only the
+	// limits + ledger DSN).
+	if err := cfg.ValidateTargets(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err
@@ -775,6 +799,11 @@ func runAudit(args []string) error {
 		return err
 	}
 	defer pool.Close()
+	// audit probes EVERY target, so validate the whole set (ledgerJob validated only the limits +
+	// ledger DSN).
+	if err := cfg.ValidateTargets(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err

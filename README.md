@@ -73,14 +73,15 @@ every field, env var, default, and constraint — is in
   per-object-timeout totals, source-gone total, the RPO gauges (backlog depth,
   oldest-pending age, last-success age, targets-circuit-open, under-replicated
   objects), `filebackup_immutability_ok{target}` (WORM object-lock + versioning
-  drift — 1 ok / 0 drift; emitted only for a target **verified this pass**), and
-  `filebackup_immutability_unverifiable{target}` (1 while a WORM target the worker
-  *should* be able to read has been unverifiable — a credential rotated to write-only,
-  a wedged endpoint). A target that turns unverifiable **drops** its `_ok` series
-  (never frozen stale-green) and raises `_unverifiable`, so a later real drift can't
-  be masked. Alert on `filebackup_under_replicated_objects > 0`,
-  `filebackup_targets_circuit_open > 0`, `filebackup_immutability_ok == 0`,
-  `filebackup_immutability_unverifiable == 1` sustained, and a climbing last-success age.
+  drift — 1 ok / 0 drift; emitted only for a WORM target the worker can actually
+  **read** — one with an `auditAccessKey`/`auditSecretKey`), and
+  `filebackup_immutability_unverifiable{target}` (1 while a **read-capable** WORM
+  target failed its read this pass — an unexpected fault). A WORM target WITHOUT an
+  audit credential (the standard PutObject-only prod config) is silent (N/A — its
+  immutability is asserted by object-lock + the audit + `never_verified`). Alert on
+  `filebackup_under_replicated_objects > 0`, `filebackup_targets_circuit_open > 0`,
+  `filebackup_immutability_ok == 0`, `filebackup_immutability_unverifiable == 1`
+  sustained, and a climbing last-success age.
 - **Restore-drill metrics:** the `drill` subcommand is short-lived, so it exports
   `filebackup_restore_drill_pass` (1/0) + `filebackup_drill_last_success_timestamp_seconds`
   via a Prometheus **textfile** (`--metrics-file` / `FBS_DRILL_METRICS_FILE`, the
