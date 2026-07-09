@@ -44,22 +44,26 @@ GROUP BY target;
 
 -- name: StoredObjectsPage :many
 -- Objects stored ON one target (manifest/audit), keyset-paged by externalID; the
--- (target, state, "externalID") index makes the WHERE+ORDER an index-ordered range scan.
+-- (target, state, "externalID") index makes the WHERE+ORDER an index-ordered range scan. The
+-- explicit COLLATE "C" pins BYTE order (matching the column collation + the byte-order `<` the
+-- audit inventory diff and manifestIterator's monotonicity check assume) so it can't drift on a
+-- locale-collated database.
 SELECT o."externalID", o.size, o."createdBy", o."sourceCreatedDate"
 FROM file_backup_object o
 JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
-WHERE ts.target = sqlc.arg(target) AND ts.state = 'stored' AND o."externalID" > sqlc.arg(after)
-ORDER BY o."externalID" LIMIT sqlc.arg(page_limit);
+WHERE ts.target = sqlc.arg(target) AND ts.state = 'stored' AND o."externalID" > sqlc.arg(after) COLLATE "C"
+ORDER BY o."externalID" COLLATE "C" LIMIT sqlc.arg(page_limit);
 
 -- name: StoredExternalIDsPage :many
 -- Just the externalIDs stored ON one target, keyset-paged by externalID — what the audit
 -- sweep needs (it re-probes the sink and consumes ONLY the id). Unlike StoredObjectsPage this
 -- does NOT join file_backup_object, so it is a covering INDEX-ONLY scan on
 -- (target, state, "externalID") with no per-row heap fetch for size/createdBy the audit
--- discards. (StoredObjectsPage stays for the manifest export, which needs those columns.)
+-- discards. COLLATE "C" pins byte order (see StoredObjectsPage) so the ledger stream and the
+-- manifest agree on ordering in the inventory diff.
 SELECT "externalID" FROM file_backup_target_status
-WHERE target = sqlc.arg(target) AND state = 'stored' AND "externalID" > sqlc.arg(after)
-ORDER BY "externalID" LIMIT sqlc.arg(page_limit);
+WHERE target = sqlc.arg(target) AND state = 'stored' AND "externalID" > sqlc.arg(after) COLLATE "C"
+ORDER BY "externalID" COLLATE "C" LIMIT sqlc.arg(page_limit);
 
 -- name: TargetGapsPage :many
 -- One keyset page (externalID order) of under-replicated objects with the CURRENT targets
