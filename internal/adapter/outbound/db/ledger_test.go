@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pashagolub/pgxmock/v4"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
@@ -66,6 +68,37 @@ func TestLedgerStoredTargets(t *testing.T) {
 	if !set["t1"] || !set["t2"] || len(set) != 2 {
 		t.Fatalf("want {t1,t2}, got %v", set)
 	}
+}
+
+// TestLedgerFirstSeenAt (re-review E2): FirstSeenAt returns the content's first-backed-up time when
+// present, and (found=false) when the content is not in the ledger (a not-backed-up file → restore
+// current fails loud toward PITR).
+func TestLedgerFirstSeenAt(t *testing.T) {
+	seen := time.Now().Add(-2 * time.Hour)
+	t.Run("found", func(t *testing.T) {
+		r, mock := newMockLedger(t)
+		mock.ExpectQuery(`"firstSeenAt" FROM file_backup_object`).WithArgs("hashA").
+			WillReturnRows(pgxmock.NewRows([]string{"firstSeenAt"}).AddRow(pgtype.Timestamptz{Time: seen, Valid: true}))
+		got, found, err := r.FirstSeenAt(context.Background(), "hashA")
+		if err != nil || !found || !got.Equal(seen) {
+			t.Fatalf("FirstSeenAt found: got=%v found=%v err=%v", got, found, err)
+		}
+	})
+	t.Run("no-row", func(t *testing.T) {
+		r, mock := newMockLedger(t)
+		mock.ExpectQuery(`"firstSeenAt" FROM file_backup_object`).WithArgs("gone").WillReturnError(pgx.ErrNoRows)
+		_, found, err := r.FirstSeenAt(context.Background(), "gone")
+		if err != nil || found {
+			t.Fatalf("content not in the ledger must be (found=false, nil), got found=%v err=%v", found, err)
+		}
+	})
+	t.Run("query-error", func(t *testing.T) {
+		r, mock := newMockLedger(t)
+		mock.ExpectQuery(`"firstSeenAt" FROM file_backup_object`).WithArgs("boom").WillReturnError(errors.New("db down"))
+		if _, _, err := r.FirstSeenAt(context.Background(), "boom"); err == nil {
+			t.Fatal("a query error must propagate")
+		}
+	})
 }
 
 func TestLedgerStoredCountByTarget(t *testing.T) {

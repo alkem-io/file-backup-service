@@ -39,6 +39,22 @@ func (q *Queries) CoverageGaps(ctx context.Context, arg CoverageGapsParams) (int
 	return gaps, err
 }
 
+const firstSeenAt = `-- name: FirstSeenAt :one
+SELECT "firstSeenAt" FROM file_backup_object WHERE "externalID" = $1
+`
+
+// When this service FIRST backed up (first saw) a content version — the CONTENT version's own
+// timeline. `restore current --at` uses it to decide whether the current backed-up version already
+// existed as of --at, independent of the file table's mutable "updatedDate" (which a metadata-only
+// edit bumps without changing the content). No row → the content is not backed up (the caller directs
+// the operator to PITR + --hash). firstSeenAt is NOT NULL (DEFAULT now()).
+func (q *Queries) FirstSeenAt(ctx context.Context, externalID string) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, firstSeenAt, externalID)
+	var firstSeenAt pgtype.Timestamptz
+	err := row.Scan(&firstSeenAt)
+	return firstSeenAt, err
+}
+
 const lastVerifiedAge = `-- name: LastVerifiedAge :one
 SELECT
   count(*) FILTER (WHERE mv IS NULL) AS never_verified,

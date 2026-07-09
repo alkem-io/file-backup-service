@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -74,32 +73,28 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	})
 }
 
-// FileByID resolves a file's CURRENT content hash (externalID) and the time its CURRENT version
-// became live — `file.updatedDate`, read DIRECTLY (NOT coalesced to createdDate): a file REPLACED
-// in place (same id + new externalID) updates updatedDate to the replace time, so this is the
-// timestamp `restore version --at` must compare against. A NULL updatedDate is returned as a ZERO
-// versionTime so the caller FAILS LOUD (directs the operator to a DB PITR + --hash) rather than
-// silently falling back to createdDate, which would misdate a replaced file and resolve a past
-// --at to the WRONG (current) version. found=false when no such file row (or a NULL/empty
-// externalID — a not-yet-stored file has no backup key); versionTime is still returned so the
-// caller can distinguish "NULL updatedDate" from "row absent". The `file` table holds only the
-// CURRENT version (no history), so a --at predating the current version's updatedDate is not
-// resolvable here — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver: `file` is the
-// foreign, server-owned table).
-func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, versionTime time.Time, found bool, err error) {
-	const q = `SELECT "externalID", "updatedDate" FROM file WHERE id = $1`
+// FileByID resolves a file's CURRENT content hash (externalID). It deliberately does NOT read
+// `file.updatedDate`: that is a last-modified-ANY-field timestamp (a metadata-only edit bumps it
+// without changing the content), so keying `restore current --at` on it would refuse a legitimate
+// content restore. The effective-time decision is made instead on the CONTENT version's own timeline
+// — the ledger's FirstSeenAt for this externalID — so no mutable `file` timestamp is read here (and
+// nothing to preflight beyond `externalID`, which Probe covers). found=false when no such file row,
+// or a NULL/empty externalID (a not-yet-stored file has no backup key). The `file` table holds only
+// the CURRENT version (no history) — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver:
+// `file` is the foreign, server-owned table).
+func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, found bool, err error) {
+	const q = `SELECT "externalID" FROM file WHERE id = $1`
 	var ext pgtype.Text
-	var vt pgtype.Timestamptz
-	if serr := r.p.QueryRow(ctx, q, id).Scan(&ext, &vt); serr != nil {
+	if serr := r.p.QueryRow(ctx, q, id).Scan(&ext); serr != nil {
 		if errors.Is(serr, pgx.ErrNoRows) {
-			return "", time.Time{}, false, nil
+			return "", false, nil
 		}
-		return "", time.Time{}, false, fmt.Errorf("file by id: %w", serr)
+		return "", false, fmt.Errorf("file by id: %w", serr)
 	}
 	if !ext.Valid || ext.String == "" {
-		return "", nullTime(vt), false, nil // a file with no content hash yet has no backup to restore
+		return "", false, nil // a file with no content hash yet has no backup to restore
 	}
-	return ext.String, nullTime(vt), true, nil
+	return ext.String, true, nil
 }
 
 // Probe verifies the `file` table is readable via the scoped role AND has every column

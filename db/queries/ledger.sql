@@ -33,6 +33,14 @@ ON CONFLICT ("externalID", target) DO UPDATE SET
 SELECT target FROM file_backup_target_status
 WHERE "externalID" = sqlc.arg(external_id) AND state = 'stored';
 
+-- name: FirstSeenAt :one
+-- When this service FIRST backed up (first saw) a content version — the CONTENT version's own
+-- timeline. `restore current --at` uses it to decide whether the current backed-up version already
+-- existed as of --at, independent of the file table's mutable "updatedDate" (which a metadata-only
+-- edit bumps without changing the content). No row → the content is not backed up (the caller directs
+-- the operator to PITR + --hash). firstSeenAt is NOT NULL (DEFAULT now()).
+SELECT "firstSeenAt" FROM file_backup_object WHERE "externalID" = sqlc.arg(external_id);
+
 -- name: StoredCountByTarget :many
 -- Count of objects currently stored per configured target — the restore-all completeness snapshot,
 -- so an operator sees per-target disparity before trusting a single-source restore. Index-only on
