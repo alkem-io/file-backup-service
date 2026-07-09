@@ -3,13 +3,18 @@
 package metrics
 
 import (
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
@@ -32,7 +37,12 @@ type Metrics struct {
 	neverVerified    prometheus.Gauge // configured targets that have never verified anything
 	circuitOpen      prometheus.Gauge // targets with an open circuit (tripped out, being deferred)
 	sampleErrors     prometheus.Counter
-	byTarget         sync.Map // target name -> *targetCounters (resolved once, per target)
+	// immutabilityOK is the WORM drift gauge (T032): per Worm target, 1 = object-lock +
+	// versioning still enabled, 0 = drift detected. A read-denying/unverifiable target's
+	// series is NEVER emitted (so the `== 0` alert can't false-fire on an inherently
+	// unverifiable PutObject-only credential — the never-verified/audit signals cover it).
+	immutabilityOK *prometheus.GaugeVec
+	byTarget       sync.Map // target name -> *targetCounters (resolved once, per target)
 }
 
 // New builds a Metrics with its own registry.
@@ -93,7 +103,109 @@ func New() *Metrics {
 			Name: "filebackup_metrics_sample_errors_total",
 			Help: "Failed RPO/coverage sampling passes — alert on rate>0 so a frozen (stale-green) gauge is itself detectable.",
 		}),
+		immutabilityOK: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "filebackup_immutability_ok",
+			Help: "Per WORM/immutable target: 1 = object-lock + versioning still configured, 0 = drift detected. Emitted ONLY for targets whose immutability could actually be read (an S3 target whose credential can query the lock/versioning config); a read-denying (PutObject-only) WORM target is unverifiable so its series is absent — alert on == 0.",
+		}, []string{"target"}),
 	}
+}
+
+// SetImmutabilityOK records a WORM target's drift-check verdict (1 ok / 0 drift). Called ONLY
+// for a target whose immutability was actually verifiable; an unverifiable (read-denying)
+// target's series is deliberately never set, so `filebackup_immutability_ok == 0` can't fire
+// on a target we simply couldn't read.
+func (m *Metrics) SetImmutabilityOK(target string, ok bool) {
+	m.immutabilityOK.WithLabelValues(target).Set(b2f(ok))
+}
+
+// b2f maps a bool to the Prometheus 1/0 gauge convention.
+func b2f(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// DrillMetrics is the restore-drill's OWN metric set (T033), separate from the worker Metrics:
+// the `drill` subcommand is a short-lived CronJob, so its gauges are exported via a
+// textfile-collector file, NOT a scraped /metrics — and its registry holds ONLY the drill gauges
+// (no go_*/process_* collectors), so the textfile can't collide with the worker's own /metrics
+// series when the node exporter merges them.
+type DrillMetrics struct {
+	reg         *prometheus.Registry
+	pass        prometheus.Gauge
+	lastSuccess prometheus.Gauge
+}
+
+// NewDrillMetrics builds the drill metric set on a private, collector-free registry.
+func NewDrillMetrics() *DrillMetrics {
+	reg := prometheus.NewRegistry()
+	f := promauto.With(reg)
+	return &DrillMetrics{
+		reg: reg,
+		pass: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_restore_drill_pass",
+			Help: "Last restore-drill result: 1 = every sampled object restored + hash-matched, 0 = at least one failed. Set by the `drill` subcommand; exported via a textfile (--metrics-file) since the drill process is short-lived. Alert on == 0.",
+		}),
+		lastSuccess: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_drill_last_success_timestamp_seconds",
+			Help: "Unix timestamp (seconds) of the last FULLY-PASSING restore drill; 0 until the first. Alert on time() - this > a week to catch a drill that stopped succeeding.",
+		}),
+	}
+}
+
+// Set records a drill outcome: the pass gauge (1/0) and, on a full pass, the last-success
+// timestamp. A failing drill leaves the last-success timestamp untouched, so an operator sees when
+// the drill last actually SUCCEEDED, not merely when it last ran.
+func (d *DrillMetrics) Set(pass bool, at time.Time) {
+	d.pass.Set(b2f(pass))
+	if pass {
+		d.lastSuccess.Set(float64(at.Unix()))
+	}
+}
+
+// WriteTextfile atomically writes the drill registry to path in Prometheus text-exposition format
+// (temp + rename, so a scrape never reads a half-written file) — the node-exporter
+// textfile-collector convention for a short-lived batch job's metrics (a scraped /metrics can't
+// carry them because the process exits). A "" path is a no-op (the exit code carries the signal).
+func (d *DrillMetrics) WriteTextfile(path string) error {
+	if path == "" {
+		return nil
+	}
+	mfs, gerr := d.reg.Gather()
+	if gerr != nil {
+		return fmt.Errorf("gather metrics: %w", gerr)
+	}
+	tmp, cerr := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if cerr != nil {
+		return fmt.Errorf("create metrics temp: %w", cerr)
+	}
+	// Remove the temp on any failure path; on success it has been renamed away (the committed
+	// flag skips the Remove of the now-absent temp).
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	enc := expfmt.NewEncoder(tmp, expfmt.NewFormat(expfmt.TypeTextPlain))
+	for _, mf := range mfs {
+		if eerr := enc.Encode(mf); eerr != nil {
+			return fmt.Errorf("encode metrics: %w", eerr)
+		}
+	}
+	if serr := tmp.Sync(); serr != nil {
+		return fmt.Errorf("sync metrics temp: %w", serr)
+	}
+	if clerr := tmp.Close(); clerr != nil {
+		return fmt.Errorf("close metrics temp: %w", clerr)
+	}
+	if rerr := os.Rename(tmp.Name(), path); rerr != nil {
+		return fmt.Errorf("commit metrics textfile: %w", rerr)
+	}
+	committed = true
+	return nil
 }
 
 // SetBacklog updates the outbox backlog gauges (pending count + oldest-pending age).

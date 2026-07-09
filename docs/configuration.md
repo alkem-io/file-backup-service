@@ -166,15 +166,46 @@ export FBS_TARGET_OFFSITE_SECRETKEY=…
 | `backfill` | ✅ | ✅ (`file` corpus) | ✅ | ✅ |
 | `reconcile` | — | — | ✅ | ✅ |
 | `audit` | — | — | ✅ | ✅ |
-| `restore` / `verify` | — | — | — | ✅ (the `--from` target) |
+| `restore object` / `verify` | — | — | — | ✅ (the `--from` target) |
+| `restore all` | — | — | ✅ (enumerate) | ✅ (the `--from` target) |
+| `restore version` | — | ✅ (unless `--hash`) | — | ✅ (the `--from` target) |
+| `drill` | — | — | ✅ (sample) | ✅ (the `--from` target) |
 | `migrate` | — | — | ✅ | — |
-| `drill` *(planned)* | — | — | — | ✅ |
 
-`reconcile`/`audit`/`restore`/`verify` run in a degraded/DR environment and
-deliberately don't require file-service or the outbox DB. `drill` (a scheduled
-restore drill — **not yet implemented**) will follow the same DR shape, exercising
-restore against the targets; its config needs are expected to mirror
-`restore`/`verify` (targets only) and will be confirmed when it lands.
+`reconcile`/`audit`/`restore`/`verify`/`drill` run in a degraded/DR environment and
+deliberately don't require file-service or the outbox DB. `restore all` and `drill`
+read the **ledger** to enumerate/sample objects; `restore version` needs the
+**alkemio DB** to resolve a `--file-id` to its content hash — unless you pass an
+explicit `--hash` (a hash recovered from a DB point-in-time restore), which skips
+the lookup and needs only the target.
+
+### Subcommand flags (DR + ops)
+
+| Subcommand | Flags |
+|---|---|
+| `restore object` (or bare `restore`) | `--hash <externalID>` `--from <target>` `--to <dir>` (default `/storage`) |
+| `restore all` | `--from <target>` (default: first target) `--to <dir>` `--concurrency N` (default: `concurrency`) |
+| `restore version` | `--file-id <uuid>` `--at <RFC3339>` `[--hash <externalID>]` `[--from <target>]` `[--to <dir>]` |
+| `verify` | `--hash <externalID>` `--from <target>` |
+| `audit` | `--sample N` (0 = all) `--inventory` (also run target→ledger + report WORM drift) |
+| `reconcile` | `--rate N` (repairs/sec, 0 = unlimited) |
+| `backfill` | `--rate N` (backups/sec, 0 = unlimited) |
+| `drill` | `--from <target>` (default: first target) `--sample N` (default 20, 0 = all) `--to <scratchdir>` (default: `scratchDir`, else OS temp) `--metrics-file <path>` (also `FBS_DRILL_METRICS_FILE`) |
+
+**Restoring a past version.** `restore version` maps `--file-id` + `--at` to the
+content hash to restore. The live `file` table holds only each file's *current*
+version, so it is **best-effort**: if the current version became live (last-modified)
+at/before `--at`, it IS the version as of `--at` and is restored; if the file was
+replaced **after** `--at`, the historical hash is not in the live table and the
+command errors, directing you to recover `file.externalID` as of `--at` from a **DB
+point-in-time restore / backup** and pass it via `--hash` (which restores it
+directly, needing only the target). See `contracts/restore-and-ops.md`.
+
+**Restore-drill metrics.** `drill` exits nonzero if any sampled object fails to
+restore + hash-verify (so a failing Job trips `kube_job_status_failed`). Because the
+process is short-lived, set `--metrics-file` (or `FBS_DRILL_METRICS_FILE`) to a
+node-exporter textfile-collector path to also export
+`filebackup_restore_drill_pass` + `filebackup_drill_last_success_timestamp_seconds`.
 
 ---
 

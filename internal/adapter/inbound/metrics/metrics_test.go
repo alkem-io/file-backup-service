@@ -4,8 +4,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -170,6 +173,91 @@ func TestCountersCachedPerTarget(t *testing.T) {
 	m.ObjectStored("t2", 1)
 	if got := testutil.CollectAndCount(m.objects); got != 6 {
 		t.Errorf("objects series across two targets = %d, want 6", got)
+	}
+}
+
+// TestSetImmutabilityOK: the WORM drift gauge is a per-target series set to 1 (ok) / 0 (drift),
+// and a target we never set has NO series (so `== 0` can't false-fire on an unverifiable target).
+func TestSetImmutabilityOK(t *testing.T) {
+	m := New()
+	m.SetImmutabilityOK("good", true)
+	m.SetImmutabilityOK("drift", false)
+	if got := testutil.ToFloat64(m.immutabilityOK.WithLabelValues("good")); got != 1 {
+		t.Errorf("good immutability gauge = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.immutabilityOK.WithLabelValues("drift")); got != 0 {
+		t.Errorf("drift immutability gauge = %v, want 0", got)
+	}
+	// Only the two series we set exist — an unverifiable target contributes none.
+	if got := testutil.CollectAndCount(m.immutabilityOK); got != 2 {
+		t.Errorf("immutability series = %d, want exactly 2 (no series for unverifiable targets)", got)
+	}
+}
+
+// TestDrillMetricsSetAndTextfile: a full-pass drill sets pass=1 and a last-success timestamp; the
+// textfile export writes valid exposition with both drill gauges (and NO go_*/process_* series,
+// so it can't collide with the worker's own /metrics when the node exporter merges them).
+func TestDrillMetricsSetAndTextfile(t *testing.T) {
+	d := NewDrillMetrics()
+	now := time.Unix(1_700_000_000, 0)
+	d.Set(true, now)
+	if got := testutil.ToFloat64(d.pass); got != 1 {
+		t.Errorf("drill pass = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(d.lastSuccess); got != 1_700_000_000 {
+		t.Errorf("drill last-success = %v, want the unix timestamp", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	if err := d.WriteTextfile(path); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // test temp path
+	if err != nil {
+		t.Fatalf("read textfile: %v", err)
+	}
+	body := string(b)
+	for _, want := range []string{"filebackup_restore_drill_pass 1", "filebackup_drill_last_success_timestamp_seconds 1.7e+09"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("textfile missing %q\n---\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "go_goroutines") || strings.Contains(body, "process_") {
+		t.Errorf("drill textfile must NOT carry runtime collectors (would collide with /metrics):\n%s", body)
+	}
+	// "" path is a no-op (the exit code carries the signal when no textfile is wired).
+	if err := d.WriteTextfile(""); err != nil {
+		t.Fatalf("empty path must be a no-op, got %v", err)
+	}
+}
+
+// TestDrillWriteTextfileBadPath: a textfile whose parent dir doesn't exist fails the write (the
+// temp can't be created); a path that is an existing DIRECTORY fails the final rename. Both must
+// surface as errors, not be silently dropped.
+func TestDrillWriteTextfileBadPath(t *testing.T) {
+	d := NewDrillMetrics()
+	d.Set(true, time.Unix(1, 0))
+	if err := d.WriteTextfile(filepath.Join(t.TempDir(), "no-such-dir", "x.prom")); err == nil {
+		t.Fatal("WriteTextfile to a nonexistent parent dir must error")
+	}
+	// path is an existing directory → the temp is created in its parent, but the final rename of a
+	// file onto a directory fails.
+	if err := d.WriteTextfile(t.TempDir()); err == nil {
+		t.Fatal("WriteTextfile onto an existing directory must fail the rename")
+	}
+}
+
+// TestDrillMetricsFailKeepsLastSuccess: a FAILING drill sets pass=0 but leaves the last-success
+// timestamp untouched, so an operator sees when the drill last actually succeeded.
+func TestDrillMetricsFailKeepsLastSuccess(t *testing.T) {
+	d := NewDrillMetrics()
+	d.Set(true, time.Unix(1_000, 0)) // an earlier success
+	d.Set(false, time.Unix(2_000, 0))
+	if got := testutil.ToFloat64(d.pass); got != 0 {
+		t.Errorf("drill pass after failure = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(d.lastSuccess); got != 1_000 {
+		t.Errorf("last-success must stay at the last PASS (1000), got %v", got)
 	}
 }
 

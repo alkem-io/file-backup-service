@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -70,6 +72,34 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 		e.CreatedDate = nullTime(createdDate)
 		return e, nil
 	})
+}
+
+// FileByID resolves a file's CURRENT content hash (externalID) and the time its CURRENT version
+// became live (COALESCE("updatedDate","createdDate") — last-modified, so a file that was REPLACED
+// in place, same id + new externalID, reports the REPLACE time, not its original creation), so
+// `restore version` can map a --file-id to the hash to restore. The `file` table holds only the
+// CURRENT version, not its history — so `restore version --at <past>` uses it best-effort: if the
+// current version became live at/before <at> it IS the version as of <at>; if it was replaced
+// AFTER <at>, the historical hash is NOT in the live table (it needs DB PITR — see
+// contracts/restore-and-ops.md), and the caller directs the operator to pass the PITR-recovered
+// hash via --hash. found=false when no such file row (or a NULL/empty externalID — a not-yet-
+// stored file has no backup key). Uses the last-modified time (fail-loud if `updatedDate` is
+// absent) rather than createdDate, so a replaced file can't SILENTLY resolve to the wrong (current)
+// version for a past --at. Hand-written pgx (§IV waiver: `file` is the foreign, server-owned table).
+func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, versionTime time.Time, found bool, err error) {
+	const q = `SELECT "externalID", COALESCE("updatedDate", "createdDate") FROM file WHERE id = $1`
+	var ext pgtype.Text
+	var vt pgtype.Timestamptz
+	if serr := r.p.QueryRow(ctx, q, id).Scan(&ext, &vt); serr != nil {
+		if errors.Is(serr, pgx.ErrNoRows) {
+			return "", time.Time{}, false, nil
+		}
+		return "", time.Time{}, false, fmt.Errorf("file by id: %w", serr)
+	}
+	if !ext.Valid || ext.String == "" {
+		return "", nullTime(vt), false, nil // a file with no content hash yet has no backup to restore
+	}
+	return ext.String, nullTime(vt), true, nil
 }
 
 // Probe verifies the `file` table is readable via the scoped role AND has every column

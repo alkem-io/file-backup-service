@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
+	"strings"
 	"sync"
 
 	"github.com/minio/minio-go/v7"
@@ -202,4 +204,68 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
 	_, err := s.putStream(ctx, s.prefixed(fsutil.ManifestKey(name)), r)
 	return err
+}
+
+// CheckImmutability reports whether the bucket still enforces object-lock AND versioning — the
+// WORM drift-check (T032): a Scaleway/S3 immutable target loses its guarantee if either is
+// disabled. It is the s3 sink's half of domain's optional immutabilityChecker capability (the
+// domain type-asserts it). A read-denying (PutObject-only) credential 403s these GET calls, so
+// the error is returned and the domain reports the target UNVERIFIABLE, not drifted — the
+// immutable off-site copy's write-only credential legitimately can't read its own config.
+func (s *Sink) CheckImmutability(ctx context.Context) (objectLock, versioning bool, err error) {
+	lockStatus, _, _, _, lerr := s.client.GetObjectLockConfig(ctx, s.bucket)
+	if lerr != nil {
+		return false, false, fmt.Errorf("object-lock config %q: %w", s.bucket, lerr)
+	}
+	ver, verr := s.client.GetBucketVersioning(ctx, s.bucket)
+	if verr != nil {
+		return false, false, fmt.Errorf("versioning config %q: %w", s.bucket, verr)
+	}
+	// GetObjectLockConfig returns the bucket's ObjectLockEnabled value ("Enabled" when the
+	// bucket was created with object-lock). Versioning is a hard prerequisite S3 enforces for
+	// object-lock, but check it explicitly so a manual Suspend (which silently defeats WORM) is
+	// caught as drift, not masked by the lock flag alone.
+	return strings.EqualFold(lockStatus, "Enabled"), ver.Enabled(), nil
+}
+
+// LatestManifest returns the newest ledger-snapshot manifest object under _manifest/ — the s3
+// sink's half of domain's optional inventoryReader capability (audit target→ledger). Manifest
+// names are UTC-nanosecond timestamps, so the lexicographically-highest key is the newest. When
+// no manifest exists yet it returns a wrapped os.ErrNotExist (the domain maps that to
+// "unverifiable — nothing to diff", not a failure). A read-denying credential's List/Get 403s
+// surface as a plain error → the domain reports the target unverifiable.
+func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
+	latest, err := s.latestManifestKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if latest == "" {
+		return nil, fmt.Errorf("no manifest under %s: %w", s.prefixed(fsutil.ManifestDir()), os.ErrNotExist)
+	}
+	obj, err := s.client.GetObject(ctx, s.bucket, latest, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get manifest %s: %w", latest, err)
+	}
+	return obj, nil
+}
+
+// latestManifestKey lists the _manifest/ prefix and returns the highest (newest) key, or "" when
+// none exist. The list runs under a CHILD ctx cancelled on return, so minio's producer goroutine
+// is torn down whether the scan finishes or bails on an error (a leaked list goroutine per audit
+// would otherwise accumulate). The subsequent GetObject uses the parent ctx (its reader outlives
+// this function).
+func (s *Sink) latestManifestKey(ctx context.Context) (string, error) {
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	prefix := s.prefixed(fsutil.ManifestDir()) + "/"
+	var latest string
+	for obj := range s.client.ListObjects(lctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if obj.Err != nil {
+			return "", fmt.Errorf("list manifests under %s: %w", prefix, obj.Err)
+		}
+		if obj.Key > latest {
+			latest = obj.Key
+		}
+	}
+	return latest, nil
 }

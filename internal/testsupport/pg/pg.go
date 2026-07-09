@@ -115,6 +115,7 @@ func (h *Harness) provision(ctx context.Context) error {
 			"externalID" VARCHAR(128),
 			"createdBy"  UUID,
 			"createdDate" TIMESTAMPTZ,
+			"updatedDate" TIMESTAMPTZ,
 			size         BIGINT,
 			"temporaryLocation" BOOLEAN
 		)`,

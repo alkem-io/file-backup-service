@@ -149,6 +149,11 @@ func ManifestKey(name string) string {
 	return path.Join(manifestPrefix, path.Base(name))
 }
 
+// ManifestDir is the reserved manifest subdirectory/prefix ("_manifest"), so the audit
+// target→ledger inventory reader lists a target's manifests in the SAME place PutManifest
+// (via ManifestKey) writes them — one owner, so the write + enumerate paths can't diverge.
+func ManifestDir() string { return manifestPrefix }
+
 // syncDir fsyncs a directory so a create/rename within it is durable
 // (atomic != durable). Used after every content write.
 func syncDir(dir string) error {

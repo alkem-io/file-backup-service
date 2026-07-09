@@ -140,6 +140,78 @@ func TestRestoreCorruptFails(t *testing.T) {
 	}
 }
 
+// TestRestoreAllRoundTripAndResume: restore all objects the ledger records on a target, verify
+// the on-disk bytes, then re-run to prove idempotence (every object skipped-as-present, resumable).
+func TestRestoreAllRoundTripAndResume(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	want := map[string][]byte{}
+	for i := 0; i < 6; i++ {
+		content := []byte("restore-all object " + string(rune('A'+i)))
+		h, err := sum(bytes.NewReader(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sink.store[h] = content
+		want[h] = content
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+	}
+	dir := t.TempDir()
+	st, err := RestoreAll(context.Background(), led, sink, "t", dir, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if st.Restored != 6 || st.Skipped != 0 || st.Failed != 0 {
+		t.Fatalf("first pass: want restored=6, got %+v", st)
+	}
+	for h, content := range want {
+		got, rerr := os.ReadFile(filepath.Join(dir, h)) //nolint:gosec // test temp path
+		if rerr != nil || !bytes.Equal(got, content) {
+			t.Fatalf("restored bytes mismatch for %s: %v", h, rerr)
+		}
+	}
+	// Re-run: every object is already present + intact → skipped (idempotent, resumable).
+	st2, err := RestoreAll(context.Background(), led, sink, "t", dir, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("RestoreAll re-run: %v", err)
+	}
+	if st2.Restored != 0 || st2.Skipped != 6 {
+		t.Fatalf("second pass must skip all (idempotent), got %+v", st2)
+	}
+}
+
+// TestRestoreAllCountsFailure: a corrupt source object (bytes don't hash to the key) is counted
+// as failed and does not abort the whole pass — the other objects still restore.
+func TestRestoreAllCountsFailure(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	var hashes []string
+	for i := 0; i < 3; i++ {
+		content := []byte("obj " + string(rune('0'+i)))
+		h, _ := sum(bytes.NewReader(content))
+		sink.store[h] = content
+		hashes = append(hashes, h)
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+	}
+	sink.store[hashes[0]] = []byte("garbage that does not hash to the key")
+	st, err := RestoreAll(context.Background(), led, sink, "t", t.TempDir(), 2, time.Minute)
+	if err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if st.Failed != 1 || st.Restored != 2 {
+		t.Fatalf("want failed=1 restored=2, got %+v", st)
+	}
+}
+
+// TestRestoreAllEnumerationError: a ledger enumeration failure aborts the whole-store restore with
+// the error, rather than silently reporting a clean (empty) pass.
+func TestRestoreAllEnumerationError(t *testing.T) {
+	led := errStoredLedger{newFakeLedger()}
+	if _, err := RestoreAll(context.Background(), led, newMemSink("t"), "t", t.TempDir(), 2, time.Minute); err == nil {
+		t.Fatal("a ledger enumeration error must propagate from RestoreAll")
+	}
+}
+
 // ioErrSink serves prefix bytes then a transient I/O error — modelling an S3 reset/timeout
 // mid-stream. prefix must begin with the zstd magic so decodeStream takes the zstd path.
 type ioErrSink struct {

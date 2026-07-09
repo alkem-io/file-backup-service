@@ -147,27 +147,60 @@ func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePer
 // startAfter with a single wrap (see Audit's doc). A cancelled sweep returns the error.
 func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int, startAfter string) (TargetAudit, error) {
 	ta := TargetAudit{Target: t.Sink.Name(), Worm: t.Worm}
+	err := keysetSample(ctx, samplePerTarget, startAfter,
+		func(after string, limit int) ([]string, error) {
+			page, err := led.StoredExternalIDsPage(ctx, ta.Target, after, limit)
+			if err != nil {
+				return nil, fmt.Errorf("audit target %s: %w", ta.Target, err)
+			}
+			return page, nil
+		},
+		func(page []string) error {
+			results := existsPage(ctx, t.Sink, page)
+			// If cancellation landed mid-page, the in-flight Exists calls returned ctx.Canceled
+			// — don't count those tainted errors (they'd falsely trip Unverifiable); surface it.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			ta.tally(results)
+			return nil
+		})
+	return ta, err
+}
+
+// keysetSample drives a random-band, single-wrap keyset sweep of up to `sample` ids (sample<=0 =
+// every id from startAfter, no wrap), calling emit once per non-empty page and counting len(page)
+// against the sample budget. It is the ONE owner of the sample→wrap-once logic, shared by the
+// audit sweep (emit probes each id on the sink) and the drill sampler (emit collects the ids), so
+// a hand-rolled copy can't drift on the boundary trim or under-check on a high random start. The
+// start is a PARAMETER (Audit/drill pass randKeysetStart(); tests inject a fixed one) so the
+// deterministic wrap/boundary behaviour stays exercisable. A pageFn error or an emit error stops
+// the sweep and propagates. ctx is checked at the top of every page so a cancelled sweep errors
+// (never reads as a clean pass).
+func keysetSample(ctx context.Context, sample int, startAfter string,
+	pageFn func(after string, limit int) ([]string, error), emit func(page []string) error) error {
 	after := startAfter
 	wrapped := false
+	consumed := 0
 	for {
-		if err := ctx.Err(); err != nil { // a cancelled audit must error, not read as a clean pass
-			return ta, err
+		if err := ctx.Err(); err != nil { // a cancelled sweep must error, not read as a clean pass
+			return err
 		}
 		limit := KeysetPageSize
-		if samplePerTarget > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
-			remaining := samplePerTarget - ta.Checked
+		if sample > 0 { // push the sample bound into SQL — don't scan+fetch more than needed
+			remaining := sample - consumed
 			if remaining <= 0 {
-				break
+				return nil
 			}
 			limit = min(limit, remaining)
 		}
-		page, err := led.StoredExternalIDsPage(ctx, ta.Target, after, limit)
+		page, err := pageFn(after, limit)
 		if err != nil {
-			return ta, fmt.Errorf("audit target %s: %w", ta.Target, err)
+			return err
 		}
-		// A short page (incl. empty) is the end of this segment. On the WRAPPED pass, also
-		// stop at startAfter — trim objects >= it (already checked in pass 1) BEFORE tallying,
-		// so the boundary page isn't double-counted.
+		// A short page (incl. empty) is the end of this segment. On the WRAPPED pass, also stop at
+		// startAfter — trim ids >= it (already covered in pass 1) BEFORE emitting, so the boundary
+		// page isn't double-counted.
 		segmentEnd := len(page) < limit
 		if wrapped {
 			var atBoundary bool
@@ -176,24 +209,20 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 			}
 		}
 		if len(page) > 0 {
-			results := existsPage(ctx, t.Sink, page)
-			// If cancellation landed mid-page, the in-flight Exists calls returned ctx.Canceled
-			// — don't count those tainted errors (they'd falsely trip Unverifiable); surface it.
-			if err := ctx.Err(); err != nil {
-				return ta, err
+			if err := emit(page); err != nil {
+				return err
 			}
-			ta.tally(results)
+			consumed += len(page)
 			after = page[len(page)-1]
 		}
 		if segmentEnd {
-			if wrapEnd(samplePerTarget, startAfter, &wrapped) {
+			if wrapEnd(sample, startAfter, &wrapped) {
 				after = "" // end of [startAfter,end) with budget left → wrap once to the start
 				continue
 			}
-			break
+			return nil
 		}
 	}
-	return ta, nil
 }
 
 // trimAtBoundary returns page truncated at the first externalID >= boundary (the wrapped pass

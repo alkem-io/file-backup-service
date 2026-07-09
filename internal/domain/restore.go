@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
@@ -50,10 +52,19 @@ var errHashMismatch = errors.New("hash mismatch")
 // it is hash-verified first — a corrupt file in the primary store does not mask the
 // good backup copy.
 func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
+	_, err := restoreObjectTo(ctx, src, hash, destDir)
+	return err
+}
+
+// restoreObjectTo is RestoreObject reporting whether the object was ALREADY present + intact at
+// the destination (skipped=true, no write) versus freshly restored — so RestoreAll can report a
+// resumable restored/skipped split without a second Stat. Every caller passes the same cap and
+// verify rules; the bool is the only addition.
+func restoreObjectTo(ctx context.Context, src Sink, hash, destDir string) (skipped bool, err error) {
 	// Validate before hash is used as a path component: filepath.Join(destDir, "../..")
 	// resolves the traversal and escapes destDir, and src.Fetch keys the sink on it too.
 	if err := fsutil.ValidateContentHash(hash); err != nil {
-		return err
+		return false, err
 	}
 	dest := filepath.Join(destDir, hash)
 	// One os.Open (not os.Stat THEN os.Open): Open already reports non-existence, so a
@@ -65,19 +76,70 @@ func RestoreObject(ctx context.Context, src Sink, hash, destDir string) error {
 		overCap, verr := copyVerify(io.Discard, ctxReader{ctx, f}, hash)
 		_ = f.Close()
 		if verr == nil && !overCap {
-			return nil // already present and intact
+			return true, nil // already present and intact
 		}
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		// present but corrupt/mismatched — overwrite with the good backup copy.
 	}
 	// 0644 so file-service (uid 65532) can read restored objects. The temp/fsync/
 	// ctx-gate/commit ceremony is the same durable spine the sink write uses.
-	return fsutil.CommitWrite(ctx, destDir, hash, func(tmp *os.File) error {
+	return false, fsutil.CommitWrite(ctx, destDir, hash, func(tmp *os.File) error {
 		// reset rewinds the temp if the rare magic-collision fallback re-decodes it.
 		return decodeStream(ctx, src, hash, tmp, func() error { return rewindTruncate(tmp) })
 	})
+}
+
+// RestoreAllStats summarizes a whole-store restore.
+type RestoreAllStats struct {
+	Restored int // freshly restored (fetched + decoded + hash-verified + written)
+	Skipped  int // already present + intact at the destination (idempotent re-run)
+	Failed   int // a hash-mismatch / unreadable source — the object was NOT restored
+}
+
+// RestoreAll restores every object the ledger records stored ON targetName from src to destDir
+// (T023/contracts restore all): keyset-paged over the ledger (no held snapshot on the ledger DB),
+// idempotent (an already-present, intact object is skipped, so a re-run resumes), and concurrent
+// (bounded by `concurrency`, overlapping the per-object fetch/decode/write latency). It reuses the
+// exact single-object restore path, so every restored object is hash-verified before it counts. A
+// per-object failure is counted and the pass continues; ctx cancellation stops it (a re-run
+// resumes from where it left off). concurrency<=0 floors to 1.
+func RestoreAll(ctx context.Context, led Ledger, src Sink, targetName, destDir string, concurrency int, perObjectTimeout time.Duration) (RestoreAllStats, error) {
+	perObjectTimeout = normalizePerObjectTimeout(perObjectTimeout)
+	var st RestoreAllStats
+	var mu sync.Mutex
+	err := runBoundedPaced(ctx, concurrency, 0,
+		func(yield func(string) error) error {
+			return KeysetLoop("", KeysetPageSize,
+				func(after string, limit int) ([]string, error) {
+					return led.StoredExternalIDsPage(ctx, targetName, after, limit)
+				},
+				func(id string) string { return id },
+				yield)
+		},
+		func(hash string) { restoreAllOne(ctx, src, hash, destDir, perObjectTimeout, &st, &mu) })
+	return st, err
+}
+
+// restoreAllOne restores one object under a per-object deadline, folding the outcome into st
+// (mutated under mu — the restores run concurrently). A panic (a poison object) is contained as a
+// counted failure so it can't crash the whole pass.
+func restoreAllOne(ctx context.Context, src Sink, hash, destDir string, perObjectTimeout time.Duration, st *RestoreAllStats, mu *sync.Mutex) {
+	defer recoverFailed(mu, &st.Failed)
+	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
+	defer cancel()
+	skipped, err := restoreObjectTo(octx, src, hash, destDir)
+	mu.Lock()
+	defer mu.Unlock()
+	switch {
+	case err != nil:
+		st.Failed++
+	case skipped:
+		st.Skipped++
+	default:
+		st.Restored++
+	}
 }
 
 // VerifyObject streams hash from src and confirms it decodes+hashes to hash,

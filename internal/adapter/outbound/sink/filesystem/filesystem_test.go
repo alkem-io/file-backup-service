@@ -3,6 +3,7 @@ package filesystem
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,6 +33,67 @@ func TestSinkRejectsTraversalHash(t *testing.T) {
 	// Confirm nothing was written outside the root by the rejected Stores.
 	if _, err := os.Stat("/etc/passwd_fbs_probe"); err == nil {
 		t.Fatal("a rejected Store must not have written outside the root")
+	}
+}
+
+// TestLatestManifestPicksNewest: the inventory reader returns the lexicographically-highest
+// (newest, since names are UTC-nanosecond timestamps) .jsonl under _manifest/.
+func TestLatestManifestPicksNewest(t *testing.T) {
+	root := t.TempDir()
+	s := New("fs", root)
+	ctx := context.Background()
+	newest := []byte(`{"externalID":"newest"}` + "\n")
+	// PutManifest writes under _manifest/<name>. Two snapshots; the higher name is newest.
+	if err := s.PutManifest(ctx, "2026-01-01T000000.000000000Z.jsonl", bytes.NewReader([]byte("old\n"))); err != nil {
+		t.Fatalf("put old manifest: %v", err)
+	}
+	if err := s.PutManifest(ctx, "2026-06-01T000000.000000000Z.jsonl", bytes.NewReader(newest)); err != nil {
+		t.Fatalf("put new manifest: %v", err)
+	}
+	rc, err := s.LatestManifest(ctx)
+	if err != nil {
+		t.Fatalf("LatestManifest: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	if err != nil || !bytes.Equal(got, newest) {
+		t.Fatalf("want the newest manifest, got %q err=%v", got, err)
+	}
+}
+
+// TestLatestManifestNoneIsNotExist: no manifest dir (or an empty one) is a wrapped os.ErrNotExist,
+// which the audit maps to "unverifiable — nothing to diff", not a failure.
+func TestLatestManifestNoneIsNotExist(t *testing.T) {
+	s := New("fs", t.TempDir())
+	if _, err := s.LatestManifest(context.Background()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a missing manifest dir must wrap os.ErrNotExist, got %v", err)
+	}
+	// A manifest dir with only non-.jsonl entries also yields ErrNotExist (nothing to diff).
+	root := t.TempDir()
+	s2 := New("fs", root)
+	dir := filepath.Join(root, "_manifest")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := s2.LatestManifest(context.Background()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a manifest dir with no .jsonl must be os.ErrNotExist, got %v", err)
+	}
+}
+
+// TestLatestManifestReadDirError: a _manifest path that is a FILE (not a dir) makes ReadDir fail
+// with a non-ErrNotExist error, which must propagate (not be masked as "no manifest").
+func TestLatestManifestReadDirError(t *testing.T) {
+	root := t.TempDir()
+	// Put a regular file where the _manifest dir would be → ReadDir returns ENOTDIR.
+	if err := os.WriteFile(filepath.Join(root, "_manifest"), []byte("x"), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write blocker: %v", err)
+	}
+	_, err := New("fs", root).LatestManifest(context.Background())
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a non-ErrNotExist ReadDir error must propagate, got %v", err)
 	}
 }
 

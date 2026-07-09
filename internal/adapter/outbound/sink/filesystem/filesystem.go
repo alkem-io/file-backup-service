@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
@@ -112,6 +113,42 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 	dest := s.osPath(fsutil.ManifestKey(name))
 	_, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r)
 	return err
+}
+
+// LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem
+// sink's half of domain's optional inventoryReader capability (audit target→ledger). Manifest
+// names are UTC-nanosecond timestamps, so the lexicographically-highest name is the newest. A
+// missing manifest dir or an empty one returns a wrapped os.ErrNotExist (the domain maps that to
+// "unverifiable — nothing to diff"). Filesystem targets have no object-lock, so this sink
+// deliberately does NOT implement CheckImmutability — a filesystem WORM target is reported
+// unverifiable for the drift check, which is correct (POSIX has no bucket object-lock to read).
+func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
+	dir := s.osPath(fsutil.ManifestDir())
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no manifest dir %s: %w", dir, os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("read manifest dir %s: %w", dir, err)
+	}
+	var latest string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		if name > latest {
+			latest = name
+		}
+	}
+	if latest == "" {
+		return nil, fmt.Errorf("no manifest in %s: %w", dir, os.ErrNotExist)
+	}
+	f, err := os.Open(filepath.Join(dir, latest)) //nolint:gosec // latest is a dir entry name under the configured root, not caller-supplied
+	if err != nil {
+		return nil, fmt.Errorf("open manifest %s: %w", latest, err)
+	}
+	return f, nil
 }
 
 // writeAtomic streams r into dir/base (0644) via the shared fsutil.CommitWrite durable
