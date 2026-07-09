@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -149,6 +150,31 @@ func TestDrillCancelDuringObjectIsInterruptNotFailure(t *testing.T) {
 	}
 	if out.Failed != 0 {
 		t.Fatalf("a cancellation must NOT be counted as a failed object, got Failed=%d", out.Failed)
+	}
+}
+
+// TestDrillOneGenuineFailureAtSIGTERMCountsFailed (re-review item 3): the drill's per-object
+// classifier shares cancelledInFlight with restore-all — a hash-mismatch whose classification
+// coincides with a parent SIGTERM must count as a Failed drill object, NOT be swallowed as an
+// interruption (which would read the drill green on real corruption). Same sequencing as the
+// restore-all counterpart; FAILS if cancelledInFlight is reverted to the imprecise predicate.
+func TestDrillOneGenuineFailureAtSIGTERMCountsFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := newMemSink("t")
+	h := hashOf("wanted")
+	sink.store[h] = []byte("bytes that do NOT hash to the key") // decode → hash-mismatch (non-Canceled)
+	var out DrillOutcome
+	var mu sync.Mutex
+	mu.Lock()
+	done := make(chan struct{})
+	go func() { drillOne(ctx, sink, h, t.TempDir(), time.Minute, &out, &mu); close(done) }()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	mu.Unlock()
+	<-done
+	if out.Failed != 1 || out.Passed != 0 {
+		t.Fatalf("a hash-mismatch coinciding with SIGTERM must be a Failed drill object, not swallowed: %+v", out)
 	}
 }
 

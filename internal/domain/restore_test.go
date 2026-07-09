@@ -8,9 +8,37 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// TestRestoreAllOneGenuineFailureAtSIGTERMCountsFailed (re-review item 3): a hash-mismatch (a REAL
+// corruption) whose per-object CLASSIFICATION coincides with a parent SIGTERM must be counted
+// Failed, NOT Cancelled — else `restore all` exits 0 on real corruption. The object is decoded with
+// the parent LIVE (so the mismatch, not a ctx error, is the result), then the parent is cancelled
+// while the worker is blocked entering its stats switch (holding the stats mutex sequences it). This
+// FAILS if cancelledInFlight is reverted to the imprecise `err!=nil && parent.Err()!=nil`, which
+// would bucket the mismatch as Cancelled.
+func TestRestoreAllOneGenuineFailureAtSIGTERMCountsFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := newMemSink("t")
+	h := hashOf("wanted")
+	sink.store[h] = []byte("bytes that do NOT hash to the key") // decode → hash-mismatch (non-Canceled)
+	var st RestoreAllStats
+	var mu sync.Mutex
+	mu.Lock() // hold the stats mutex so the worker blocks BEFORE classifying (after the decode)
+	done := make(chan struct{})
+	go func() { restoreAllOne(ctx, sink, h, t.TempDir(), time.Minute, &st, &mu); close(done) }()
+	time.Sleep(100 * time.Millisecond) // the decode (parent live → mismatch) finishes; worker parks on mu.Lock()
+	cancel()                           // a SIGTERM coinciding with the classification
+	mu.Unlock()
+	<-done
+	if st.Failed != 1 || st.Cancelled != 0 {
+		t.Fatalf("a hash-mismatch coinciding with SIGTERM must be Failed, not Cancelled: %+v", st)
+	}
+}
 
 // TestDecodeStreamAbandonsWedgedSource: a filesystem source whose Fetch blocks uninterruptibly
 // (a wedged mount) must NOT hang decodeStream past its ctx deadline — the abandonment wrapper

@@ -85,30 +85,35 @@ type ImmutabilityGauge interface {
 
 // ImmutabilitySampler drives the filebackup_immutability_ok gauge from serve: it periodically
 // re-checks every Worm target and maps each verdict's Status to a gauge action (below). It lives in
-// domain (not a cmd closure) so the derive-gauge-from-Status policy is fake-testable.
+// domain (not a cmd closure) so the derive-gauge-from-Status policy is fake-testable. It tracks which
+// targets have EVER been verifiable this session, so it can tell a by-design write-only WORM copy
+// (never readable — expected) from a target that WAS readable and lost its read access (unexpected).
 type ImmutabilitySampler struct {
-	targets []Target
-	gauge   ImmutabilityGauge
+	targets      []Target
+	gauge        ImmutabilityGauge
+	verifiedOnce map[string]bool // target -> has been Verified/Drifted (i.e. readable) at least once
 }
 
 // NewImmutabilitySampler binds a sampler to the target set + the gauge sink.
 func NewImmutabilitySampler(targets []Target, gauge ImmutabilityGauge) *ImmutabilitySampler {
-	return &ImmutabilitySampler{targets: targets, gauge: gauge}
+	return &ImmutabilitySampler{targets: targets, gauge: gauge, verifiedOnce: make(map[string]bool, len(targets))}
 }
 
 // Sample runs one drift-check pass and derives the gauges from each verdict's Status:
-//   - Verified → SetImmutabilityOK(1); clear the unverifiable signal.
-//   - Drift → SetImmutabilityOK(0); clear the unverifiable signal.
-//   - NoData (structural — a target that can NEVER report object-lock) → drop the _ok series; no
-//     unverifiable signal (it is expected, not an anomaly — a filesystem WORM target has no bucket
-//     object-lock to read).
-//   - Unverifiable / Fault (a read-deny, timeout, wedged probe, or driver panic on a target that
-//     SHOULD be readable) → DROP the _ok series (so a rotated-to-write-only credential can't freeze
-//     stale-green and mask a later real drift) AND raise the distinct unverifiable signal (so the
-//     dropped series is alertable, not silent). This is the fix for the stale-green masking.
+//   - Verified → SetImmutabilityOK(1); clear the unverifiable signal; mark the target readable.
+//   - Drift → SetImmutabilityOK(0); clear the unverifiable signal; mark the target readable.
+//   - NoData (structural — a target that can NEVER report object-lock, e.g. a filesystem WORM) → drop
+//     the _ok series; no unverifiable signal (it is expected, not an anomaly).
+//   - Unverifiable / Fault (a read-deny, timeout, wedged probe, or driver panic) → always DROP the
+//     _ok series (so a rotated-to-write-only credential can't freeze stale-green and mask a later
+//     real drift), but raise the distinct unverifiable signal ONLY when the target was EVER readable
+//     this session. A by-design write-only WORM copy (PutObject-only worker credential — the standard
+//     immutable prod config) is NEVER readable, so its 403 is EXPECTED and stays SILENT: paging on it
+//     would be a continuous false alarm, and its immutability is asserted by object-lock itself, the
+//     audit path (run with a read credential), and never_verified — not this serve-time probe. This
+//     matches the audit fail-policy, where Failed(worm)=false leaves the same target benign.
 //
-// It never returns an error for an unverifiable target (that is an expected state of a PutObject-only
-// WORM copy); a genuine drift is surfaced through the gauge (0), not this return.
+// It never returns an error for an unverifiable target; a genuine drift is surfaced via the gauge (0).
 func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -116,17 +121,19 @@ func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 	for _, v := range CheckImmutability(ctx, s.targets).Targets {
 		switch v.Status {
 		case StatusVerified:
+			s.verifiedOnce[v.Target] = true
 			s.gauge.SetImmutabilityOK(v.Target, true)
 			s.gauge.SetImmutabilityUnverifiable(v.Target, false)
 		case StatusDrift:
+			s.verifiedOnce[v.Target] = true
 			s.gauge.SetImmutabilityOK(v.Target, false)
 			s.gauge.SetImmutabilityUnverifiable(v.Target, false)
 		case StatusNoData:
 			s.gauge.ClearImmutabilityOK(v.Target)
 			s.gauge.SetImmutabilityUnverifiable(v.Target, false)
-		default: // Unverifiable / Fault: drop stale-green, raise the distinct alertable signal
+		default: // Unverifiable / Fault: drop stale-green; alert ONLY on an UNEXPECTED loss of read access
 			s.gauge.ClearImmutabilityOK(v.Target)
-			s.gauge.SetImmutabilityUnverifiable(v.Target, true)
+			s.gauge.SetImmutabilityUnverifiable(v.Target, s.verifiedOnce[v.Target])
 		}
 	}
 	return nil

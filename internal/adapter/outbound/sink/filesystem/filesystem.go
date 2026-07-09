@@ -63,7 +63,11 @@ func (s *Sink) Preflight(ctx context.Context) error {
 	return nil
 }
 
-// Exists reports whether the object is present.
+// Exists reports whether the object is present. A missing object is reported absent ONLY once the
+// root is confirmed present: a detached/gone root (a mount that vanished) makes EVERY object's
+// os.Stat return IsNotExist, so without this guard the ledger→target audit would read the whole
+// target as silent loss (missing>0 → Drift). A gone root instead surfaces as an ERROR, which the
+// audit classifies as Unverifiable — the filesystem analogue of the s3 sink's confirmBucket-on-404.
 func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 	path, err := s.pathFor(hash)
 	if err != nil {
@@ -74,7 +78,10 @@ func (s *Sink) Exists(_ context.Context, hash string) (bool, error) {
 	case err == nil:
 		return true, nil
 	case os.IsNotExist(err):
-		return false, nil
+		if rerr := s.confirmRoot(); rerr != nil {
+			return false, rerr // the "object" absence is really a gone/unreachable root
+		}
+		return false, nil // root present → the object is genuinely absent
 	default:
 		return false, fmt.Errorf("stat: %w", err)
 	}

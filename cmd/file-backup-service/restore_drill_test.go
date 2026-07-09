@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/alkem-io/file-backup-service/internal/adapter/inbound/metrics"
 	"github.com/alkem-io/file-backup-service/internal/config"
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
@@ -223,6 +225,49 @@ func TestRunRestoreVersionHashDefaultsToFirstTarget(t *testing.T) {
 
 // ---- config-error paths of the ledger-backed restore/drill subcommands ----
 // Each fails on ValidateDR (fsConfig has no ledgerDB) BEFORE opening a pool.
+
+// TestDrillReportInterruptedPreservesTextfile (re-review item 4): an INTERRUPTED drill (derr is a
+// ctx cancellation) must write NO gauges — it must not clobber the prior textfile's pass=1 with a red
+// pass=0, nor reset last_success — and must still exit nonzero. This FAILS if the
+// `errors.Is(derr, context.Canceled)` early-return is removed (drillReport would then write pass=0).
+func TestDrillReportInterruptedPreservesTextfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	// A prior FULL PASS writes the file (a separate short-lived drill process).
+	pass := metrics.NewDrillMetrics()
+	pass.SetPass(true, time.Unix(1_700_000_000, 0))
+	if err := pass.WriteTextfile(path); err != nil {
+		t.Fatalf("seed pass textfile: %v", err)
+	}
+	// An interrupted run (a partial outcome + a ctx-cancellation error) must leave the file untouched.
+	err := drillReport(domain.DrillOutcome{Target: "t", Passed: 3}, context.Canceled, path, "t")
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("an interrupted drill must return the ctx error (nonzero exit), got %v", err)
+	}
+	b, rerr := os.ReadFile(path) //nolint:gosec // test temp path
+	if rerr != nil {
+		t.Fatalf("read textfile: %v", rerr)
+	}
+	body := string(b)
+	if !strings.Contains(body, "filebackup_restore_drill_pass 1") {
+		t.Fatalf("an interrupted drill must NOT clobber the prior pass=1 with a red pass=0:\n%s", body)
+	}
+	if !strings.Contains(body, "filebackup_drill_last_success_timestamp_seconds 1.7e+09") {
+		t.Fatalf("an interrupted drill must NOT reset last_success:\n%s", body)
+	}
+}
+
+// TestDrillReportPassWritesGauges: a clean full-pass drill writes pass=1 + the last-success timestamp
+// (the non-interrupted path drillReport takes).
+func TestDrillReportPassWritesGauges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	if err := drillReport(domain.DrillOutcome{Target: "t", Passed: 5}, nil, path, "t"); err != nil {
+		t.Fatalf("a clean full-pass drill must succeed, got %v", err)
+	}
+	b, _ := os.ReadFile(path) //nolint:gosec // test temp path
+	if !strings.Contains(string(b), "filebackup_restore_drill_pass 1") {
+		t.Fatalf("a passing drill must write pass=1:\n%s", b)
+	}
+}
 
 // TestRunRestoreVersionVerbRenamed: the old `restore version` verb errors loud pointing at
 // `restore current` (Pillar 7), rather than silently falling through to the bare-hash alias.

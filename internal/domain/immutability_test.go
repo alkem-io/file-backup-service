@@ -119,16 +119,17 @@ func TestImmutabilitySamplerPolicy(t *testing.T) {
 	if v, ok := g.set["drift"]; !ok || v {
 		t.Fatalf("drift must set gauge false, got %v/%v", v, ok)
 	}
-	// denied = Unverifiable: DROP the stale-green _ok series AND raise the distinct signal (the fix
-	// for stale-green masking — a rotated-to-write-only credential can't freeze the gauge at 1).
+	// denied = Unverifiable, never verified this pass (a by-design write-only WORM): DROP the _ok
+	// series (no stale-green) but stay SILENT — do NOT raise the distinct signal (its 403 is expected;
+	// paging on the standard immutable prod config would be a continuous false alarm).
 	if _, ok := g.set["denied"]; ok {
 		t.Fatal("an unverifiable target must NOT keep an _ok series")
 	}
 	if !g.cleared["denied"] {
 		t.Fatal("an unverifiable target must CLEAR its _ok series (no stale-green)")
 	}
-	if !g.unverif["denied"] {
-		t.Fatal("an unverifiable target must RAISE the distinct unverifiable signal")
+	if g.unverif["denied"] {
+		t.Fatal("a by-design (never-verified) unverifiable WORM target must NOT raise the unverifiable signal")
 	}
 	// nocap = structural NoData: drop the _ok series but do NOT alert (it can never carry a signal).
 	if !g.cleared["nocap"] {
@@ -142,10 +143,11 @@ func TestImmutabilitySamplerPolicy(t *testing.T) {
 	}
 }
 
-// TestImmutabilitySamplerDropsStaleGreenOnTransient (Pillar 1): a target that was verifiable-green
-// then turns transiently unverifiable must NOT stay frozen stale-green — the _ok series is DROPPED
-// and the distinct unverifiable signal is raised, so a later real drift can't be masked.
-func TestImmutabilitySamplerDropsStaleGreenOnTransient(t *testing.T) {
+// TestImmutabilitySamplerAlertsOnLostReadAccess (Pillar 1): a target that was verifiable-green then
+// turns unverifiable (an UNEXPECTED loss of read access — e.g. a credential rotated to write-only)
+// must NOT stay frozen stale-green — the _ok series is DROPPED and, BECAUSE it was readable before,
+// the distinct unverifiable signal IS raised, so a later real drift can't be masked.
+func TestImmutabilitySamplerAlertsOnLostReadAccess(t *testing.T) {
 	g := newFakeImmGauge()
 	sink := &immSink{stubSink: stubSink{name: "flip"}, lock: true, versioning: true}
 	s := NewImmutabilitySampler([]Target{wormTarget(sink)}, g)
@@ -155,15 +157,37 @@ func TestImmutabilitySamplerDropsStaleGreenOnTransient(t *testing.T) {
 	if v, present := g.set["flip"]; !present || !v {
 		t.Fatalf("pass 1 must set the series green, got %v/%v", v, present)
 	}
-	sink.err = errors.New("timeout") // pass 2: now transiently unreadable
+	sink.err = errors.New("timeout") // pass 2: the formerly-readable target now can't be read
 	if err := s.Sample(context.Background()); err != nil {
 		t.Fatalf("pass 2: %v", err)
 	}
 	if !g.cleared["flip"] {
-		t.Fatal("a transient-unverifiable pass must DROP the formerly-green series (no stale-green)")
+		t.Fatal("a now-unverifiable pass must DROP the formerly-green series (no stale-green)")
 	}
 	if !g.unverif["flip"] {
-		t.Fatal("dropping the green series must raise the distinct unverifiable signal (not go silent)")
+		t.Fatal("a target that LOST its read access must raise the distinct unverifiable signal (not go silent)")
+	}
+}
+
+// TestImmutabilitySamplerByDesignWormStaysSilent (re-review item 2): a WORM target that is
+// unverifiable FROM THE START (a PutObject-only worker credential — the standard immutable prod
+// config) is NEVER readable, so its 403 is EXPECTED: across passes the sampler clears any _ok series
+// but must NEVER raise the unverifiable signal — paging continuously on a healthy, correctly-immutable
+// target would be a false alarm. Its immutability is covered by object-lock + audit + never_verified.
+func TestImmutabilitySamplerByDesignWormStaysSilent(t *testing.T) {
+	g := newFakeImmGauge()
+	sink := &immSink{stubSink: stubSink{name: "offsite"}, err: errors.New("AccessDenied")} // 403 from inception
+	s := NewImmutabilitySampler([]Target{wormTarget(sink)}, g)
+	for pass := 1; pass <= 2; pass++ {
+		if err := s.Sample(context.Background()); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if _, ok := g.set["offsite"]; ok {
+			t.Fatalf("pass %d: a never-readable WORM target must have no _ok series", pass)
+		}
+		if g.unverif["offsite"] {
+			t.Fatalf("pass %d: a by-design write-only WORM target must NOT raise the unverifiable signal (false alarm)", pass)
+		}
 	}
 }
 

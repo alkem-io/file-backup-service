@@ -865,26 +865,30 @@ func runDrill(args []string) error {
 		fmt.Printf("drill FAIL %s: %v\n", f.Hash, f.Err)
 	}
 	fmt.Printf("drill %s: checked=%d passed=%d failed=%d\n", name, outcome.Checked(), outcome.Passed, outcome.Failed)
+	return drillReport(outcome, derr, *metricsFile, name)
+}
 
-	// An INTERRUPTED drill (derr is a ctx cancellation) proved less than it sampled, so record NO
-	// gauges: writing pass=0 would page a false week-long failure, and clobbering last_success would
-	// reset a genuinely-recent success. Leave the prior textfile untouched and just exit nonzero.
+// drillReport records + exports the drill gauges and maps the outcome to an exit error — extracted
+// so the interruption invariant is unit-testable. On an INTERRUPTION (derr is a ctx cancellation) it
+// records NO gauges at all: writing a red pass=0 would page a false week-long failure and clobbering
+// last_success would reset a genuinely-recent success, so a clean SIGTERM must leave the prior
+// textfile untouched and just exit nonzero. Otherwise it writes the gauges (a full pass only when
+// nothing failed AND the drill wasn't interrupted; a textfile write failure is a warning, not a
+// drill failure — the exit code is the primary signal) and returns: an enumeration error, a distinct
+// 0-sampled failure (proved nothing — a renamed target / empty ledger), a not-every-object-passed
+// failure, or nil.
+func drillReport(outcome domain.DrillOutcome, derr error, metricsFile, name string) error {
 	if derr != nil && errors.Is(derr, context.Canceled) {
 		return derr
 	}
-	// Record + export the drill gauges (a full pass only when nothing failed AND the drill wasn't
-	// interrupted). A textfile write failure is a warning, not a drill failure — the exit code is
-	// the primary signal (kube_job_status_failed), the textfile is a convenience.
 	dm := metrics.NewDrillMetrics()
 	dm.SetPass(outcome.Pass() && derr == nil, time.Now())
-	if werr := dm.WriteTextfile(*metricsFile); werr != nil {
+	if werr := dm.WriteTextfile(metricsFile); werr != nil {
 		fmt.Fprintln(os.Stderr, "warning: drill metrics textfile:", werr)
 	}
 	if derr != nil {
 		return derr // an enumeration error — nonzero exit, never a clean pass
 	}
-	// A 0-checked drill proved nothing: it is a distinct failure (a renamed/misconfigured --from
-	// target, or an empty/wrong ledger), NOT a green "everything's fine" — so call it out.
 	if outcome.Checked() == 0 {
 		return fmt.Errorf("restore drill sampled 0 objects on %s — nothing to drill (renamed/misconfigured target, or an empty/wrong ledger?)", name)
 	}

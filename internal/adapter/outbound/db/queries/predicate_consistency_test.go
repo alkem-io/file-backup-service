@@ -42,3 +42,31 @@ func TestCoverageAndGapPredicatesAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestInventoryPagingIsByteOrdered guards the COLLATE "C" contract at the SQL-string level: the
+// audit target→ledger inventory diff (domain.mergeInventory) lock-steps the ledger's paged
+// externalIDs against a manifest using Go's byte-order `<`, and manifestIterator enforces
+// strictly-ascending BYTE order — so the ledger paging queries MUST order (and range-filter) in byte
+// order, not a locale collation, or the diff mis-counts drift AND a valid manifest is rejected as
+// non-ascending. Both StoredExternalIDsPage (the audit/ledger sweep) and StoredObjectsPage (the
+// manifest export the diff is compared against) must pin `COLLATE "C"` on BOTH the keyset range
+// predicate and the ORDER BY, so the predicate and the ordering can't disagree (which would skip or
+// repeat keyset rows). There is no live-DB test on a locale-collated database here, so this asserts
+// the compiled SQL — a mechanical guard that FAILS if the collation is stripped, not padding.
+func TestInventoryPagingIsByteOrdered(t *testing.T) {
+	for _, q := range []struct {
+		name, sql, order string
+	}{
+		{"StoredExternalIDsPage", storedExternalIDsPage, `ORDER BY "externalID" COLLATE "C"`},
+		{"StoredObjectsPage", storedObjectsPage, `ORDER BY o."externalID" COLLATE "C"`},
+	} {
+		// The keyset range predicate must be byte-ordered (consistent with the ORDER BY collation).
+		if !strings.Contains(q.sql, `> $2 COLLATE "C"`) {
+			t.Errorf("%s: keyset range predicate is not byte-ordered — missing `> $2 COLLATE \"C\"`; a locale collation would skip/repeat keyset rows", q.name)
+		}
+		// The ORDER BY must be byte-ordered so the DB order matches mergeInventory's byte-order merge.
+		if !strings.Contains(q.sql, q.order) {
+			t.Errorf("%s: ORDER BY is not byte-ordered — missing %q; the inventory diff would mis-count and reject valid manifests", q.name, q.order)
+		}
+	}
+}

@@ -45,11 +45,12 @@ type Metrics struct {
 	// series is NEVER emitted (so the `== 0` alert can't false-fire on an inherently
 	// unverifiable PutObject-only credential — the never-verified/audit signals cover it).
 	immutabilityOK *prometheus.GaugeVec
-	// immutabilityUnverifiable is the DISTINCT unverifiable signal (Pillar 1): per Worm target the
-	// worker SHOULD be able to read, 1 = it has been unverifiable this pass (a credential rotated to
-	// write-only, a persistent read-deny, a wedged endpoint). It exists so the _ok series can be
-	// DROPPED when a target turns unreadable — avoiding a frozen stale-green that masks a later real
-	// drift — WITHOUT going silent: alert on `filebackup_immutability_unverifiable == 1` sustained.
+	// immutabilityUnverifiable is the DISTINCT unverifiable signal (Pillar 1): per Worm target that
+	// WAS readable this session and is now unverifiable, 1 = an UNEXPECTED loss of read access (a
+	// credential rotated to write-only, a wedged endpoint). It exists so the _ok series can be DROPPED
+	// when a formerly-green target turns unreadable — avoiding a frozen stale-green that masks a later
+	// real drift — WITHOUT going silent. A by-design write-only WORM copy (never readable) does NOT
+	// raise it (its 403 is expected; paging on it would be a false alarm). Alert on == 1 sustained.
 	immutabilityUnverifiable *prometheus.GaugeVec
 	byTarget                 sync.Map // target name -> *targetCounters (resolved once, per target)
 }
@@ -118,7 +119,7 @@ func New() *Metrics {
 		}, []string{"target"}),
 		immutabilityUnverifiable: f.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "filebackup_immutability_unverifiable",
-			Help: "Per WORM target the worker SHOULD be able to read: 1 = its object-lock/versioning could NOT be read this pass (a credential rotated to write-only, a persistent read-deny, a wedged endpoint). Set when the _ok series is dropped so the drop is alertable, not silent — alert on == 1 sustained. A structurally-unreadable target (a filesystem WORM with no bucket object-lock) does NOT set this (it is expected, not an anomaly).",
+			Help: "Per WORM target that WAS readable this session and is now unverifiable: 1 = an UNEXPECTED loss of read access (a credential rotated to write-only, a wedged endpoint). Set when the formerly-green _ok series is dropped so the drop is alertable, not silent — alert on == 1 sustained. A by-design write-only WORM copy (never readable — the standard immutable prod config) does NOT set this: its 403 is expected and its immutability is asserted by object-lock + the audit path (with a read credential) + never_verified, not this serve-time probe.",
 		}, []string{"target"}),
 	}
 }
