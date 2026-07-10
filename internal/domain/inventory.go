@@ -383,9 +383,15 @@ func abandonableFetch(ctx context.Context, timeout time.Duration, fetch func() (
 // underlying ReadCloser: an abandoned read's goroutine keeps running against rc, so Close() must NOT
 // close rc concurrently — the abandon path closes rc only AFTER that goroutine finishes (no fd race).
 type stallReader struct {
-	ctx       context.Context
-	rc        io.ReadCloser
-	timeout   time.Duration
+	ctx     context.Context
+	rc      io.ReadCloser
+	timeout time.Duration
+	// own is the read buffer, REUSED across Read calls. Reuse is safe ONLY because the sole consumer —
+	// manifestIterator's bufio.Scanner — permanently STOPS calling Read once it sees a non-nil error (an
+	// abandoned read returns DeadlineExceeded), so a background read goroutine still writing `own` after an
+	// abandon is never re-read by a later Read on this buffer. A future caller that RETRIES a Read after an
+	// error would race that goroutine on `own` — do NOT reuse stallReader outside manifestIterator without
+	// revisiting this. The `abandoned` short-circuit in Read enforces the no-re-read rule for THIS type.
 	own       []byte
 	abandoned bool // an abandon happened → the abandon path owns rc.Close(); Read/Close must not touch rc
 }
@@ -426,9 +432,21 @@ func (s *stallReader) Read(p []byte) (int, error) {
 // Close closes the underlying reader UNLESS a read was abandoned — in which case the abandon path
 // owns closing it (after the wedged read goroutine finishes), so Close must not race an in-flight
 // Read. Called by inventoryProbe via defer.
+//
+// The teardown close is BOUNDED like every other per-op step in the DR sweep: AuditInventory imposes no
+// whole-probe deadline, so a wedged rc.Close (a broken NFS mount, a pathological connection teardown)
+// would otherwise hang the audit critical path AFTER the diff is already computed. It abandons a wedged
+// close at the per-op timeout via the shared primitive — the abandoned goroutine is bounded and still
+// frees rc when the close eventually returns (no fd leak), so only the WAIT is bounded, not the close.
 func (s *stallReader) Close() error {
 	if s.abandoned {
 		return nil
 	}
-	return s.rc.Close()
+	cctx, cancel := context.WithTimeout(s.ctx, s.timeout)
+	defer cancel()
+	res := RunAbandonable(cctx,
+		func() readResult { return readResult{err: s.rc.Close()} },
+		func() readResult { return readResult{err: cctx.Err()} },
+		func(r any) readResult { return readResult{err: PanicErr("manifest close", r)} })
+	return res.err
 }

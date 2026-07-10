@@ -525,6 +525,33 @@ func TestStallReaderBoundsWedgedRead(t *testing.T) {
 	}
 }
 
+// blockingCloseReader reads promptly (EOF) but BLOCKS in Close IGNORING ctx — a wedged teardown (a
+// broken NFS mount, a pathological connection close). Only stallReader.Close's per-op bound can stop it.
+type blockingCloseReader struct{ release chan struct{} }
+
+func (blockingCloseReader) Read([]byte) (int, error) { return 0, io.EOF }
+func (b blockingCloseReader) Close() error           { <-b.release; return nil }
+
+// TestStallReaderBoundsWedgedClose (CodeRabbit inline #6): a NORMAL (non-abandoned) read completes, but
+// rc.Close() then WEDGES ignoring ctx. stallReader.Close must be BOUNDED at the per-op timeout — it must
+// never hang the audit critical path after the diff is already computed (AuditInventory imposes no
+// whole-probe deadline). The abandoned Close goroutine still frees rc when it eventually returns.
+func TestStallReaderBoundsWedgedClose(t *testing.T) {
+	br := blockingCloseReader{release: make(chan struct{})}
+	sr := &stallReader{ctx: context.Background(), rc: br, timeout: 50 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- sr.Close() }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a wedged teardown Close must be abandoned with a deadline error, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stallReader.Close HUNG on a wedged teardown — per-op bound not enforced")
+	}
+	close(br.release) // let the abandoned Close goroutine finish (frees rc — no leak)
+}
+
 // trackedCloser records whether Close was called (a leak detector for the abandon path).
 type trackedCloser struct{ closed chan struct{} }
 
