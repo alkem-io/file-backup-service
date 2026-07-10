@@ -190,7 +190,15 @@ func (s *Sink) confirmRoot() error {
 // returning ok=false when the pointer is absent/unreadable/empty. The name is VALIDATED by
 // OpenLatestManifest, not here.
 func (s *Sink) readManifestPointer() (string, bool) {
-	b, err := os.ReadFile(s.osPath(fsutil.ManifestLatestKey())) //nolint:gosec // fixed pointer key under the configured root
+	f, err := os.Open(s.osPath(fsutil.ManifestLatestKey())) //nolint:gosec // fixed pointer key under the configured root
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = f.Close() }()
+	// Cap the read at manifestPointerMax (a base name is tiny) — parity with the s3 sink's
+	// io.LimitReader(obj, 4096), so a corrupted/oversized _manifest/LATEST can't OOM the DR pod before
+	// ParseManifestPointer/IsTimestampedManifest rejects it.
+	b, err := io.ReadAll(io.LimitReader(f, fsutil.ManifestPointerMax))
 	if err != nil {
 		return "", false
 	}

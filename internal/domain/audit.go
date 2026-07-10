@@ -51,6 +51,20 @@ func storedPageBounded(ctx context.Context, led Ledger, target, after string, li
 	return led.StoredExternalIDsPage(pctx, target, after, limit)
 }
 
+// storedPageLedgerTagged fetches one bounded ledger page and, on error, tags it with the errLedgerRead
+// sentinel — the ONE owner of the load-bearing "a ledger-page read error must route to FAULT (never a
+// silent worm-exempt benign Unverifiable)" contract that classifyAuditErr / classifyInventoryErr key on.
+// Shared by BOTH the existence sweep (auditTarget's keysetSample pageFn) and the inventory sweep
+// (ledgerStoredPull's keysetPull pageFn), so a future change to the tagging can't update one direction
+// and leave the other misrouting a wedged ledger page to a benign pass on a WORM target.
+func storedPageLedgerTagged(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
+	page, err := storedPageBounded(ctx, led, target, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("%w: ledger page for %s: %w", errLedgerRead, target, err)
+	}
+	return page, nil
+}
+
 // randKeysetStart returns a random externalID-shaped hex string — a rotating keyset start so a
 // SAMPLED audit checks a different band each run instead of the same fixed lowest-prefix band
 // (a permanent blind spot). A failed rand falls back to "" (the beginning) so a sampled audit
@@ -137,11 +151,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 	exempt := targetUnverifiableExempt(t)
 	err := keysetSample(ctx, samplePerTarget, startAfter,
 		func(after string, limit int) ([]string, error) {
-			page, perr := storedPageBounded(ctx, led, name, after, limit)
-			if perr != nil {
-				return nil, fmt.Errorf("%w: audit target %s: %w", errLedgerRead, name, perr)
-			}
-			return page, nil
+			return storedPageLedgerTagged(ctx, led, name, after, limit)
 		},
 		func(page []string) error {
 			results := existsPage(ctx, t.Sink, page)

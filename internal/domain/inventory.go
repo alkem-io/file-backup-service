@@ -339,11 +339,7 @@ func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 func ledgerStoredPull(ctx context.Context, led Ledger, target string) func() (string, bool, error) {
 	return keysetPull("", KeysetPageSize,
 		func(after string, limit int) ([]string, error) {
-			page, err := storedPageBounded(ctx, led, target, after, limit)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %w", errLedgerRead, err)
-			}
-			return page, nil
+			return storedPageLedgerTagged(ctx, led, target, after, limit)
 		},
 		func(id string) string { return id })
 }

@@ -68,17 +68,27 @@ func cancelledInFlight(parentCtx context.Context, objErr error) bool {
 // runBoundedPaced dispatches each item `enumerate` yields to `work`, at up to `concurrency`
 // in flight and paced at ratePerSec DISPATCHES/sec (0 = unlimited). The pacer AND a semaphore
 // gate dispatch; each item runs in a worker goroutine; ALL in-flight workers are drained before
-// returning. This overlaps the per-object I/O latency of the batch/DR sweeps (backfill,
-// reconcile) — which the Concurrency knob sizes just like serve's worker pool — and, for
-// reconcile, removes the head-of-line stall where one slow object blocked the whole pass.
-// enumerate is the sweep source (backfill's EachFile / reconcile's TargetGaps); a yield/enumerate
-// error stops the sweep. The one owner of the bounded-paced worker-pool scaffold.
+// returning. This overlaps the per-object I/O latency of the batch/DR sweeps (backfill EachFile,
+// reconcile TargetGaps, restore-all, drill) — which the Concurrency knob sizes just like serve's
+// worker pool — and, for reconcile, removes the head-of-line stall where one slow object blocked the
+// whole pass. enumerate is the sweep source; a yield/enumerate error stops the sweep. The one owner of
+// the bounded-paced worker-pool scaffold, used by ALL FOUR sweeps (backupOne / repair / restoreAllOne /
+// drillOne).
+//
+// PANIC SAFETY: each work closure is REQUIRED to recover its own panic (recoverFailed /
+// recoverDrillFailure record it as a per-object failure so the sweep continues). This primitive adds a
+// BACKSTOP recover per worker so a panic a closure let ESCAPE its own guard (a forgotten defer, a future
+// caller) can NEVER crash the whole DR process via a fatal bare-goroutine panic — it is caught and
+// surfaced as a loud sweep error (the sweep fails nonzero, never silently swallows the poison object).
+// The per-site recover runs first (inside work), so this backstop never fires in normal operation.
 func runBoundedPaced[T any](ctx context.Context, concurrency, ratePerSec int, enumerate func(yield func(T) error) error, work func(T)) error {
 	concurrency = max(concurrency, 1)
 	wait, stop := newPacer(ratePerSec)
 	defer stop()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	var panicMu sync.Mutex
+	var escapedPanic error // the FIRST panic a work closure let escape its own recover (a bug backstop)
 	err := enumerate(func(item T) error {
 		if err := wait(ctx); err != nil { // pacer gates DISPATCH (nil = go, else stop the sweep)
 			return err
@@ -92,11 +102,23 @@ func runBoundedPaced[T any](ctx context.Context, concurrency, ratePerSec int, en
 		go func(item T) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() { // backstop: a panic work's own recover missed must not crash the process
+				if r := recover(); r != nil {
+					panicMu.Lock()
+					if escapedPanic == nil {
+						escapedPanic = PanicErr("bounded-paced worker", r)
+					}
+					panicMu.Unlock()
+				}
+			}()
 			work(item)
 		}(item)
 		return ctx.Err()
 	})
 	wg.Wait() // drain in-flight workers before the caller reads the stats
+	if err == nil {
+		err = escapedPanic // an escaped work-closure panic fails the sweep loud, never a silent green
+	}
 	return err
 }
 

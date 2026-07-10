@@ -966,8 +966,9 @@ func drillReport(outcome domain.DrillOutcome, derr error, metricsFile, name stri
 		return derr // interrupted OR an enumeration/infra fault — nonzero exit, prior textfile untouched
 	}
 	dm := metrics.NewDrillMetrics()
-	dm.SetPass(outcome.Pass(), time.Now())
-	if werr := dm.WriteTextfile(metricsFile); werr != nil {
+	pass := outcome.Pass()
+	dm.SetPass(pass, time.Now())
+	if werr := dm.WriteTextfile(metricsFile, pass); werr != nil {
 		fmt.Fprintln(os.Stderr, "warning: drill metrics textfile:", werr)
 	}
 	if outcome.Checked() == 0 {

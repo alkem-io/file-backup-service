@@ -3,6 +3,7 @@ package domain
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -32,6 +33,29 @@ func TestBackfillPerObjectTimeout(t *testing.T) {
 	}
 	if st.Failed != 2 || st.Backed != 0 {
 		t.Fatalf("stats: %+v (want both objects failed via per-object timeout)", st)
+	}
+}
+
+// TestRunBoundedPacedPanicBackstop (Alt#1 vanilla11): a work closure that lets a panic ESCAPE its own
+// recover (a forgotten guard / a future caller) must NOT crash the process via a fatal bare-goroutine
+// panic — runBoundedPaced's backstop recover catches it and surfaces it as a loud sweep error. (Against
+// the un-backstopped primitive this test would panic the test process instead of returning an error.)
+func TestRunBoundedPacedPanicBackstop(t *testing.T) {
+	err := runBoundedPaced(context.Background(), 2, 0,
+		func(yield func(int) error) error {
+			for i := 0; i < 3; i++ {
+				if e := yield(i); e != nil {
+					return e
+				}
+			}
+			return nil
+		},
+		func(_ int) { panic("poison object with no per-site recover") }) // NO defer recover in this closure
+	if err == nil {
+		t.Fatal("an escaped work-closure panic must surface as a sweep error, not be swallowed (and must not crash the process)")
+	}
+	if !errors.Is(err, ErrProbePanic) {
+		t.Fatalf("the escaped panic must be wrapped as ErrProbePanic, got %v", err)
 	}
 }
 

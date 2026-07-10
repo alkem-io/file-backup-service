@@ -201,14 +201,26 @@ func isReadDenied(err error) bool {
 // then-gone bucket reads as objects missing → Drift, which pages — the safe direction. So the two
 // directions intentionally use different bucket checks.) Reads via the audit/read credential.
 func (s *Sink) bucketPresentUncached(ctx context.Context) error {
-	ok, err := s.readClient().BucketExists(ctx, s.bucket)
-	if err != nil {
-		return fmt.Errorf("bucket %q existence check: %w", s.bucket, err)
+	_, err := s.bucketState(ctx)
+	return err
+}
+
+// bucketState does ONE fresh BucketExists and maps it to (definitive, err) — the ONE owner of the
+// BucketExists call + the "existence check" (transient) and "does not exist" (definitively gone) error
+// strings. `definitive` is true when the answer is CACHEABLE (a present bucket → (true,nil); a gone
+// bucket → (true,goneErr)) and false for a TRANSIENT BucketExists error (not cacheable → re-check next
+// probe). Shared by bucketPresentUncached (any error → Unverifiable for the inventory direction) and
+// confirmBucket (caches only the definitive verdict). So the two directions can't diverge on the probe
+// or the wording — only on the caching policy.
+func (s *Sink) bucketState(ctx context.Context) (definitive bool, err error) {
+	ok, berr := s.readClient().BucketExists(ctx, s.bucket)
+	if berr != nil {
+		return false, fmt.Errorf("bucket %q existence check: %w", s.bucket, berr) // transient — don't cache
 	}
 	if !ok {
-		return fmt.Errorf("bucket %q does not exist (deleted/renamed/misconfigured?)", s.bucket)
+		return true, fmt.Errorf("bucket %q does not exist (deleted/renamed/misconfigured?)", s.bucket)
 	}
-	return nil
+	return true, nil
 }
 
 // confirmBucket verifies the bucket exists, so Exists never mistakes a missing bucket for a missing
@@ -229,14 +241,12 @@ func (s *Sink) confirmBucket(ctx context.Context) error {
 	if s.bucketChecked { // a definitive present/gone verdict is cached
 		return s.bucketGone
 	}
-	ok, err := s.readClient().BucketExists(ctx, s.bucket)
-	if err != nil {
-		return fmt.Errorf("bucket %q existence check: %w", s.bucket, err) // transient — don't cache; re-check next probe
+	definitive, err := s.bucketState(ctx)
+	if !definitive {
+		return err // transient BucketExists error — don't cache; re-check next probe
 	}
-	s.bucketChecked = true // cache the definitive verdict (present → bucketGone stays nil; gone → set below)
-	if !ok {
-		s.bucketGone = fmt.Errorf("bucket %q does not exist (deleted/renamed/misconfigured?)", s.bucket)
-	}
+	s.bucketChecked = true // cache the definitive verdict (present → err is nil; gone → err is set)
+	s.bucketGone = err
 	return s.bucketGone
 }
 
@@ -449,7 +459,7 @@ func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	defer func() { _ = obj.Close() }()
-	b, err := io.ReadAll(io.LimitReader(obj, 4096)) // a base name — tiny
+	b, err := io.ReadAll(io.LimitReader(obj, fsutil.ManifestPointerMax)) // a base name — tiny; shared bound
 	if err != nil {
 		return "", false // includes a lazy 404/403 surfacing here → fall back to the scan
 	}

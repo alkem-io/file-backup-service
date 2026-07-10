@@ -348,7 +348,7 @@ func TestDrillReportInterruptedPreservesTextfile(t *testing.T) {
 	// A prior FULL PASS writes the file (a separate short-lived drill process).
 	pass := metrics.NewDrillMetrics()
 	pass.SetPass(true, time.Unix(1_700_000_000, 0))
-	if err := pass.WriteTextfile(path); err != nil {
+	if err := pass.WriteTextfile(path, true); err != nil {
 		t.Fatalf("seed pass textfile: %v", err)
 	}
 	// An interrupted run (a partial outcome + a ctx-cancellation error) must leave the file untouched.

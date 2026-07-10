@@ -246,7 +246,7 @@ func TestDrillMetricsSetAndTextfile(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "drill.prom")
-	if err := d.WriteTextfile(path); err != nil {
+	if err := d.WriteTextfile(path, true); err != nil {
 		t.Fatalf("WriteTextfile: %v", err)
 	}
 	b, err := os.ReadFile(path) //nolint:gosec // test temp path
@@ -263,7 +263,7 @@ func TestDrillMetricsSetAndTextfile(t *testing.T) {
 		t.Errorf("drill textfile must NOT carry runtime collectors (would collide with /metrics):\n%s", body)
 	}
 	// "" path is a no-op (the exit code carries the signal when no textfile is wired).
-	if err := d.WriteTextfile(""); err != nil {
+	if err := d.WriteTextfile("", true); err != nil {
 		t.Fatalf("empty path must be a no-op, got %v", err)
 	}
 }
@@ -280,7 +280,7 @@ func TestDrillWriteTextfileBadPath(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write blocker: %v", err)
 	}
-	if err := d.WriteTextfile(filepath.Join(blocker, "sub", "x.prom")); err == nil {
+	if err := d.WriteTextfile(filepath.Join(blocker, "sub", "x.prom"), true); err == nil {
 		t.Fatal("WriteTextfile under a file-as-dir must error")
 	}
 }
@@ -293,13 +293,13 @@ func TestDrillMetricsCarriesForwardLastSuccess(t *testing.T) {
 	// Process 1: a PASS at t=1700000000 writes the file.
 	pass := NewDrillMetrics()
 	pass.SetPass(true, time.Unix(1_700_000_000, 0))
-	if err := pass.WriteTextfile(path); err != nil {
+	if err := pass.WriteTextfile(path, true); err != nil {
 		t.Fatalf("pass write: %v", err)
 	}
 	// Process 2 (fresh metrics): a FAIL overwrites the file — last-success must be CARRIED FORWARD.
 	fail := NewDrillMetrics()
 	fail.SetPass(false, time.Unix(1_800_000_000, 0))
-	if err := fail.WriteTextfile(path); err != nil {
+	if err := fail.WriteTextfile(path, false); err != nil {
 		t.Fatalf("fail write: %v", err)
 	}
 	b, err := os.ReadFile(path) //nolint:gosec // test temp path

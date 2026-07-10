@@ -197,6 +197,12 @@ func FormatManifestName(t time.Time) string {
 	return t.UTC().Format(manifestTimeLayout) + manifestSuffix
 }
 
+// ManifestPointerMax bounds the `_manifest/LATEST` pointer READ on BOTH sinks (s3 io.LimitReader, fs
+// io.LimitReader) — the pointer body is a single manifest base name (~40 bytes), so 4 KiB is generous,
+// and the cap stops a corrupted/oversized pointer object from OOMing the DR pod before ParseManifestPointer
+// rejects it. One owner so the two sinks can't diverge on the guard.
+const ManifestPointerMax = 4096
+
 // ParseManifestPointer parses the raw bytes of the `_manifest/LATEST` pointer into a manifest base name,
 // returning ok=false when the pointer is empty/whitespace-only. The ONE owner of the pointer's on-disk/
 // on-object encoding, shared by the s3 and filesystem sinks' readManifestPointer (only the byte READ —

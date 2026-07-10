@@ -100,7 +100,14 @@ func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectT
 	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
 	defer cancel()
 	err := RestoreObject(octx, src, hash, scratchDir)
-	_ = os.Remove(filepath.Join(scratchDir, hash)) // best-effort; the caller RemoveAll's the whole dir
+	if err == nil {
+		// Remove the restored file to bound live scratch to one object (best-effort; the caller RemoveAll's
+		// the whole dir). ONLY on success: a successful RestoreObject validated `hash` as a safe path
+		// component (fsutil.ValidateContentHash, so no "../" traversal) AND wrote destDir/<hash>; a FAILED
+		// restore wrote nothing (CommitWrite removes its own temp), so there is nothing to clean up and we
+		// never build an os path from an unvalidated hash — the repo's validate-at-every-path-boundary rule.
+		_ = os.Remove(filepath.Join(scratchDir, hash))
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if cancelledInFlight(ctx, err) {
