@@ -68,6 +68,24 @@ func TestLedgerStoredTargets(t *testing.T) {
 	}
 }
 
+func TestLedgerStoredCountByTarget(t *testing.T) {
+	r, mock := newMockLedger(t)
+	// The query returns counts for targets that HAVE stored objects; a configured target with none
+	// is absent from the result and must be filled with 0.
+	mock.ExpectQuery("count").WithArgs([]string{"a", "b", "empty"}).
+		WillReturnRows(pgxmock.NewRows([]string{"target", "n"}).AddRow("a", int64(5)).AddRow("b", int64(2)))
+	counts, err := r.StoredCountByTarget(context.Background(), []string{"a", "b", "empty"})
+	if err != nil {
+		t.Fatalf("stored count by target: %v", err)
+	}
+	if counts["a"] != 5 || counts["b"] != 2 {
+		t.Fatalf("want a=5 b=2, got %v", counts)
+	}
+	if n, ok := counts["empty"]; !ok || n != 0 {
+		t.Fatalf("a configured target with no stored objects must be present with 0, got %v (present=%v)", n, ok)
+	}
+}
+
 func TestLedgerStoredExternalIDsPage(t *testing.T) {
 	r, mock := newMockLedger(t)
 	mock.ExpectQuery("file_backup_target_status").WithArgs("t1", "after", int32(1000)).

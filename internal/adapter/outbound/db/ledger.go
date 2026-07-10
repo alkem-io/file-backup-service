@@ -178,6 +178,25 @@ func (r *LedgerRepo) Probe(ctx context.Context) error {
 	return nil
 }
 
+// StoredCountByTarget returns the count of objects currently stored on each of the given targets —
+// the restore-all completeness snapshot so an operator sees per-target disparity before trusting a
+// single-source restore. A target with no stored objects is present in the map with count 0 (the
+// query omits it; this fills it), so the caller sees every configured target.
+func (r *LedgerRepo) StoredCountByTarget(ctx context.Context, targets []string) (map[string]int, error) {
+	counts := make(map[string]int, len(targets))
+	for _, t := range targets {
+		counts[t] = 0
+	}
+	rows, err := r.q.StoredCountByTarget(ctx, targets)
+	if err != nil {
+		return nil, fmt.Errorf("stored count by target: %w", err)
+	}
+	for _, row := range rows {
+		counts[row.Target] = int(row.N)
+	}
+	return counts, nil
+}
+
 // StoredTargets returns the set of target names already in state='stored' for externalID
 // (the dedup source of truth) — the 'stored' filter is in SQL (ListStoredTargets), not Go.
 func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[string]bool, error) {

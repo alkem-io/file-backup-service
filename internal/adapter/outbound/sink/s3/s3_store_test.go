@@ -34,6 +34,7 @@ type storeStub struct {
 	getBody        []byte // GET body when getStatus == 200
 	putStatus      int    // status for a single-object PutObject (empty/manifest/preflight)
 	initiateStatus int    // status for POST ?uploads; 0 or 200 => success
+	failPointer    bool   // fail the write of the _manifest/LATEST pointer specifically
 
 	singlePuts []string // object keys received via a single PUT (no ?partNumber)
 	initiates  []string // object keys received via POST ?uploads (multipart initiate)
@@ -61,13 +62,7 @@ func (s *storeStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.Method == http.MethodPost && q.Has("uploads"): // initiate multipart
-		s.initiates = append(s.initiates, key)
-		if s.initiateStatus != 0 && s.initiateStatus != http.StatusOK {
-			writeStatusOrS3Error(w, s.initiateStatus, "AccessDenied")
-			return
-		}
-		writeXML(w, `<InitiateMultipartUploadResult><Bucket>`+bucket+`</Bucket><Key>`+key+
-			`</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
+		s.serveInitiate(w, bucket, key)
 	case r.Method == http.MethodPost && q.Get("uploadId") != "": // complete multipart
 		s.completes++
 		writeXML(w, `<CompleteMultipartUploadResult><Location>http://x/`+key+`</Location><Bucket>`+
@@ -94,6 +89,22 @@ func (s *storeStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+// serveInitiate handles a multipart-initiate (POST ?uploads), honoring the failPointer / initiate
+// status knobs. Split out to keep ServeHTTP under the cyclomatic budget.
+func (s *storeStub) serveInitiate(w http.ResponseWriter, bucket, key string) {
+	s.initiates = append(s.initiates, key)
+	if s.failPointer && strings.HasSuffix(key, "/LATEST") {
+		writeStatusOrS3Error(w, http.StatusForbidden, "AccessDenied")
+		return
+	}
+	if s.initiateStatus != 0 && s.initiateStatus != http.StatusOK {
+		writeStatusOrS3Error(w, s.initiateStatus, "AccessDenied")
+		return
+	}
+	writeXML(w, `<InitiateMultipartUploadResult><Bucket>`+bucket+`</Bucket><Key>`+key+
+		`</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
 }
 
 // writeXML writes a 200 XML response (the standard S3 envelope prefix + body).
@@ -259,24 +270,52 @@ func TestPreflightDeniedIsError(t *testing.T) {
 	}
 }
 
-// TestPutManifestRoutesToManifestPrefix: PutManifest streams a ledger snapshot through
-// putStream to a key under <prefix>/_manifest/. A non-empty snapshot goes multipart, so
-// the key is captured at the initiate request — this also exercises the target-prefix
-// join end-to-end. (S1)
+// TestPutManifestRoutesToManifestPrefix: PutManifest streams a ledger snapshot through putStream to
+// a key under <prefix>/_manifest/, AND overwrites the <prefix>/_manifest/LATEST pointer with the
+// snapshot name — both non-empty, so both go multipart and are captured at the initiate request.
+// This also exercises the target-prefix join end-to-end. (S1)
 func TestPutManifestRoutesToManifestPrefix(t *testing.T) {
 	stub := &storeStub{putStatus: http.StatusOK}
 	sink := newStoreSink(t, stub, "backups")
 
-	if err := sink.PutManifest(context.Background(), "snapshot-7", bytes.NewReader([]byte("ledger snapshot"))); err != nil {
+	if err := sink.PutManifest(context.Background(), "snapshot-7.jsonl", bytes.NewReader([]byte("ledger snapshot"))); err != nil {
 		t.Fatalf("PutManifest: %v", err)
 	}
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
-	if len(stub.initiates) != 1 {
-		t.Fatalf("PutManifest of a non-empty snapshot must open one multipart upload, got %d", len(stub.initiates))
+	got := map[string]bool{}
+	for _, k := range stub.initiates {
+		got[k] = true
 	}
-	if stub.initiates[0] != "backups/_manifest/snapshot-7" {
-		t.Fatalf("manifest key = %q, want backups/_manifest/snapshot-7", stub.initiates[0])
+	if !got["backups/_manifest/snapshot-7.jsonl"] {
+		t.Fatalf("manifest key not written, got initiates %v", stub.initiates)
+	}
+	if !got["backups/_manifest/LATEST"] {
+		t.Fatalf("LATEST pointer not written, got initiates %v", stub.initiates)
+	}
+}
+
+// TestPutManifestPointerWriteFailureSwallowed: the LATEST pointer is a read-time OPTIMIZATION —
+// SelectLatestManifest self-heals via a prefix scan when it is absent/stale — so a pointer-only write
+// failure must NOT fail PutManifest. When the pointer write is denied but the manifest object itself
+// writes durably, PutManifest returns nil, having still ATTEMPTED the pointer (proved by its initiate).
+func TestPutManifestPointerWriteFailureSwallowed(t *testing.T) {
+	stub := &storeStub{putStatus: http.StatusOK, failPointer: true}
+	sink := newStoreSink(t, stub, "backups")
+	if err := sink.PutManifest(context.Background(), "snapshot-9.jsonl", bytes.NewReader([]byte("ledger snapshot"))); err != nil {
+		t.Fatalf("a best-effort pointer-write failure must NOT fail PutManifest, got %v", err)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	got := map[string]bool{}
+	for _, k := range stub.initiates {
+		got[k] = true
+	}
+	if !got["backups/_manifest/snapshot-9.jsonl"] {
+		t.Fatalf("the manifest object itself must be written durably, got initiates %v", stub.initiates)
+	}
+	if !got["backups/_manifest/LATEST"] {
+		t.Fatalf("the pointer write must still be ATTEMPTED (it just fails best-effort), got initiates %v", stub.initiates)
 	}
 }
 

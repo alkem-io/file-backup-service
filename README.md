@@ -37,11 +37,11 @@ operator restore. A worker + CLI, not a public API.
 | `serve`     | The worker: drain the outbox continuously, fan out to all targets, run the RPO/coverage samplers + periodic ledger-snapshot manifests, serve `/live` `/health` `/metrics`. |
 | `backfill`  | Back up the whole pre-existing corpus (the file-service `file` table) — for objects created before this service. Resumable + rate-limited (`--rate`). |
 | `reconcile` | Repair under-replicated objects target-to-target: fetch from a holder, re-fan-out to the targets missing it (`--rate`). |
-| `audit`     | Verify the ledger against reality (FR-014): sample objects per target and confirm the target still holds them. Nonzero exit on missing/unverifiable, for cron/CI (`--sample`). |
-| `restore`   | Operator DR: fetch + decode + hash-verify one object from a target and write the plaintext to a directory (`--hash`, `--from`, `--to`). |
+| `audit`     | Verify the ledger against reality (FR-014): sample objects per target and confirm the target still holds them (ledger→target). Also runs the WORM immutability drift-check, and — with `--inventory` — the target→ledger direction (diff each target's manifest against the ledger). Nonzero exit on missing/drift/unverifiable, for cron/CI (`--sample`, `--inventory`). |
+| `restore`   | Operator DR. `restore [object] --hash --from [--to]` restores one object; `restore all --from [--to] [--concurrency]` restores the whole store (resumable, idempotent, prints per-target sizes; fails loud on **0 objects enumerated** — an empty/wrong source); `restore current --file-id --at [--hash] [--from] [--to]` restores a file's CURRENT backed-up version, guarded by `--at` (fail loud otherwise — see below). Every restored object is hash-verified. `--from` default picks the first **readable** (non-WORM) target; an **explicit** `--from <worm>` is allowed (restore from the sole surviving immutable copy is attempted with a read-capable credential — a 403 fails with an actionable error). |
 | `verify`    | Confirm one stored object decodes + hashes correctly, no write (`--hash`, `--from`). |
 | `migrate`   | Apply the embedded ledger migrations to the ledger DB (a one-shot init step / init-container). |
-| `drill`     | DR drill — planned (not yet implemented). |
+| `drill`     | Restore drill (FR-024): restore a random sample of the objects stored on a target to a scratch dir, hash-verify each, exit nonzero if any fails — proving the end-to-end restore *procedure*, not just byte existence (`--from`, `--sample`, `--to`, `--metrics-file`). |
 
 ## Configuration
 
@@ -72,8 +72,27 @@ every field, env var, default, and constraint — is in
 - **Key metrics:** per-target stored/failed/dedup counters, dead-letter and
   per-object-timeout totals, source-gone total, the RPO gauges (backlog depth,
   oldest-pending age, last-success age, targets-circuit-open, under-replicated
-  objects). Alert on `filebackup_under_replicated_objects > 0`,
-  `filebackup_targets_circuit_open > 0`, and a climbing last-success age.
+  objects), `filebackup_immutability_ok{target}` (WORM object-lock + versioning
+  drift — 1 ok / 0 drift; emitted only for a WORM target the worker can actually
+  **read** — one with an `auditAccessKey`/`auditSecretKey`), and
+  `filebackup_immutability_unverifiable{target}` (1 while a **read-capable** WORM
+  target failed its read this pass — an unexpected fault). A WORM target WITHOUT an
+  audit credential (the standard PutObject-only prod config) is silent (N/A — its
+  immutability is asserted by object-lock + the audit + `never_verified`). Alert on
+  `filebackup_under_replicated_objects > 0`, `filebackup_targets_circuit_open > 0`,
+  `filebackup_immutability_ok == 0`, `filebackup_immutability_unverifiable == 1`
+  sustained, and a climbing last-success age.
+- **Restore-drill metrics:** the `drill` subcommand is short-lived, so it exports
+  `filebackup_restore_drill_pass` (1/0) + `filebackup_drill_last_success_timestamp_seconds`
+  via a Prometheus **textfile** (`--metrics-file` / `FBS_DRILL_METRICS_FILE`, the
+  node-exporter textfile-collector convention); its primary signal is the exit code
+  (a failing drill Job trips `kube_job_status_failed`, like the audit job).
+- **Restore by point-in-time (`restore current`):** the live `file` table holds only
+  each file's *current* version (no history), so this restores the CURRENT backed-up
+  version **guarded by `--at`** — it **fails loud** (never guesses): if the current
+  version was last-modified after `--at`, or `updatedDate` is NULL, you must recover
+  the historical `file.externalID` from a **DB point-in-time restore** and pass it via
+  `--hash`. See [`restore-and-ops.md`](../agents-hq/specs/008-continuous-file-backup/contracts/restore-and-ops.md).
 
 ## Layout (hexagonal)
 
@@ -106,11 +125,11 @@ are in [`CLAUDE.md`](./CLAUDE.md) and [`.specify/memory/constitution.md`](./.spe
 
 ## Status
 
-**Implemented.** The worker (serve), backfill, reconcile, audit, restore, verify,
-and migrate are functional; the streaming fan-out, circuit-breaker isolation,
-ledger, and observability are in place. `drill` (a scheduled restore drill) is the
-remaining planned subcommand. See `specs/008-continuous-file-backup/` for the task
-breakdown and status.
+**Implemented.** The worker (serve), backfill, reconcile, audit (with the WORM
+immutability drift-check + the `--inventory` target→ledger direction), restore
+(single object / `all` / `current`), verify, `drill`, and migrate are functional;
+the streaming fan-out, circuit-breaker isolation, ledger, and observability are in
+place. See `specs/008-continuous-file-backup/` for the task breakdown and status.
 
 ## License
 

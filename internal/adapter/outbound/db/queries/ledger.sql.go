@@ -167,10 +167,45 @@ func (q *Queries) RecordBackup(ctx context.Context, arg RecordBackupParams) erro
 	return err
 }
 
+const storedCountByTarget = `-- name: StoredCountByTarget :many
+SELECT target, count(*)::bigint AS n
+FROM file_backup_target_status
+WHERE state = 'stored' AND target = ANY($1::text[])
+GROUP BY target
+`
+
+type StoredCountByTargetRow struct {
+	Target string `json:"target"`
+	N      int64  `json:"n"`
+}
+
+// Count of objects currently stored per configured target — the restore-all completeness snapshot,
+// so an operator sees per-target disparity before trusting a single-source restore. Index-only on
+// (target, state). A target with no rows is simply absent from the result (the caller fills 0).
+func (q *Queries) StoredCountByTarget(ctx context.Context, targets []string) ([]StoredCountByTargetRow, error) {
+	rows, err := q.db.Query(ctx, storedCountByTarget, targets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []StoredCountByTargetRow{}
+	for rows.Next() {
+		var i StoredCountByTargetRow
+		if err := rows.Scan(&i.Target, &i.N); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const storedExternalIDsPage = `-- name: StoredExternalIDsPage :many
 SELECT "externalID" FROM file_backup_target_status
-WHERE target = $1 AND state = 'stored' AND "externalID" > $2
-ORDER BY "externalID" LIMIT $3
+WHERE target = $1 AND state = 'stored' AND "externalID" > $2 COLLATE "C"
+ORDER BY "externalID" COLLATE "C" LIMIT $3
 `
 
 type StoredExternalIDsPageParams struct {
@@ -183,7 +218,8 @@ type StoredExternalIDsPageParams struct {
 // sweep needs (it re-probes the sink and consumes ONLY the id). Unlike StoredObjectsPage this
 // does NOT join file_backup_object, so it is a covering INDEX-ONLY scan on
 // (target, state, "externalID") with no per-row heap fetch for size/createdBy the audit
-// discards. (StoredObjectsPage stays for the manifest export, which needs those columns.)
+// discards. COLLATE "C" pins byte order (see StoredObjectsPage) so the ledger stream and the
+// manifest agree on ordering in the inventory diff.
 func (q *Queries) StoredExternalIDsPage(ctx context.Context, arg StoredExternalIDsPageParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, storedExternalIDsPage, arg.Target, arg.After, arg.PageLimit)
 	if err != nil {
@@ -208,8 +244,8 @@ const storedObjectsPage = `-- name: StoredObjectsPage :many
 SELECT o."externalID", o.size, o."createdBy", o."sourceCreatedDate"
 FROM file_backup_object o
 JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"
-WHERE ts.target = $1 AND ts.state = 'stored' AND o."externalID" > $2
-ORDER BY o."externalID" LIMIT $3
+WHERE ts.target = $1 AND ts.state = 'stored' AND o."externalID" > $2 COLLATE "C"
+ORDER BY o."externalID" COLLATE "C" LIMIT $3
 `
 
 type StoredObjectsPageParams struct {
@@ -226,7 +262,10 @@ type StoredObjectsPageRow struct {
 }
 
 // Objects stored ON one target (manifest/audit), keyset-paged by externalID; the
-// (target, state, "externalID") index makes the WHERE+ORDER an index-ordered range scan.
+// (target, state, "externalID") index makes the WHERE+ORDER an index-ordered range scan. The
+// explicit COLLATE "C" pins BYTE order (matching the column collation + the byte-order `<` the
+// audit inventory diff and manifestIterator's monotonicity check assume) so it can't drift on a
+// locale-collated database.
 func (q *Queries) StoredObjectsPage(ctx context.Context, arg StoredObjectsPageParams) ([]StoredObjectsPageRow, error) {
 	rows, err := q.db.Query(ctx, storedObjectsPage, arg.Target, arg.After, arg.PageLimit)
 	if err != nil {

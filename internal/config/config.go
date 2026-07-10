@@ -14,6 +14,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -49,9 +50,17 @@ type Target struct {
 	Compression string `yaml:"compression,omitempty"` // "" | "none" | "zstd"
 	AccessKey   string `yaml:"accessKey,omitempty"`   // secret — normally injected via env
 	SecretKey   string `yaml:"secretKey,omitempty"`   // secret — normally injected via env
-	UseSSL      bool   `yaml:"useSSL,omitempty"`
-	SSE         bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
-	Insecure    bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
+	// AuditAccessKey/AuditSecretKey are an OPTIONAL read/audit credential for a WORM target: the
+	// worker's own credential is PutObject-only (can't read GetObjectLockConfig), so the immutability
+	// drift-check needs a read-capable credential to actually run. When BOTH are set the drift-check
+	// runs (Verified/Drift); when unset it is legitimately N/A → SILENT (no series, no alert, no false
+	// pass) — the immutability is then asserted by object-lock + the audit + never_verified. Secrets,
+	// injected via FBS_TARGET_<NAME>_AUDITACCESSKEY / _AUDITSECRETKEY.
+	AuditAccessKey string `yaml:"auditAccessKey,omitempty"`
+	AuditSecretKey string `yaml:"auditSecretKey,omitempty"`
+	UseSSL         bool   `yaml:"useSSL,omitempty"`
+	SSE            bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
+	Insecure       bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
 	// Worm marks a write-once target whose credential can't read (PutObject-only, e.g. the
 	// immutable off-site copy): audit EXPECTS its Exists to always deny, so it isn't an
 	// alert — whereas a normally-readable target that suddenly can't be verified IS.
@@ -131,8 +140,16 @@ type Config struct {
 	ScratchDir string `yaml:"scratchDir"`
 }
 
-// PerObjectTimeout is the per-object backup deadline.
+// PerObjectTimeout is the per-object backup deadline. It returns 0 for a non-positive value OR one
+// so large that PerObjectTimeoutSec*time.Second would OVERFLOW int64 nanoseconds and wrap to a
+// positive near-instant (or negative) deadline — the single-object DR read paths (cmd's sourceOp /
+// restore current) do NOT run validateLimits, so a hostile/absurd perObjectTimeoutSec must degrade to
+// "use the default" (via domain.NormalizePerObjectTimeout downstream), never to an instant-expiry
+// deadline that fails every restore. A 0 return signals the caller to floor to the default.
 func (c *Config) PerObjectTimeout() time.Duration {
+	if c.PerObjectTimeoutSec <= 0 || int64(c.PerObjectTimeoutSec) > math.MaxInt64/int64(time.Second) {
+		return 0
+	}
 	return time.Duration(c.PerObjectTimeoutSec) * time.Second
 }
 
@@ -285,6 +302,8 @@ func (c *Config) applyTargetEnv() error {
 		setStr(&c.Targets[i].Compression, p+"COMPRESSION")
 		setStr(&c.Targets[i].AccessKey, p+"ACCESSKEY")
 		setStr(&c.Targets[i].SecretKey, p+"SECRETKEY")
+		setStr(&c.Targets[i].AuditAccessKey, p+"AUDITACCESSKEY")
+		setStr(&c.Targets[i].AuditSecretKey, p+"AUDITSECRETKEY")
 		errs = append(errs,
 			setBool(&c.Targets[i].UseSSL, p+"USESSL"),
 			setBool(&c.Targets[i].SSE, p+"SSE"),
@@ -379,16 +398,25 @@ func (c *Config) Validate() error {
 	return c.ValidateTargets()
 }
 
-// ValidateDR is the check the ledger-DB DR subcommands (reconcile/audit) need: the
-// numeric limits (so a huge perObjectTimeoutSec can't overflow to a negative Duration on
-// this path), the LedgerDB (they connect to it — so a malformed DSN fails with a clear
-// 'ledgerDB.host is required' here, not an opaque pgx parse error later), PLUS the target
-// set — but NOT fileServiceBase/outbox, so it still runs in the degraded/DR environment.
-func (c *Config) ValidateDR() error {
+// ValidateDRLimits validates the DR common config every ledger-DB subcommand needs: the numeric
+// limits (so a huge perObjectTimeoutSec can't overflow to a negative Duration on this path) and the
+// LedgerDB DSN (a malformed DSN fails with a clear 'ledgerDB.host is required' here, not an opaque pgx
+// parse error later) — but NOT fileServiceBase/outbox (it runs in the degraded/DR environment) and
+// NOT the target set. The SINGLE-source DR ops (restore-all / drill) use only this plus their ONE
+// source target's validation (config.SelectReadTarget + ValidateTargetFields), so an UNRELATED
+// misconfigured target can't block a restore/drill from a healthy --from (Pillar 4c — extended from
+// build-time to validation-time).
+func (c *Config) ValidateDRLimits() error {
 	if err := c.validateLimits(); err != nil {
 		return err
 	}
-	if err := c.LedgerDB.Validate("ledgerDB"); err != nil {
+	return c.LedgerDB.Validate("ledgerDB")
+}
+
+// ValidateDR is ValidateDRLimits PLUS the full target set — for the DR ops that touch EVERY target
+// (audit probes all, reconcile repairs across all).
+func (c *Config) ValidateDR() error {
+	if err := c.ValidateDRLimits(); err != nil {
 		return err
 	}
 	return c.ValidateTargets()
@@ -505,6 +533,17 @@ func (c *Config) validateLimits() error {
 }
 
 func validateTarget(i int, t Target, seen map[string]string) error {
+	if err := validateTargetName(i, t, seen); err != nil {
+		return err
+	}
+	return ValidateTargetFields(t)
+}
+
+// validateTargetName checks a target's NAME + the set-wide env-token collision guard (seen
+// accumulates the tokens seen so far). Split from the field validation so a single-source DR op can
+// run the collision guard over the whole set (a sibling must not have injected the chosen target's
+// secret) WITHOUT validating every other target's fields (Pillar 4c).
+func validateTargetName(i int, t Target, seen map[string]string) error {
 	if t.Name == "" {
 		return fmt.Errorf("target[%d]: name is required", i)
 	}
@@ -525,6 +564,14 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 		return fmt.Errorf("targets %q and %q collide on env-var namespace FBS_TARGET_%s_*", prev, t.Name, tok)
 	}
 	seen[tok] = t.Name
+	return nil
+}
+
+// ValidateTargetFields validates ONE target's structural fields (type, per-type required fields,
+// codec) independently of the set — the exported half the single-source DR build path uses so it can
+// validate + build ONLY the chosen target and not be blocked by an unrelated target's misconfig
+// (Pillar 4c).
+func ValidateTargetFields(t Target) error {
 	f, ok := targetFactories[t.Type]
 	if !ok {
 		return fmt.Errorf("target %q: unknown type %q (want s3|filesystem)", t.Name, t.Type)
@@ -536,6 +583,46 @@ func validateTarget(i int, t Target, seen map[string]string) error {
 		return fmt.Errorf("target %q: %w", t.Name, err)
 	}
 	return nil
+}
+
+// CheckTargetCollisions validates only that at least one target exists and that no two target names
+// collide on the FBS_TARGET_<TOKEN>_* env namespace — the set-wide guard a single-source DR read runs
+// (so a sibling target can't have injected the chosen target's secret) WITHOUT validating every
+// target's fields. Returns nil for a well-named set.
+func (c *Config) CheckTargetCollisions() error {
+	if len(c.Targets) == 0 {
+		return errors.New("at least one target is required")
+	}
+	seen := make(map[string]string, len(c.Targets))
+	for i, t := range c.Targets {
+		if err := validateTargetName(i, t, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SelectReadTarget resolves which configured target a READ op (restore/verify/drill) should use: the
+// named `from` (honored as given — a WORM target IS allowed for an EXPLICIT choice, per Pillar 4b:
+// restoring from the SOLE surviving immutable copy must not be refused; a read-deny then surfaces as
+// a clear error), or, when `from` is empty, the FIRST readable (non-WORM) target — all readable
+// targets are symmetric holders of the same content. It resolves off the CONFIG (names + Worm flags),
+// so no sink is built for a target the op doesn't use (Pillar 4c).
+func SelectReadTarget(targets []Target, from string) (Target, error) {
+	if from != "" {
+		for _, t := range targets {
+			if t.Name == from {
+				return t, nil // explicit choice honored, incl. a WORM target
+			}
+		}
+		return Target{}, fmt.Errorf("target %q not found in config", from)
+	}
+	for _, t := range targets {
+		if !t.Worm {
+			return t, nil
+		}
+	}
+	return Target{}, errors.New("no readable (non-WORM) target configured by default — restore/drill needs a target it can read; name a WORM/immutable copy explicitly via --from to attempt an admin-credential read")
 }
 
 // validateS3Target checks the s3-specific required fields (split out of validateTarget to
@@ -552,6 +639,13 @@ func validateS3Target(t Target) error {
 		// PutObject 403s. Fail loud at config time (like every other s3 field) instead of a
 		// degraded-target startup or an opaque 403 at preflight / restore fetch time.
 		return fmt.Errorf("target %q: s3 requires accessKey and secretKey (inject via FBS_TARGET_%s_ACCESSKEY / _SECRETKEY)", t.Name, envToken(t.Name))
+	}
+	// The OPTIONAL audit/read credential is all-or-nothing: s3.New only builds the audit client when
+	// BOTH keys are set, so a HALF-set pair would SILENTLY leave the WORM drift-check the operator
+	// intended to enable disabled (ImmutabilityReadable()==false → NoData, no error, no alert). Fail
+	// loud on a half-set pair (mirrors the primary pair).
+	if (t.AuditAccessKey == "") != (t.AuditSecretKey == "") {
+		return fmt.Errorf("target %q: the audit credential is all-or-nothing — set BOTH FBS_TARGET_%s_AUDITACCESSKEY and _AUDITSECRETKEY, or neither", t.Name, envToken(t.Name))
 	}
 	if !t.Insecure && (!t.UseSSL || !t.SSE) {
 		return fmt.Errorf("target %q: s3 requires useSSL and sse (constitution §V: TLS + SSE at rest); "+
@@ -601,5 +695,6 @@ func buildS3Sink(t Target) (domain.Sink, error) {
 	return s3.New(s3.Config{
 		Name: t.Name, Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket, Prefix: t.Prefix,
 		AccessKey: t.AccessKey, SecretKey: t.SecretKey, UseSSL: t.UseSSL, SSE: t.SSE,
+		AuditAccessKey: t.AuditAccessKey, AuditSecretKey: t.AuditSecretKey,
 	})
 }

@@ -55,6 +55,21 @@ func TestExistsFalseBeforeStoreAndFetchMissing(t *testing.T) {
 	}
 }
 
+// TestExistsGoneRootIsError: on a detached/gone root every object's os.Stat returns IsNotExist, but
+// Exists must NOT report (false,nil) — that would make the ledger→target audit read the whole target
+// as silent loss. A gone root surfaces as an ERROR (which the audit classifies Unverifiable, not
+// Drift), and that error must NOT itself be os.ErrNotExist (which would read as benign absent).
+func TestExistsGoneRootIsError(t *testing.T) {
+	s := New("fs", filepath.Join(t.TempDir(), "never-created-root"))
+	ok, err := s.Exists(context.Background(), strings.Repeat("a", 64))
+	if err == nil {
+		t.Fatalf("Exists on a gone root must return an error (→ audit Unverifiable), got ok=%v err=nil", ok)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a gone-root Exists error must NOT be os.ErrNotExist (that reads as benign absent), got %v", err)
+	}
+}
+
 // TestPutManifestWritesUnderManifestDir: PutManifest lands under _manifest/<name>,
 // is byte-for-byte readable, and a 0-byte ledger snapshot is a legitimate manifest
 // (empty-safe). (S1)

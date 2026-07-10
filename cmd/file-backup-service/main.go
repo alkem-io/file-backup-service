@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	consumer "github.com/alkem-io/file-backup-service/internal/adapter/inbound/consumer"
@@ -57,8 +59,9 @@ func run(argv []string) int {
 	case "backfill":
 		err = onShutdownOK(runBackfill(args))
 	case "drill":
-		fmt.Fprintf(os.Stderr, "%q: not implemented yet (see specs/008 tasks)\n", argv[1])
-		return 1
+		// NOT onShutdownOK-wrapped (like audit): an interrupted restore drill must exit nonzero,
+		// never read as a clean pass — an integrity check aborted midway proved nothing.
+		err = runDrill(args)
 	default:
 		usage()
 		return 2
@@ -195,8 +198,9 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 	// pool Close defers above): the RPO/lag gauges (FR-026) and the periodic ledger
 	// snapshot to each target (FR-015, standalone-restorability).
 	sampler := domain.NewSampler(outbox, ledger, targets, breaker, mx)
+	immSampler := domain.NewImmutabilitySampler(targets, mx)
 	var bgWG sync.WaitGroup
-	bgWG.Add(3)
+	bgWG.Add(4)
 	// SampleError once per failed pass (a returned read error OR a panic — TickLoop routes both
 	// to onError), so a frozen stale-green gauge is itself detectable.
 	go func() {
@@ -208,6 +212,18 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 		domain.TickLoop(ctx, 5*time.Minute, 30*time.Second, sampler.SampleCoverage, func(any, bool) { mx.SampleError() })
 	}()
 	go func() { defer bgWG.Done(); manifestLoop(ctx, ledger, targets, cfg.ManifestEvery(), logger, mx) }()
+	// WORM immutability drift gauge (T032): coarse cadence — object-lock config rarely changes,
+	// and each pass is an S3 GET per Worm target. It drives filebackup_immutability_ok ONLY for
+	// targets it can actually read; a read-denying (PutObject-only) WORM copy is unverifiable and
+	// emits no series (so the `== 0` alert can't false-fire). A panic is logged, never fatal.
+	go func() {
+		defer bgWG.Done()
+		domain.TickLoop(ctx, 15*time.Minute, 2*time.Minute, immSampler.Sample, func(cause any, isPanic bool) {
+			if isPanic {
+				logger.Warn("immutability sampler panicked", zap.Any("panic", cause))
+			}
+		})
+	}()
 	defer bgWG.Wait()
 
 	logger.Info("file-backup-service serving", zap.Int("metricsPort", cfg.MetricsPort), zap.Int("targets", len(targets)))
@@ -230,9 +246,9 @@ func newLogger() (*zap.Logger, func(), error) {
 	return logger, func() { _ = logger.Sync() }, nil
 }
 
-// sourceOp is the shared scaffold for the DR subcommands: parse --config/--hash/--from
-// (plus any extra flags via register), validate the resolved target's sink, and run op
-// under a signal-cancellable context.
+// sourceOp is the shared scaffold for the single-object DR subcommands (restore object / verify):
+// parse --config/--hash/--from (plus any extra flags via register), build ONLY the resolved source
+// sink, and run op under a signal-cancellable, per-object-bounded context.
 func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(ctx context.Context, sink domain.Sink, hash string) error) error {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
 	cfgPath := registerConfigFlag(fs)
@@ -245,29 +261,115 @@ func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(
 	if *hash == "" || *from == "" {
 		return fmt.Errorf("%s requires --hash and --from", name)
 	}
-	sink, cfg, err := sinkFor(*cfgPath, *from)
+	sink, _, cfg, err := sourceSink(*cfgPath, *from)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signalContext()
 	defer stop()
-	// Bound the DR op like every other path (serve/backfill/reconcile all cap one object with
-	// perObjectTimeout): a black-holing sink — one that accepts the connection but never
-	// returns bytes — must fail the operator's command on the deadline, not hang it forever
-	// (only SIGINT would otherwise stop it).
-	timeout := cfg.PerObjectTimeout()
-	if timeout <= 0 {
-		// sinkFor validates only the targets, NOT the numeric limits (validateLimits' maxSec cap
-		// is a serve/DR-pool concern), so an absurd perObjectTimeoutSec could overflow to a
-		// non-positive Duration here. Fall back to the default rather than an instant-deadline op.
-		timeout = 30 * time.Minute
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := boundedRestoreCtx(ctx, cfg)
 	defer cancel()
 	return op(ctx, sink, *hash)
 }
 
+// sourceSink loads config and builds ONLY the DR read source target (the --from, or the first
+// readable) — so an unrelated misconfigured target can't block a restore/drill from a healthy one
+// (Pillar 4c). Returns the (worm-aware) sink, its resolved name, and the loaded config.
+func sourceSink(cfgPath, from string) (domain.Sink, string, *config.Config, error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("load config: %w", err)
+	}
+	sink, name, err := buildReadSource(cfg, from)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	return sink, name, cfg, nil
+}
+
+// buildReadSource validates + builds ONLY the chosen read target from an already-loaded config: the
+// set-wide env-token collision guard (so a sibling can't have injected the chosen target's secret)
+// plus the CHOSEN target's own field validation, then that single sink. An unrelated target's
+// misconfig is never touched (Pillar 4c). A WORM source (allowed only as an explicit --from, Pillar
+// 4b) is wrapped so a read-deny surfaces an actionable hint instead of a raw 403.
+func buildReadSource(cfg *config.Config, from string) (domain.Sink, string, error) {
+	if err := cfg.CheckTargetCollisions(); err != nil {
+		return nil, "", fmt.Errorf("invalid config: %w", err)
+	}
+	ct, err := config.SelectReadTarget(cfg.Targets, from)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := config.ValidateTargetFields(ct); err != nil {
+		return nil, "", fmt.Errorf("invalid config: %w", err)
+	}
+	sink, err := config.BuildSink(ct)
+	if err != nil {
+		return nil, "", err
+	}
+	if ct.Worm {
+		return wormReadSource{Sink: sink, name: ct.Name}, ct.Name, nil
+	}
+	return sink, ct.Name, nil
+}
+
+// wormReadSource wraps a WORM (write-only-by-design) target chosen EXPLICITLY as a restore/verify/
+// drill source (Pillar 4b): the read is ATTEMPTED (restoring from the sole surviving immutable copy
+// must not be refused up front), but a Fetch failure — typically a 403 on a PutObject-only worker
+// credential — is annotated with an actionable hint, since reading an immutable copy needs a
+// read-capable admin credential.
+type wormReadSource struct {
+	domain.Sink
+	name string
+}
+
+// Fetch attempts the read and, on failure, annotates it with the WORM-source recovery hint.
+func (w wormReadSource) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
+	rc, err := w.Sink.Fetch(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("reading WORM/write-only target %q failed (its worker credential is PutObject-only by design; restore from a readable target, or supply the immutable copy's read-capable admin credential): %w", w.name, err)
+	}
+	return rc, nil
+}
+
+// boundedRestoreCtx caps one DR object op with perObjectTimeout — like every other path
+// (serve/backfill/reconcile all bound one object): a black-holing sink that accepts the
+// connection but never returns bytes must fail the operator's command on the deadline, not hang
+// forever (only SIGINT would otherwise stop it). It floors the bound through the SHARED
+// domain.NormalizePerObjectTimeout (no private copy of the 30m default), so a non-positive OR
+// overflow-degraded-to-0 perObjectTimeout — which the target-only DR validation doesn't range-check
+// — falls back to the default rather than an instant-deadline op. One owner, shared by sourceOp
+// (restore object/verify) and the restore-current DB path.
+func boundedRestoreCtx(ctx context.Context, cfg *config.Config) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, domain.NormalizePerObjectTimeout(cfg.PerObjectTimeout()))
+}
+
+// runRestore dispatches the restore sub-verbs (contracts/restore-and-ops.md): `restore all`
+// (whole store), `restore current` (a file's current backed-up version, guarded by --at), and
+// `restore object` (a single hash). A bare `restore --hash …` (no sub-verb) is an alias for
+// `restore object` (kept for v0.0.2 CLI compatibility).
 func runRestore(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "all":
+			return runRestoreAll(args[1:])
+		case "current":
+			return runRestoreCurrent(args[1:])
+		case "object":
+			return runRestoreObject(args[1:])
+		case "version":
+			// The old `restore version` verb was renamed to `restore current` (it restores the CURRENT
+			// backed-up version guarded by --at, never an arbitrary historical one). Fail loud with the
+			// new name rather than silently falling through to the bare-hash alias.
+			return errors.New("`restore version` was renamed to `restore current` (it restores the current backed-up version, guarded by --at; see contracts/restore-and-ops.md)")
+		}
+	}
+	return runRestoreObject(args)
+}
+
+// runRestoreObject restores a single object by hash from one target (`restore [object] --hash
+// --from [--to]`) — the single-object DR path.
+func runRestoreObject(args []string) error {
 	var to string
 	return sourceOp("restore", args,
 		func(fs *flag.FlagSet) { fs.StringVar(&to, "to", "/storage", "destination directory") },
@@ -278,6 +380,188 @@ func runRestore(args []string) error {
 			fmt.Printf("restored %s -> %s/%s\n", hash, to, hash)
 			return nil
 		})
+}
+
+// runRestoreAll restores every object the ledger records stored on the source target to --to,
+// resumable + idempotent (RestoreObject skips an already-present, intact object) and keyset-paged
+// (no held snapshot), reusing the single-object restore path. Needs only the ledger DB + the source
+// target (built alone — an unrelated misconfigured target can't block it, Pillar 4c). A clean SIGTERM
+// mid-restore is exit 0 (the pass resumes on re-run); genuine per-object failures exit nonzero.
+func runRestoreAll(args []string) error {
+	fs := flag.NewFlagSet("restore all", flag.ExitOnError)
+	cfgPath := registerConfigFlag(fs)
+	from := fs.String("from", "", "source target name (default: the first readable target)")
+	to := fs.String("to", "/storage", "destination directory")
+	concurrency := fs.Int("concurrency", 0, "parallel restores (0 = the configured concurrency)")
+	_ = fs.Parse(args)
+	ctx, stop := signalContext()
+	defer stop()
+	cfg, ledger, pool, err := ledgerJob(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	src, name, err := buildReadSource(cfg, *from)
+	if err != nil {
+		return err
+	}
+	// Print the per-target stored-set sizes FIRST so an operator sees cross-target disparity before
+	// trusting a single-`--from` restore: `restore all` restores only what the SOURCE holds, so a
+	// smaller source misses objects a fuller target has (which reconcile/backfill would refill).
+	printTargetStoredSizes(ctx, ledger, cfg.Targets, name)
+	conc := *concurrency
+	if conc <= 0 {
+		conc = cfg.Concurrency
+	}
+	st, rerr := domain.RestoreAll(ctx, ledger, src, name, *to, conc, cfg.PerObjectTimeout())
+	fmt.Printf("restore all (%s -> %s): restored=%d skipped=%d failed=%d cancelled=%d\n", name, *to, st.Restored, st.Skipped, st.Failed, st.Cancelled)
+	return restoreAllVerdict(st, rerr, name)
+}
+
+// printTargetStoredSizes prints each configured target's stored-object count (marking the restore
+// source), so an operator can spot a source that holds fewer objects than a sibling before trusting
+// a single-source `restore all`. It reads the counts by the CONFIG target names (no sink built for a
+// target the restore doesn't use). Best-effort: a count error is warned, not fatal.
+func printTargetStoredSizes(ctx context.Context, ledger *db.LedgerRepo, targets []config.Target, source string) {
+	names := make([]string, len(targets))
+	for i, t := range targets {
+		names[i] = t.Name
+	}
+	counts, err := ledger.StoredCountByTarget(ctx, names)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not read per-target stored counts:", err)
+		return
+	}
+	for _, n := range names {
+		marker := ""
+		if n == source {
+			marker = "  <- restore source"
+		}
+		fmt.Printf("target %s: %d objects stored%s\n", n, counts[n], marker)
+	}
+}
+
+// restoreAllVerdict maps a restore-all outcome to an exit error — extracted so the SIGTERM policy
+// is unit-testable. GENUINE per-object failures (st.Failed — a source read/verify error, a
+// per-object timeout, or a recovered panic; cancellations are separated into st.Cancelled by
+// RestoreAll) exit NONZERO even when a SIGTERM coincides. A run that ENUMERATED zero objects on a
+// clean pass also exits nonzero (a restore-all that restored nothing is worth flagging) — but with an
+// UNAMBIGUOUS message that names the source target and says the LEDGER holds 0 objects for it (a
+// new/empty target, or the wrong --from among the configured targets — the --from name was already
+// validated, so this is NOT a data-fault/corruption exit and the per-target stored counts printed
+// above disambiguate). A 0-restored run with objects merely SKIPPED (an idempotent re-run) stays
+// success. Otherwise an enumeration error maps through onShutdownOK (a clean SIGTERM → nil) and a
+// clean run exits 0.
+func restoreAllVerdict(st domain.RestoreAllStats, rerr error, source string) error {
+	if st.Failed > 0 {
+		return fmt.Errorf("restore all left %d object(s) unrestored (a source read/verify failed, timed out, or panicked)", st.Failed)
+	}
+	if rerr == nil && st.Restored+st.Skipped+st.Failed+st.Cancelled == 0 {
+		return fmt.Errorf("restore all: the ledger records 0 objects stored on target %q — nothing to restore (a new/empty target, or the wrong --from among the configured targets; see the per-target stored counts above)", source)
+	}
+	return onShutdownOK(rerr)
+}
+
+// runRestoreCurrent restores a file's CURRENT backed-up version, GUARDED by --at (`restore current
+// --file-id --at`). The live `file` table holds only the current version — there is NO version
+// history — so this deliberately does NOT promise "restore the historical version at --at". Instead
+// it FAILS LOUD unless the current version was already the one in effect at --at:
+//   - --hash <externalID>: restore that hash directly — the reliable escape hatch when the operator
+//     has recovered the historical file.externalID from a DB PITR/backup (targets-only, no DB needed).
+//   - else: resolve the file's CURRENT hash from the alkemio `file` table by its last-modified time.
+//     If the current version was live at/before --at it IS the version as of --at (restore it); if it
+//     was replaced AFTER --at, or its version time is unknowable, error — directing the operator to
+//     the DB-PITR + --hash procedure in contracts/restore-and-ops.md.
+func runRestoreCurrent(args []string) error {
+	fs := flag.NewFlagSet("restore current", flag.ExitOnError)
+	cfgPath := registerConfigFlag(fs)
+	fileID := fs.String("file-id", "", "file uuid to restore the current version of")
+	at := fs.String("at", "", "RFC3339 time the restored version must have been live at (fail loud if the current version is newer)")
+	hashOverride := fs.String("hash", "", "explicit content hash (recovered via DB PITR) — restore it directly, skipping the file-table lookup")
+	from := fs.String("from", "", "source target name (default: the first readable target)")
+	to := fs.String("to", "/storage", "destination directory")
+	_ = fs.Parse(args)
+	if *fileID == "" || *at == "" {
+		return errors.New("restore current requires --file-id and --at")
+	}
+	fid, ferr := uuid.Parse(*fileID)
+	if ferr != nil {
+		return fmt.Errorf("invalid --file-id (want a uuid): %w", ferr)
+	}
+	atTime, aerr := time.Parse(time.RFC3339, *at)
+	if aerr != nil {
+		return fmt.Errorf("invalid --at (want RFC3339, e.g. 2026-07-01T00:00:00Z): %w", aerr)
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	src, srcName, err := buildReadSource(cfg, *from)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signalContext()
+	defer stop()
+
+	hash := *hashOverride
+	if hash == "" {
+		hash, err = resolveCurrentHash(ctx, cfg, fid, atTime)
+		if err != nil {
+			return err
+		}
+	}
+	rctx, cancel := boundedRestoreCtx(ctx, cfg)
+	defer cancel()
+	if err := domain.RestoreObject(rctx, src, hash, *to); err != nil {
+		return err
+	}
+	fmt.Printf("restored current version of %s (in effect at %s) from %s -> %s/%s\n", fid, atTime.Format(time.RFC3339), srcName, *to, hash)
+	return nil
+}
+
+// resolveCurrentHash maps (file-id, at) to the content hash to restore, using the live `file` table
+// (which holds only the current version). It needs the alkemio DB, so it validates + opens it here
+// (and preflights the columns via FileRepo.Probe so a missing `updatedDate` fails loud up front, not
+// mid-DR). It keys on the SAFE guard — `file.updatedDate` (when the current version became current):
+// it returns the current hash ONLY when the file has NOT been modified since --at (updatedDate <=
+// --at → the current version was in effect at --at). A modification since --at (updatedDate > --at) —
+// which INCLUDES a metadata-only edit — is a deliberate SAFE OVER-REFUSAL (content-version history is
+// out of scope; the ledger's first-seen time is unsafe because externalIDs are content hashes and a
+// hash can RECYCLE A→B→A, so first-seen ≠ the current version's became-current time). It NEVER
+// returns a wrong version; the operator recovers a historical version via a DB PITR + --hash.
+func resolveCurrentHash(ctx context.Context, cfg *config.Config, fid uuid.UUID, at time.Time) (string, error) {
+	if err := cfg.AlkemioDB.Validate("alkemioDB"); err != nil {
+		return "", fmt.Errorf("invalid config (resolving --file-id needs alkemioDB; or pass --hash from a PITR query): %w", err)
+	}
+	pool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(1), cfg.DBTimeout(), "alkemio")
+	if err != nil {
+		return "", err
+	}
+	defer pool.Close()
+	files := db.NewFileRepo(pool)
+	// Preflight the `file` columns (incl. updatedDate) so a schema drift fails loud up front, not
+	// mid-DR on FileByID's Scan.
+	if err := files.Probe(ctx); err != nil {
+		return "", err
+	}
+	hash, versionTime, found, err := files.FileByID(ctx, fid)
+	if err != nil {
+		return "", fmt.Errorf("resolve file %s: %w", fid, err)
+	}
+	if !found {
+		return "", fmt.Errorf("file %s has no current content hash in the live file table — recover its externalID as of %s from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)", fid, at.Format(time.RFC3339))
+	}
+	// FAIL LOUD when the version time is unknowable: a NULL updatedDate means we cannot prove the
+	// current version was the one in effect at --at, so we MUST NOT guess. Direct the operator to PITR.
+	if versionTime.IsZero() {
+		return "", fmt.Errorf("file %s has a NULL updatedDate — cannot determine whether it was modified after %s; recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
+			fid, at.Format(time.RFC3339))
+	}
+	if versionTime.After(at) {
+		return "", fmt.Errorf("file %s was modified at %s, AFTER --at %s — cannot prove the current version was in effect at --at (a since-replacement OR a metadata-only edit); recover file.externalID as of --at from a DB PITR/backup and pass it via --hash (see contracts/restore-and-ops.md)",
+			fid, versionTime.Format(time.RFC3339), at.Format(time.RFC3339))
+	}
+	return hash, nil
 }
 
 func runVerify(args []string) error {
@@ -309,38 +593,37 @@ func registerConfigFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", "config.yaml", "path to the config file")
 }
 
-// ledgerJob opens config for a ledger-DB-only subcommand (reconcile/audit): it
-// validates the targets (not the full serve config — these run in the DR state without
-// file-service / the outbox DB), opens + probes the ledger pool, and builds the sinks.
-// The caller MUST close the returned pool.
-func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerRepo, *db.Pool, []domain.Target, error) {
+// ledgerJob opens config for a ledger-DB-only subcommand (reconcile/audit/restore-all/drill): it
+// validates the DR config (not the full serve config — these run in the DR state without
+// file-service / the outbox DB) and opens + probes the ledger pool. It deliberately does NOT build
+// any sinks — the caller builds only the targets IT needs (all of them for audit/reconcile, just the
+// source for restore-all/drill — Pillar 4c). The caller MUST close the returned pool.
+func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerRepo, *db.Pool, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("load config: %w", err)
+		return nil, nil, nil, fmt.Errorf("load config: %w", err)
 	}
-	if err := cfg.ValidateDR(); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("invalid config: %w", err)
+	// Validate only the DR limits + the ledger DSN here — NOT the target SET: the single-source ops
+	// (restore-all/drill) validate only their one source target (buildReadSource), so a sibling
+	// misconfig can't block them (Pillar 4c). Audit/reconcile add cfg.ValidateTargets() themselves.
+	if err := cfg.ValidateDRLimits(); err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid config: %w", err)
 	}
 	pool, err := openPool(ctx, cfg.LedgerDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "ledger")
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 	ledger := db.NewLedgerRepo(pool)
 	if err := ledger.Probe(ctx); err != nil {
 		pool.Close()
-		return nil, nil, nil, nil, fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
+		return nil, nil, nil, fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
 	}
-	targets, err := buildTargets(cfg.Targets)
-	if err != nil {
-		pool.Close()
-		return nil, nil, nil, nil, err
-	}
-	return cfg, ledger, pool, targets, nil
+	return cfg, ledger, pool, nil
 }
 
 // runReconcile repairs under-replicated objects target-to-target (FR-025/T029): for
 // each object the ledger shows not stored on every target, fetch it from a target that
-// has it and re-fan-out to the missing ones. Needs only the ledger DB + the targets.
+// has it and re-fan-out to the missing ones. Needs the ledger DB + EVERY target.
 func runReconcile(args []string) error {
 	fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
 	cfgPath := registerConfigFlag(fs)
@@ -348,11 +631,20 @@ func runReconcile(args []string) error {
 	_ = fs.Parse(args)
 	ctx, stop := signalContext()
 	defer stop()
-	cfg, ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
+	cfg, ledger, pool, err := ledgerJob(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
+	// reconcile repairs across EVERY target, so validate the whole set (ledgerJob validated only the
+	// limits + ledger DSN).
+	if err := cfg.ValidateTargets(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+	targets, err := buildTargets(cfg.Targets)
+	if err != nil {
+		return err
+	}
 	logger, syncLog, err := newLogger()
 	if err != nil {
 		return err
@@ -494,55 +786,141 @@ func runAudit(args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	cfgPath := registerConfigFlag(fs)
 	sample := fs.Int("sample", 0, "objects to check per target (0 = all)")
+	inventory := fs.Bool("inventory", false, "also run the target→ledger direction: diff each target's own manifest against the ledger (detects orphans / lost ledger records)")
 	_ = fs.Parse(args)
 	ctx, stop := signalContext()
 	defer stop()
-	_, ledger, pool, targets, err := ledgerJob(ctx, *cfgPath)
+	cfg, ledger, pool, err := ledgerJob(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-	// Audit derives its own random keyset band for a sampled run (*sample>0); the pass/fail
-	// verdict lives with the report (rep.FailErr) — cmd only prints + propagates.
-	rep, err := domain.Audit(ctx, ledger, targets, *sample)
-	for _, t := range rep.Targets {
-		status := ""
-		switch {
-		case t.UnexpectedlyUnverifiable():
-			status = "  [UNVERIFIABLE — every Exists denied but target is NOT worm: read credential/endpoint broken?]"
-		case t.Errors > 0 && !t.Worm:
-			status = "  [PARTIAL — some Exists probes errored (throttled/intermittent); sample not fully verified]"
-		case t.Unverifiable():
-			status = "  [unverifiable — worm target, read-denying by design; no coverage expected]"
-		}
-		fmt.Printf("audit %s: checked=%d missing=%d errors=%d%s\n", t.Target, t.Checked, t.Missing, t.Errors, status)
+	// audit probes EVERY target, so validate the whole set (ledgerJob validated only the limits +
+	// ledger DSN).
+	if err := cfg.ValidateTargets(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
 	}
-	if err != nil { // print partial per-target results above, then surface the sweep error
+	targets, err := buildTargets(cfg.Targets)
+	if err != nil {
 		return err
 	}
-	return rep.FailErr()
+	// The audit VERDICT combines every direction so a single nonzero exit alerts cron/CI, and every
+	// direction runs on the SHARED verdict model + probe engine: ledger→target (silent loss), the
+	// WORM immutability drift-check, and (opt-in) target→ledger inventory. Each direction is printed
+	// + reduced to its ONE shared FailErr; they are errors.Join'd — NO early-return — so a
+	// corrupt-manifest fault or drift on ONE target/direction can't MASK a finding on another.
+	verdicts := make([]error, 0, 4) // 3 directions + the top-level ctx.Err() fold
+	printAudit("audit", domain.Audit(ctx, ledger, targets, *sample), &verdicts)
+	printAudit("immutability", domain.CheckImmutability(ctx, targets), &verdicts)
+	if *inventory {
+		printAudit("inventory", domain.AuditInventory(ctx, ledger, targets), &verdicts)
+	}
+	// A SIGTERM mid-audit must exit NONZERO (audit is deliberately NOT shutdown-wrapped — an aborted
+	// integrity check proved nothing): the per-direction probes map a parent cancellation to a benign
+	// NoData verdict, so fold ctx.Err() in so a cancelled run can't read as a clean pass.
+	verdicts = append(verdicts, ctx.Err())
+	return errors.Join(verdicts...)
 }
 
-// sinkFor loads config, validates the target set, and builds the named target's sink.
-// It validates the whole target set (not the full serve config) so a DR restore fails
-// with a clear config error — including an env-token collision that would silently
-// build the sink with a sibling target's injected secret — instead of a raw minio/os
-// error or a wrong-store restore.
-func sinkFor(cfgPath, name string) (domain.Sink, *config.Config, error) {
-	cfg, err := config.Load(cfgPath)
+// printAudit prints one direction's per-target verdicts (label prefixes each line) and appends the
+// direction's ONE shared FailErr to verdicts. Every direction shares this — the printed shape and
+// the pass/fail reduction can't diverge between them.
+func printAudit(label string, rep domain.VerdictReport, verdicts *[]error) {
+	for _, v := range rep.Targets {
+		fmt.Printf("%s %s: %s — %s\n", label, v.Target, v.Status, v.Detail)
+	}
+	*verdicts = append(*verdicts, rep.FailErr())
+}
+
+// runDrill runs a restore drill (T033/FR-024/SC-009): it samples random objects the ledger
+// records stored on the source target, restores each to a scratch dir (proving the end-to-end
+// restore PROCEDURE, not just byte existence), verifies the bytes hash to their key, and exits
+// nonzero if any fails — so the (suspended) infra-ops drill CronJob's failing Job trips the
+// kube_job_status_failed alert, exactly like the audit job. It also records the drill gauges and,
+// when --metrics-file (or FBS_DRILL_METRICS_FILE) is set, exports them as a Prometheus textfile
+// (a short-lived CronJob can't be scraped). Needs the ledger DB + only the SOURCE target (built
+// alone — Pillar 4c). On INTERRUPTION it writes NO gauges at all (Pillar 6): an interrupted drill
+// proved less than it sampled, so it must not clobber the textfile with a RED pass=0 or reset the
+// prior last_success — a clean SIGTERM would otherwise page a week-long false failure.
+func runDrill(args []string) error {
+	fs := flag.NewFlagSet("drill", flag.ExitOnError)
+	cfgPath := registerConfigFlag(fs)
+	from := fs.String("from", "", "source target to drill (default: the first readable target)")
+	sample := fs.Int("sample", 20, "objects to restore-verify (0 = all — a full-store drill)")
+	to := fs.String("to", "", "scratch directory for the drill (default: scratchDir, else the OS temp dir)")
+	metricsFile := fs.String("metrics-file", os.Getenv("FBS_DRILL_METRICS_FILE"), "write the drill gauges to this Prometheus textfile (node-exporter textfile-collector)")
+	_ = fs.Parse(args)
+	ctx, stop := signalContext()
+	defer stop()
+	cfg, ledger, pool, err := ledgerJob(ctx, *cfgPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load config: %w", err)
+		return err
 	}
-	if err := cfg.ValidateTargets(); err != nil {
-		return nil, nil, fmt.Errorf("invalid config: %w", err)
+	defer pool.Close()
+	src, name, err := buildReadSource(cfg, *from)
+	if err != nil {
+		return err
 	}
-	for _, t := range cfg.Targets {
-		if t.Name == name {
-			sink, berr := config.BuildSink(t)
-			return sink, cfg, berr
-		}
+	logger, syncLog, err := newLogger()
+	if err != nil {
+		return err
 	}
-	return nil, nil, fmt.Errorf("target %q not found in config", name)
+	defer syncLog()
+	// Default the scratch base to the configured scratchDir (as reconcile does), falling back to the
+	// OS temp dir only when neither --to nor scratchDir is set. Preflight it the SAME way reconcile
+	// does (writability + the tmpfs-OOM warning) so an unwritable/memory-backed scratch fails LOUD
+	// up front instead of failing every drilled object mid-pass.
+	base := *to
+	if base == "" {
+		base = cfg.ScratchDir
+	}
+	if err := preflightScratch(base, logger); err != nil {
+		return err
+	}
+	// Stage restored objects in an isolated per-run subdir so the whole drill's scratch is removed
+	// wholesale on exit (Drill also removes each object as it verifies, bounding live disk to one).
+	dir, err := os.MkdirTemp(base, "drill-")
+	if err != nil {
+		return fmt.Errorf("create drill scratch dir (set --to / scratchDir to a writable, sized volume): %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	outcome, derr := domain.Drill(ctx, ledger, src, name, dir, *sample, cfg.PerObjectTimeout())
+	for _, f := range outcome.Failures {
+		fmt.Printf("drill FAIL %s: %v\n", f.Hash, f.Err)
+	}
+	fmt.Printf("drill %s: checked=%d passed=%d failed=%d\n", name, outcome.Checked(), outcome.Passed, outcome.Failed)
+	return drillReport(outcome, derr, *metricsFile, name)
+}
+
+// drillReport records + exports the drill gauges and maps the outcome to an exit error — extracted
+// so the interruption invariant is unit-testable. On an INTERRUPTION (derr is a ctx cancellation) it
+// records NO gauges at all: writing a red pass=0 would page a false week-long failure and clobbering
+// last_success would reset a genuinely-recent success, so a clean SIGTERM must leave the prior
+// textfile untouched and just exit nonzero. Otherwise it writes the gauges (a full pass only when
+// nothing failed AND the drill wasn't interrupted; a textfile write failure is a warning, not a
+// drill failure — the exit code is the primary signal) and returns: an enumeration error, a distinct
+// 0-sampled failure (proved nothing — a renamed target / empty ledger), a not-every-object-passed
+// failure, or nil.
+func drillReport(outcome domain.DrillOutcome, derr error, metricsFile, name string) error {
+	if derr != nil && errors.Is(derr, context.Canceled) {
+		return derr
+	}
+	dm := metrics.NewDrillMetrics()
+	dm.SetPass(outcome.Pass() && derr == nil, time.Now())
+	if werr := dm.WriteTextfile(metricsFile); werr != nil {
+		fmt.Fprintln(os.Stderr, "warning: drill metrics textfile:", werr)
+	}
+	if derr != nil {
+		return derr // an enumeration error — nonzero exit, never a clean pass
+	}
+	if outcome.Checked() == 0 {
+		return fmt.Errorf("restore drill sampled 0 objects on %s — nothing to drill (renamed/misconfigured target, or an empty/wrong ledger?)", name)
+	}
+	if !outcome.Pass() {
+		return fmt.Errorf("restore drill FAILED: %d of %d sampled objects did not restore+verify on %s", outcome.Failed, outcome.Checked(), name)
+	}
+	return nil
 }
 
 // manifestLoop writes a ledger snapshot (JSONL) to every target on a cadence (FR-015),

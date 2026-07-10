@@ -184,6 +184,10 @@ func TestValidateTargetErrors(t *testing.T) {
 		{"unknown codec", []Target{{Name: "t", Type: "filesystem", Path: "/a", Compression: "gzip"}}, "unknown compression"},
 		{"s3 missing region", []Target{{Name: "s", Type: "s3", Endpoint: "e", Bucket: "b", AccessKey: "AK", SecretKey: "SK", UseSSL: true, SSE: true}}, "endpoint, bucket, and region"},
 		{"fs missing path", []Target{{Name: "f", Type: "filesystem"}}, "filesystem requires path"},
+		// re-review item 1: a HALF-set audit credential would SILENTLY disable the WORM drift-check
+		// (only-one-set → s3.New builds no audit client → NoData). Fail loud on either half alone.
+		{"audit access without secret", []Target{{Name: "s", Type: "s3", Endpoint: "e", Region: "r", Bucket: "b", AccessKey: "AK", SecretKey: "SK", UseSSL: true, SSE: true, AuditAccessKey: "AAK"}}, "audit credential is all-or-nothing"},
+		{"audit secret without access", []Target{{Name: "s", Type: "s3", Endpoint: "e", Region: "r", Bucket: "b", AccessKey: "AK", SecretKey: "SK", UseSSL: true, SSE: true, AuditSecretKey: "ASK"}}, "audit credential is all-or-nothing"},
 	} {
 		err := validConfig(tc.targets...).ValidateTargets()
 		if err == nil {

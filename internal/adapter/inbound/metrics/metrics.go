@@ -3,15 +3,23 @@
 package metrics
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 
 	"github.com/alkem-io/file-backup-service/internal/domain"
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // Metrics holds the Prometheus collectors.
@@ -32,7 +40,19 @@ type Metrics struct {
 	neverVerified    prometheus.Gauge // configured targets that have never verified anything
 	circuitOpen      prometheus.Gauge // targets with an open circuit (tripped out, being deferred)
 	sampleErrors     prometheus.Counter
-	byTarget         sync.Map // target name -> *targetCounters (resolved once, per target)
+	// immutabilityOK is the WORM drift gauge (T032): per Worm target, 1 = object-lock +
+	// versioning still enabled, 0 = drift detected. A read-denying/unverifiable target's
+	// series is NEVER emitted (so the `== 0` alert can't false-fire on an inherently
+	// unverifiable PutObject-only credential — the never-verified/audit signals cover it).
+	immutabilityOK *prometheus.GaugeVec
+	// immutabilityUnverifiable is the DISTINCT unverifiable signal (Pillar 1): per Worm target that
+	// WAS readable this session and is now unverifiable, 1 = an UNEXPECTED loss of read access (a
+	// credential rotated to write-only, a wedged endpoint). It exists so the _ok series can be DROPPED
+	// when a formerly-green target turns unreadable — avoiding a frozen stale-green that masks a later
+	// real drift — WITHOUT going silent. A by-design write-only WORM copy (never readable) does NOT
+	// raise it (its 403 is expected; paging on it would be a false alarm). Alert on == 1 sustained.
+	immutabilityUnverifiable *prometheus.GaugeVec
+	byTarget                 sync.Map // target name -> *targetCounters (resolved once, per target)
 }
 
 // New builds a Metrics with its own registry.
@@ -93,7 +113,158 @@ func New() *Metrics {
 			Name: "filebackup_metrics_sample_errors_total",
 			Help: "Failed RPO/coverage sampling passes — alert on rate>0 so a frozen (stale-green) gauge is itself detectable.",
 		}),
+		immutabilityOK: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "filebackup_immutability_ok",
+			Help: "Per WORM/immutable target: 1 = object-lock + versioning still configured, 0 = drift detected. Emitted ONLY for a target whose immutability could actually be READ this pass; a target that turns unverifiable has its series DROPPED (not frozen stale-green) and raises filebackup_immutability_unverifiable instead — alert on == 0.",
+		}, []string{"target"}),
+		immutabilityUnverifiable: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "filebackup_immutability_unverifiable",
+			Help: "Per WORM target that WAS readable this session and is now unverifiable: 1 = an UNEXPECTED loss of read access (a credential rotated to write-only, a wedged endpoint). Set when the formerly-green _ok series is dropped so the drop is alertable, not silent — alert on == 1 sustained. A by-design write-only WORM copy (never readable — the standard immutable prod config) does NOT set this: its 403 is expected and its immutability is asserted by object-lock + the audit path (with a read credential) + never_verified, not this serve-time probe.",
+		}, []string{"target"}),
 	}
+}
+
+// SetImmutabilityOK records a WORM target's drift-check verdict (1 ok / 0 drift). Called ONLY
+// for a target whose immutability was actually verifiable; an unverifiable (read-denying)
+// target's series is deliberately never set, so `filebackup_immutability_ok == 0` can't fire
+// on a target we simply couldn't read.
+func (m *Metrics) SetImmutabilityOK(target string, ok bool) {
+	m.immutabilityOK.WithLabelValues(target).Set(b2f(ok))
+}
+
+// ClearImmutabilityOK removes target's drift series (used when it becomes unverifiable or is
+// structurally unreadable), so a formerly-green target that turns unreadable drops to NO series
+// rather than freezing stale at 1. Deleting an absent series is a no-op, so an always-unverifiable
+// target simply never appears.
+func (m *Metrics) ClearImmutabilityOK(target string) {
+	m.immutabilityOK.DeleteLabelValues(target)
+}
+
+// SetImmutabilityUnverifiable raises (true → 1) or drops (false → delete) target's distinct
+// unverifiable signal. It is raised when a target the worker SHOULD be able to read turns
+// unreadable — so dropping the stale-green _ok series does not go silent — and dropped again once the
+// target verifies or is structurally-unreadable-by-design. Deleting an absent series is a no-op.
+func (m *Metrics) SetImmutabilityUnverifiable(target string, unverifiable bool) {
+	if unverifiable {
+		m.immutabilityUnverifiable.WithLabelValues(target).Set(1)
+		return
+	}
+	m.immutabilityUnverifiable.DeleteLabelValues(target)
+}
+
+// b2f maps a bool to the Prometheus 1/0 gauge convention.
+func b2f(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// DrillMetrics is the restore-drill's OWN metric set (T033), separate from the worker Metrics:
+// the `drill` subcommand is a short-lived CronJob, so its gauges are exported via a
+// textfile-collector file, NOT a scraped /metrics — and its registry holds ONLY the drill gauges
+// (no go_*/process_* collectors), so the textfile can't collide with the worker's own /metrics
+// series when the node exporter merges them.
+type DrillMetrics struct {
+	reg         *prometheus.Registry
+	pass        prometheus.Gauge
+	lastSuccess prometheus.Gauge
+	passed      bool // whether the recorded run passed — drives the last-success carry-forward
+}
+
+// drillLastSuccessMetric is the last-success gauge name — shared by NewDrillMetrics and the
+// carry-forward parse (readPriorLastSuccess), so they can't disagree on the metric name.
+const drillLastSuccessMetric = "filebackup_drill_last_success_timestamp_seconds"
+
+// NewDrillMetrics builds the drill metric set on a private, collector-free registry.
+func NewDrillMetrics() *DrillMetrics {
+	reg := prometheus.NewRegistry()
+	f := promauto.With(reg)
+	return &DrillMetrics{
+		reg: reg,
+		pass: f.NewGauge(prometheus.GaugeOpts{
+			Name: "filebackup_restore_drill_pass",
+			Help: "Last restore-drill result: 1 = every sampled object restored + hash-matched, 0 = at least one failed (or 0 sampled). Set by the `drill` subcommand; exported via a textfile (--metrics-file) since the drill process is short-lived. Alert on == 0.",
+		}),
+		lastSuccess: f.NewGauge(prometheus.GaugeOpts{
+			Name: drillLastSuccessMetric,
+			Help: "Unix timestamp (seconds) of the last FULLY-PASSING restore drill; 0 until the first. Preserved across FAILING runs. Alert on time() - this > a week to catch a drill that stopped succeeding.",
+		}),
+	}
+}
+
+// SetPass records a drill outcome: the pass gauge (1/0) and, ON A PASS, the last-success timestamp.
+// A FAILING/0-checked run leaves last-success at 0 HERE — WriteTextfile then carries forward the
+// prior textfile's last-success so a failing run never CLOBBERS the true last-success to 0 (each
+// drill is a separate short-lived process overwriting the same file).
+func (d *DrillMetrics) SetPass(pass bool, at time.Time) {
+	d.passed = pass
+	d.pass.Set(b2f(pass))
+	if pass {
+		d.lastSuccess.Set(float64(at.Unix()))
+	}
+}
+
+// WriteTextfile durably writes the drill registry to path in Prometheus text-exposition format via
+// fsutil.CommitWrite (temp → fsync → rename → parent-dir fsync, so a crash can't leave a torn or
+// non-durable file). On a NON-pass run it first carries forward the PRIOR textfile's last-success
+// timestamp, so a failing/0-checked drill overwriting the file never resets last-success to 0 — the
+// file always carries the true last-success. A "" path is a no-op (the exit code carries the signal).
+func (d *DrillMetrics) WriteTextfile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if !d.passed {
+		if prior := readPriorLastSuccess(path); prior > 0 {
+			d.lastSuccess.Set(prior)
+		}
+	}
+	mfs, gerr := d.reg.Gather()
+	if gerr != nil {
+		return fmt.Errorf("gather metrics: %w", gerr)
+	}
+	return fsutil.CommitWrite(context.Background(), filepath.Dir(path), filepath.Base(path), func(f *os.File) error {
+		enc := expfmt.NewEncoder(f, expfmt.NewFormat(expfmt.TypeTextPlain))
+		for _, mf := range mfs {
+			if eerr := enc.Encode(mf); eerr != nil {
+				return fmt.Errorf("encode metrics: %w", eerr)
+			}
+		}
+		return nil
+	})
+}
+
+// readPriorLastSuccess parses the existing textfile for the last-success gauge's value, so a
+// failing run can re-emit it unchanged. It uses expfmt.TextParser — the SAME exposition-format
+// parser Prometheus itself uses — rather than a fragile hand-rolled 2-field split that a HELP/TYPE
+// comment, a label set, or a scientific-notation value could defeat. A missing/unparseable file, or
+// an absent metric, yields 0 (nothing to carry).
+func readPriorLastSuccess(path string) float64 {
+	f, err := os.Open(path) //nolint:gosec // operator-configured metrics textfile path
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+	// NewTextParser (NOT a zero-value TextParser): a zero-value parser has an UnsetValidation name
+	// scheme whose IsValidMetricName PANICS — verified STILL required as of prometheus/common v0.69.0
+	// (the current release; UnsetValidation.IsValidMetricName panics there too), so this is not a stale
+	// pin but the library's required API. Passing an explicit scheme is the intended usage; UTF8 is the
+	// library's current default for names.
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	mfs, err := parser.TextToMetricFamilies(f)
+	if err != nil {
+		return 0
+	}
+	mf, ok := mfs[drillLastSuccessMetric]
+	if !ok {
+		return 0
+	}
+	for _, m := range mf.GetMetric() {
+		if g := m.GetGauge(); g != nil {
+			return g.GetValue()
+		}
+	}
+	return 0
 }
 
 // SetBacklog updates the outbox backlog gauges (pending count + oldest-pending age).

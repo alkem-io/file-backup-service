@@ -15,11 +15,17 @@ import (
 // full verified stream — it must never be recorded as "stored".
 var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stream")
 
-// PanicErr renders a recovered panic as an error — the one owner of the "<what>
-// panicked: <v>" convention, shared by the pipeline's per-target recover guards (each on
-// a different goroutine, so they can't share a defer) and the CLI's startup-check guard.
+// ErrProbePanic marks a recovered panic (wrapped by PanicErr), so an audit direction can route a
+// panicked probe to StatusFault (fail-loud on a code bug) rather than swallowing it to a benign
+// Unverifiable — a panic is never benign, even on a WORM target.
+var ErrProbePanic = errors.New("probe panicked")
+
+// PanicErr renders a recovered panic as an error — the one owner of the "<what> panicked: <v>"
+// convention, shared by the pipeline's per-target recover guards (each on a different goroutine, so
+// they can't share a defer) and the CLI's startup-check guard. It wraps ErrProbePanic so the audit
+// directions can classify a recovered panic as a Fault.
 func PanicErr(what string, r any) error {
-	return fmt.Errorf("%s panicked: %v", what, r)
+	return fmt.Errorf("%s panicked: %v (%w)", what, r, ErrProbePanic)
 }
 
 // Per-target ledger states. The dedup reader, the writers, and the metrics labels
@@ -517,6 +523,16 @@ func (p *Pipeline) fanOut(ctx context.Context, src Source, e BackupItem, targets
 // buffered-chan + recover primitive, shared by storeWithCtx, callWithCtx, and the CLI's
 // startup-check gate (runChecks) — exported so package main reuses it rather than a 4th copy.
 func RunAbandonable[T any](ctx context.Context, fn func() T, onCancel func() T, onPanic func(recovered any) T) T {
+	return RunAbandonableClose(ctx, fn, onCancel, onPanic, nil)
+}
+
+// RunAbandonableClose is RunAbandonable with an optional onLateResult hook: when the call is ABANDONED
+// on ctx cancellation, onLateResult (if non-nil) is invoked in a detached goroutine with fn's LATE
+// result once it finally completes — so a result that OWNS a resource (an io.ReadCloser) can be freed
+// even though the caller never received it (no fd leak). On the happy path onLateResult is NOT called
+// (the caller owns the returned result). abandonableFetch builds on this instead of a hand-rolled
+// copy of the abandon + buffered-chan + recover primitive.
+func RunAbandonableClose[T any](ctx context.Context, fn func() T, onCancel func() T, onPanic func(recovered any) T, onLateResult func(T)) T {
 	ch := make(chan T, 1)
 	go func() {
 		defer func() {
@@ -528,6 +544,9 @@ func RunAbandonable[T any](ctx context.Context, fn func() T, onCancel func() T, 
 	}()
 	select {
 	case <-ctx.Done():
+		if onLateResult != nil {
+			go func() { onLateResult(<-ch) }() // free the abandoned fn's late-produced resource
+		}
 		return onCancel()
 	case res := <-ch:
 		return res

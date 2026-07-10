@@ -39,9 +39,9 @@ func TestOpenPoolBadDSN(t *testing.T) {
 // match the key, exercising the DR verify/restore integrity check.
 func storeRaw(t *testing.T, cfgPath, hash string, content []byte) {
 	t.Helper()
-	sink, _, err := sinkFor(cfgPath, "local")
+	sink, _, _, err := sourceSink(cfgPath, "local")
 	if err != nil {
-		t.Fatalf("sinkFor: %v", err)
+		t.Fatalf("sourceSink: %v", err)
 	}
 	if _, err := sink.Store(context.Background(), hash, bytes.NewReader(content)); err != nil {
 		t.Fatalf("store raw object: %v", err)
@@ -92,11 +92,11 @@ func TestRunRestoreTamperedFails(t *testing.T) {
 
 // ---- sourceOp: absurd perObjectTimeoutSec overflow fallback ---------------
 
-// TestSourceOpTimeoutOverflowFallback: sinkFor validates only the targets (not the numeric
-// limits), so an absurd perObjectTimeoutSec that overflows time.Duration to a non-positive value
-// must fall back to the 30-minute default rather than run the DR op with an instant deadline. A
-// verify of an intact object still succeeds, proving the fallback timeout (not a 0/negative one)
-// governed the op.
+// TestSourceOpTimeoutOverflowFallback: the single-source DR read path validates only the chosen
+// target (not the numeric limits), so an absurd perObjectTimeoutSec that overflows time.Duration
+// (PerObjectTimeout clamps it to 0) must fall back to the 30-minute default via
+// domain.NormalizePerObjectTimeout rather than run the DR op with an instant deadline. A verify of an
+// intact object still succeeds, proving the fallback timeout (not a 0/near-instant one) governed the op.
 func TestSourceOpTimeoutOverflowFallback(t *testing.T) {
 	dir := t.TempDir()
 	storeDir := dir + "/store"

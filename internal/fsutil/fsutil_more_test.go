@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fillBytes returns a fill func that writes b into the temp — the realistic
@@ -68,6 +69,142 @@ func TestValidateContentHashInvariants(t *testing.T) {
 		if err := ValidateContentHash(bad); err == nil {
 			t.Fatalf("%s hash %q accepted, want rejected", name, bad)
 		}
+	}
+}
+
+// TestIsTimestampedManifest locks in that a manifest name is accepted ONLY when it both carries
+// the `.jsonl` suffix AND parses as the fixed-width ManifestName layout — so a stray `.jsonl`
+// (which sorts ABOVE every real 2026-…Z name) can never be picked as "newest". This is the ONE
+// naming rule shared by the s3 + filesystem sinks and SelectLatestManifest.
+func TestIsTimestampedManifest(t *testing.T) {
+	// A hand-written genuine name, and a name freshly stamped from the canonical layout (the exact
+	// shape domain.ManifestName produces) must both be accepted.
+	if !IsTimestampedManifest("2026-06-01T000000.000000000Z.jsonl") {
+		t.Fatal("a genuine timestamped manifest name must be accepted")
+	}
+	live := time.Now().UTC().Format(manifestTimeLayout) + manifestSuffix
+	if !IsTimestampedManifest(live) {
+		t.Fatalf("a name from the canonical layout %q must be accepted", live)
+	}
+
+	for _, bad := range []string{
+		"backup.jsonl",                       // .jsonl suffix but NOT a timestamp — must not sort above real names
+		"LATEST",                             // the pointer object, not a manifest
+		"2026-06-01T000000.000000000Z.txt",   // right timestamp prefix, wrong suffix
+		"2026-06-01T000000.000000000Z",       // a timestamp with no suffix
+		"2026-13-01T000000.000000000Z.jsonl", // .jsonl but an impossible month → parse fails
+		"not-a-date.jsonl",
+		"",
+	} {
+		if IsTimestampedManifest(bad) {
+			t.Fatalf("%q must be rejected as a timestamped manifest", bad)
+		}
+	}
+}
+
+// TestSelectLatestManifestPointerUsedWhenCurrent: a VALID pointer with NOTHING newer (the bounded
+// listFrom(pointer) returns empty) is used directly — the fast path avoids a full scan.
+func TestSelectLatestManifestPointerUsedWhenCurrent(t *testing.T) {
+	const valid = "2026-06-01T000000.000000000Z.jsonl"
+	var listedAfter string
+	got, err := SelectLatestManifest(
+		func() (string, bool) { return valid, true },
+		func(after string) ([]string, error) { listedAfter = after; return nil, nil }, // nothing newer than the pointer
+	)
+	if err != nil {
+		t.Fatalf("current pointer must not error: %v", err)
+	}
+	if got != valid {
+		t.Fatalf("a current pointer must be used, got %q want %q", got, valid)
+	}
+	if listedAfter != valid {
+		t.Fatalf("the staleness check must list AFTER the pointer (%q), listed after %q", valid, listedAfter)
+	}
+}
+
+// TestSelectLatestManifestStalePointerOverridden (re-review C1): the pointer write is best-effort, so
+// it can be STALE. If a NEWER timestamped manifest exists (the bounded listFrom returns it), the
+// newer one is used instead of the stale pointer — else the inventory diff would miss an orphan added
+// after the stale pointer (a false Verified).
+func TestSelectLatestManifestStalePointerOverridden(t *testing.T) {
+	const stale = "2026-03-01T000000.000000000Z.jsonl"
+	const newer = "2026-06-01T000000.000000000Z.jsonl"
+	got, err := SelectLatestManifest(
+		func() (string, bool) { return stale, true },
+		func(after string) ([]string, error) {
+			if after != stale {
+				t.Fatalf("must list after the stale pointer %q, got %q", stale, after)
+			}
+			return []string{newer, "backup.jsonl"}, nil // a newer valid manifest exists; ignore the stray
+		},
+	)
+	if err != nil {
+		t.Fatalf("stale-pointer override must not error: %v", err)
+	}
+	if got != newer {
+		t.Fatalf("a stale pointer must be overridden by the newer manifest, got %q want %q", got, newer)
+	}
+}
+
+// TestSelectLatestManifestScanIgnoresStrayAndPointer: an INVALID pointer forces a full scan (from ""),
+// which picks the highest VALID timestamped name while ignoring a stray `backup.jsonl` (sorts above
+// every real name) and the `LATEST` pointer object.
+func TestSelectLatestManifestScanIgnoresStrayAndPointer(t *testing.T) {
+	got, err := SelectLatestManifest(
+		func() (string, bool) { return "backup.jsonl", true }, // present but not timestamped → full scan
+		func(after string) ([]string, error) {
+			if after != "" {
+				t.Fatalf("an invalid pointer must trigger a full scan (after==\"\"), got %q", after)
+			}
+			return []string{
+				"2026-01-01T000000.000000000Z.jsonl",
+				"2026-06-01T000000.000000000Z.jsonl", // newest VALID
+				"2026-03-01T000000.000000000Z.jsonl",
+				"backup.jsonl", // stray — lexically ABOVE any 2026-… name; must be ignored
+				"LATEST",       // the pointer object itself
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("scan fallback must not error: %v", err)
+	}
+	if want := "2026-06-01T000000.000000000Z.jsonl"; got != want {
+		t.Fatalf("scan picked %q, want the highest VALID timestamped name %q", got, want)
+	}
+}
+
+// TestSelectLatestManifestListErrorPropagates: a listFrom error (a read-deny / gone container)
+// propagates unchanged — the caller reports Unverifiable, not "no manifest".
+func TestSelectLatestManifestListErrorPropagates(t *testing.T) {
+	boom := errors.New("list read denied")
+	got, err := SelectLatestManifest(
+		func() (string, bool) { return "", false },
+		func(string) ([]string, error) { return nil, boom },
+	)
+	if !errors.Is(err, boom) {
+		t.Fatalf("listFrom error must propagate, got %v", err)
+	}
+	if got != "" {
+		t.Fatalf("on a list error the name must be \"\", got %q", got)
+	}
+}
+
+// TestSelectLatestManifestEmptyOrAllInvalid: with no names — or only non-timestamped ones — the
+// result is ("", nil), which the caller maps to os.ErrNotExist / NoData (benign).
+func TestSelectLatestManifestEmptyOrAllInvalid(t *testing.T) {
+	got, err := SelectLatestManifest(
+		func() (string, bool) { return "", false },
+		func(string) ([]string, error) { return nil, nil },
+	)
+	if err != nil || got != "" {
+		t.Fatalf("an empty scan must yield (\"\", nil), got (%q, %v)", got, err)
+	}
+	got, err = SelectLatestManifest(
+		func() (string, bool) { return "", false },
+		func(string) ([]string, error) { return []string{"backup.jsonl", "LATEST", "notes.txt"}, nil },
+	)
+	if err != nil || got != "" {
+		t.Fatalf("only-invalid names must yield (\"\", nil), got (%q, %v)", got, err)
 	}
 }
 

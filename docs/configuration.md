@@ -126,6 +126,8 @@ FBS_TARGET_LOCAL_PATH=/storage
 | `type` | `FBS_TARGET_<N>_TYPE` | all | `s3` or `filesystem`. |
 | `compression` | `FBS_TARGET_<N>_COMPRESSION` | all | `""`/`none` or `zstd` (per-target). |
 | `worm` | `FBS_TARGET_<N>_WORM` | all | `true` for a write-once, read-denying (PutObject-only) target; audit expects its `Exists` to deny and won't alert. |
+| `auditAccessKey` | `FBS_TARGET_<N>_AUDITACCESSKEY` | s3 | **Optional** read/audit credential for a WORM target — the worker's own PutObject-only credential can't read `GetObjectLockConfiguration`, so the immutability drift-check needs this to actually run. Set **both** audit keys → the drift-check runs (`filebackup_immutability_ok` = 1/0); unset → the drift-check is N/A (silent — no series, no alert, no false pass; the immutability is then asserted by object-lock + the audit + `never_verified`). |
+| `auditSecretKey` | `FBS_TARGET_<N>_AUDITSECRETKEY` | s3 | Secret pair for `auditAccessKey` (inject via env). |
 | `path` | `FBS_TARGET_<N>_PATH` | filesystem | Root directory (**required** for `filesystem`). Sharded two levels by hash. |
 | `endpoint` | `FBS_TARGET_<N>_ENDPOINT` | s3 | S3 endpoint host (**required**). |
 | `region` | `FBS_TARGET_<N>_REGION` | s3 | Region (**required** — PutObject-only creds can't auto-discover it; SigV4 signs it). |
@@ -166,15 +168,88 @@ export FBS_TARGET_OFFSITE_SECRETKEY=…
 | `backfill` | ✅ | ✅ (`file` corpus) | ✅ | ✅ |
 | `reconcile` | — | — | ✅ | ✅ |
 | `audit` | — | — | ✅ | ✅ |
-| `restore` / `verify` | — | — | — | ✅ (the `--from` target) |
+| `restore object` / `verify` | — | — | — | ✅ (the `--from` target) |
+| `restore all` | — | — | ✅ (enumerate) | ✅ (the `--from` target) |
+| `restore current` | — | ✅ (unless `--hash`) | — | ✅ (the `--from` target) |
+| `drill` | — | — | ✅ (sample) | ✅ (the `--from` target) |
 | `migrate` | — | — | ✅ | — |
-| `drill` *(planned)* | — | — | — | ✅ |
 
-`reconcile`/`audit`/`restore`/`verify` run in a degraded/DR environment and
-deliberately don't require file-service or the outbox DB. `drill` (a scheduled
-restore drill — **not yet implemented**) will follow the same DR shape, exercising
-restore against the targets; its config needs are expected to mirror
-`restore`/`verify` (targets only) and will be confirmed when it lands.
+`reconcile`/`audit`/`restore`/`verify`/`drill` run in a degraded/DR environment and
+deliberately don't require file-service or the outbox DB. `restore all` and `drill`
+read the **ledger** to enumerate/sample objects; `restore current` needs the
+**alkemio DB** to resolve a `--file-id` to its content hash — unless you pass an
+explicit `--hash` (a hash recovered from a DB point-in-time restore), which skips
+the lookup and needs only the target.
+
+**Read source (`--from`): default skips WORM, explicit WORM is allowed.** For a read op
+(`restore`/`drill`) with `--from` **omitted**, the default is the **first readable
+(non-WORM)** target. An **explicitly named** WORM/PutObject-only target (`worm: true`) is
+**attempted**, not refused — so a restore from the *sole surviving immutable copy*, using
+an admin/read-capable credential, is possible in a real DR. If the worker's write-only
+credential 403s, the read fails with a clear, actionable error (recover via a readable
+target, or supply the immutable copy's read-capable credential). Only the **one chosen
+source sink** is built — an unrelated misconfigured target can't block the op. (Note: the
+infra-ops restore-drill CronJob ships `--from offsite` where `offsite` is the WORM copy —
+on un-suspend, point it at a readable target; the WORM copy's integrity is covered by
+`filebackup_immutability_ok` + `audit`.)
+
+### Subcommand flags (DR + ops)
+
+| Subcommand | Flags |
+|---|---|
+| `restore object` (or bare `restore`) | `--hash <externalID>` `--from <target>` `--to <dir>` (default `/storage`) |
+| `restore all` | `--from <target>` (default: first readable target) `--to <dir>` `--concurrency N` (default: `concurrency`). Fails loud on **0 objects enumerated** (empty/wrong source); 0-restored-but-N-skipped (an idempotent re-run) stays success. |
+| `restore current` | `--file-id <uuid>` `--at <RFC3339>` `[--hash <externalID>]` `[--from <target>]` `[--to <dir>]` |
+| `verify` | `--hash <externalID>` `--from <target>` |
+| `audit` | `--sample N` (0 = all) `--inventory` (also run target→ledger + report WORM drift) |
+| `reconcile` | `--rate N` (repairs/sec, 0 = unlimited) |
+| `backfill` | `--rate N` (backups/sec, 0 = unlimited) |
+| `drill` | `--from <target>` (default: first readable target) `--sample N` (default 20, 0 = all) `--to <scratchdir>` (default: `scratchDir`, else OS temp) `--metrics-file <path>` (also `FBS_DRILL_METRICS_FILE`) |
+
+**Restoring by point-in-time (`restore current`).** The live `file` table holds only
+each file's **current** version — there is **no version history** — so this restores
+the CURRENT backed-up version, *guarded* by `--at`. The guard keys on the **safe**
+timestamp `file.updatedDate` (when the current version became current): it restores only
+when the file has **not been modified since `--at`** (`updatedDate <= --at`). A
+modification since `--at` (`updatedDate > --at`) — which **includes a metadata-only edit**
+— **fails loud** → PITR/`--hash`. This is a **deliberate conservative over-refusal**: it
+never risks a silent wrong-version restore. (The ledger's first-seen time is *not* used —
+externalIDs are content hashes, so a hash can recycle A→B→A, and first-seen ≠ the current
+version's became-current time; content-version history is out of scope.) It fails loud:
+- `updatedDate` **at/before** `--at` → the current version was in effect at `--at` → restored;
+- `updatedDate` **after** `--at` (a since-modification, incl. a metadata edit) → **error**;
+- `updatedDate` is **NULL** (became-current time unknowable) → **error**.
+
+To recover a genuinely HISTORICAL version — or when the guard over-refuses a metadata-only
+edit — recover `file.externalID` as of `--at` from a **DB point-in-time restore / backup**
+and pass it via `--hash` (which restores it directly, needing only the target). The
+`updatedDate` column is preflighted (`FileRepo.Probe`) so a schema drift fails loud up
+front. See `contracts/restore-and-ops.md`.
+
+**`restore all` completeness.** It restores only what the `--from` source holds, so
+before restoring it prints each configured target's stored-object count (marking the
+source) — an operator can see cross-target disparity before trusting a single-source
+restore.
+
+**Restore-drill metrics.** `drill` exits nonzero if any sampled object fails to
+restore + hash-verify (so a failing Job trips `kube_job_status_failed`). Because the
+process is short-lived, set `--metrics-file` (or `FBS_DRILL_METRICS_FILE`) to a
+node-exporter textfile-collector path to also export
+`filebackup_restore_drill_pass` + `filebackup_drill_last_success_timestamp_seconds`.
+An **interrupted** drill (SIGTERM) writes **no** gauges — it neither records a red
+`restore_drill_pass=0` nor clobbers the prior `last_success` — so a clean shutdown
+can't page a week-long false failure; the exit code (nonzero) still reflects the abort.
+
+**Immutability drift signal.** `filebackup_immutability_ok{target}` is 1 (verified) / 0
+(drift), emitted only for a WORM target the worker can actually **read** this pass — i.e.
+one with an **audit credential** (`auditAccessKey`/`auditSecretKey`). A WORM target WITHOUT
+an audit credential (the standard immutable prod config — a PutObject-only worker cred) is
+**N/A → silent**: no `_ok` series, no alert, no false pass; its immutability is asserted by
+object-lock + the audit path + `never_verified`, not this serve-time probe. A **read-capable**
+target (has an audit cred) that fails its read this pass drops its `_ok` series and raises
+`filebackup_immutability_unverifiable{target}=1` (a genuinely unexpected fault) — alert on
+`_unverifiable == 1` sustained. A restore from an immutable copy uses an EXPLICIT `--from`
+(Pillar 4b); reading it needs a read-capable credential.
 
 ---
 

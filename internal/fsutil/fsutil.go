@@ -12,12 +12,19 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 const (
-	manifestPrefix  = "_manifest"
-	preflightPrefix = "_preflight"
+	manifestPrefix     = "_manifest"
+	manifestLatestName = "LATEST"
+	manifestSuffix     = ".jsonl"
+	preflightPrefix    = "_preflight"
+	// manifestTimeLayout is the fixed-width UTC-nanosecond prefix ManifestName stamps onto every
+	// snapshot; IsTimestampedManifest PARSES it (not just the suffix) so a stray non-timestamped
+	// `.jsonl` can't sort above real names and be picked as "newest".
+	manifestTimeLayout = "2006-01-02T150405.000000000Z"
 	// contentHashLen is the hex length of a SHA3-256 externalID (32 bytes -> 64 hex chars).
 	contentHashLen = 64
 )
@@ -147,6 +154,65 @@ func commitFile(tmpName, dest string) error {
 // DR-restore tooling from diverging on where manifests live.
 func ManifestKey(name string) string {
 	return path.Join(manifestPrefix, path.Base(name))
+}
+
+// ManifestDir is the reserved manifest subdirectory/prefix ("_manifest"), so the audit
+// target→ledger inventory reader lists a target's manifests in the SAME place PutManifest
+// (via ManifestKey) writes them — one owner, so the write + enumerate paths can't diverge.
+func ManifestDir() string { return manifestPrefix }
+
+// ManifestLatestKey is the fixed pointer object (`_manifest/LATEST`) naming the newest manifest, so
+// a reader single-GETs it instead of listing the whole prefix. PutManifest overwrites it each pass
+// (a new object VERSION on a versioned/object-lock bucket, so it's WORM-safe).
+func ManifestLatestKey() string { return path.Join(manifestPrefix, manifestLatestName) }
+
+// IsTimestampedManifest reports whether base is a genuine timestamped manifest object: it must both
+// carry the `.jsonl` suffix AND parse as the fixed-width UTC-nanosecond ManifestName layout. Merely
+// checking the suffix let a stray `backup.jsonl` (which sorts ABOVE every real `2026-…Z.jsonl` name)
+// be picked as "newest" and diffed as the inventory — validating the timestamp layout rejects it.
+// The ONE naming rule shared by the s3 + filesystem sinks + selectLatestManifest, so they can't
+// diverge on which object is "the newest manifest".
+func IsTimestampedManifest(base string) bool {
+	ts, ok := strings.CutSuffix(base, manifestSuffix)
+	if !ok {
+		return false
+	}
+	_, err := time.Parse(manifestTimeLayout, ts)
+	return err == nil
+}
+
+// SelectLatestManifest resolves the newest manifest's base name from a pointer read + a
+// bounded-after lister, owning the policy in ONE place so the s3 and filesystem sinks provide only
+// primitive reads and can't diverge on selection. readPointer returns the `_manifest/LATEST` contents
+// (ok=false when absent/unreadable/empty). The pointer is only a HINT (its write is best-effort, so
+// it can be STALE — name an OLDER manifest): SelectLatestManifest VALIDATES it by listing only the
+// manifests strictly AFTER it (a bounded `StartAfter=<pointer>` list — cheap, since the pointer is
+// updated each write) and, if any newer timestamped manifest exists, uses that newer one instead of
+// the stale pointer (so the diff can't miss an orphan added after a stale pointer). An invalid/absent
+// pointer lists from "" (a full scan). Returns "" (nil error) when none exist — the caller maps that
+// to os.ErrNotExist / NoData — and propagates a listFrom error (a read-deny / gone container → the
+// caller reports the target Unverifiable, not "no manifest").
+func SelectLatestManifest(readPointer func() (string, bool), listFrom func(after string) ([]string, error)) (string, error) {
+	pointer, ok := readPointer()
+	valid := ok && IsTimestampedManifest(pointer)
+	after := ""
+	if valid { // list only what is NEWER than the pointer — a bounded staleness check
+		after = pointer
+	}
+	names, err := listFrom(after)
+	if err != nil {
+		return "", err
+	}
+	latest := ""
+	if valid { // the pointer is a candidate; a newer listed manifest below overrides a stale pointer
+		latest = pointer
+	}
+	for _, n := range names {
+		if IsTimestampedManifest(n) && n > latest {
+			latest = n
+		}
+	}
+	return latest, nil
 }
 
 // syncDir fsyncs a directory so a create/rename within it is durable

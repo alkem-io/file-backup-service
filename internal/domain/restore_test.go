@@ -8,9 +8,37 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// TestRestoreAllOneGenuineFailureAtSIGTERMCountsFailed (re-review item 3): a hash-mismatch (a REAL
+// corruption) whose per-object CLASSIFICATION coincides with a parent SIGTERM must be counted
+// Failed, NOT Cancelled — else `restore all` exits 0 on real corruption. The object is decoded with
+// the parent LIVE (so the mismatch, not a ctx error, is the result), then the parent is cancelled
+// while the worker is blocked entering its stats switch (holding the stats mutex sequences it). This
+// FAILS if cancelledInFlight is reverted to the imprecise `err!=nil && parent.Err()!=nil`, which
+// would bucket the mismatch as Cancelled.
+func TestRestoreAllOneGenuineFailureAtSIGTERMCountsFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := newMemSink("t")
+	h := hashOf("wanted")
+	sink.store[h] = []byte("bytes that do NOT hash to the key") // decode → hash-mismatch (non-Canceled)
+	var st RestoreAllStats
+	var mu sync.Mutex
+	mu.Lock() // hold the stats mutex so the worker blocks BEFORE classifying (after the decode)
+	done := make(chan struct{})
+	go func() { restoreAllOne(ctx, sink, h, t.TempDir(), time.Minute, &st, &mu); close(done) }()
+	time.Sleep(100 * time.Millisecond) // the decode (parent live → mismatch) finishes; worker parks on mu.Lock()
+	cancel()                           // a SIGTERM coinciding with the classification
+	mu.Unlock()
+	<-done
+	if st.Failed != 1 || st.Cancelled != 0 {
+		t.Fatalf("a hash-mismatch coinciding with SIGTERM must be Failed, not Cancelled: %+v", st)
+	}
+}
 
 // TestDecodeStreamAbandonsWedgedSource: a filesystem source whose Fetch blocks uninterruptibly
 // (a wedged mount) must NOT hang decodeStream past its ctx deadline — the abandonment wrapper
@@ -137,6 +165,120 @@ func TestRestoreCorruptFails(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, h)); err == nil {
 		t.Fatal("corrupt object must not be written to dest")
+	}
+}
+
+// TestRestoreAllRoundTripAndResume: restore all objects the ledger records on a target, verify
+// the on-disk bytes, then re-run to prove idempotence (every object skipped-as-present, resumable).
+func TestRestoreAllRoundTripAndResume(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	want := map[string][]byte{}
+	for i := 0; i < 6; i++ {
+		content := []byte("restore-all object " + string(rune('A'+i)))
+		h, err := sum(bytes.NewReader(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sink.store[h] = content
+		want[h] = content
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+	}
+	dir := t.TempDir()
+	st, err := RestoreAll(context.Background(), led, sink, "t", dir, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if st.Restored != 6 || st.Skipped != 0 || st.Failed != 0 {
+		t.Fatalf("first pass: want restored=6, got %+v", st)
+	}
+	for h, content := range want {
+		got, rerr := os.ReadFile(filepath.Join(dir, h)) //nolint:gosec // test temp path
+		if rerr != nil || !bytes.Equal(got, content) {
+			t.Fatalf("restored bytes mismatch for %s: %v", h, rerr)
+		}
+	}
+	// Re-run: every object is already present + intact → skipped (idempotent, resumable).
+	st2, err := RestoreAll(context.Background(), led, sink, "t", dir, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("RestoreAll re-run: %v", err)
+	}
+	if st2.Restored != 0 || st2.Skipped != 6 {
+		t.Fatalf("second pass must skip all (idempotent), got %+v", st2)
+	}
+}
+
+// TestRestoreAllCountsFailure: a corrupt source object (bytes don't hash to the key) is counted
+// as failed and does not abort the whole pass — the other objects still restore.
+func TestRestoreAllCountsFailure(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	var hashes []string
+	for i := 0; i < 3; i++ {
+		content := []byte("obj " + string(rune('0'+i)))
+		h, _ := sum(bytes.NewReader(content))
+		sink.store[h] = content
+		hashes = append(hashes, h)
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+	}
+	sink.store[hashes[0]] = []byte("garbage that does not hash to the key")
+	st, err := RestoreAll(context.Background(), led, sink, "t", t.TempDir(), 2, time.Minute)
+	if err != nil {
+		t.Fatalf("RestoreAll: %v", err)
+	}
+	if st.Failed != 1 || st.Restored != 2 {
+		t.Fatalf("want failed=1 restored=2, got %+v", st)
+	}
+}
+
+// TestRestoreAllEnumerationError: a ledger enumeration failure aborts the whole-store restore with
+// the error, rather than silently reporting a clean (empty) pass.
+func TestRestoreAllEnumerationError(t *testing.T) {
+	led := errStoredLedger{newFakeLedger()}
+	if _, err := RestoreAll(context.Background(), led, newMemSink("t"), "t", t.TempDir(), 2, time.Minute); err == nil {
+		t.Fatal("a ledger enumeration error must propagate from RestoreAll")
+	}
+}
+
+// TestRestoreAllCancelledReturnsCtxError (review #3): a cancelled whole-store restore returns the
+// ctx error (which the CLI maps to a clean exit — a resumable interruption, not a failure), rather
+// than swallowing the cancellation and reporting the in-flight cancels as genuine failures.
+func TestRestoreAllCancelledReturnsCtxError(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	for i := 0; i < 5; i++ {
+		content := []byte("cancel me " + string(rune('a'+i)))
+		h, _ := sum(bytes.NewReader(content))
+		sink.store[h] = content
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := RestoreAll(ctx, led, sink, "t", t.TempDir(), 1, time.Minute); err == nil {
+		t.Fatal("a cancelled restore-all must return the ctx error so the CLI can map it to a clean, resumable exit")
+	}
+}
+
+// TestRestoreAllCountsCancelNotFailure (review Cluster 1): a cancellation that lands WHILE an object
+// restores is counted as Cancelled, NOT Failed — so a clean SIGTERM doesn't manufacture a false
+// "restore failed" verdict.
+func TestRestoreAllCountsCancelNotFailure(t *testing.T) {
+	led := newFakeLedger()
+	content := []byte("restore me")
+	h, _ := sum(bytes.NewReader(content))
+	base := newMemSink("t")
+	base.store[h] = content
+	_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: h}, []TargetStatus{{Target: "t", State: StateStored}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel the parent ctx the moment the object's Fetch begins → the in-flight restore is aborted.
+	sink := &cancelOnFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{h: content}}, cancel: cancel}
+	st, _ := RestoreAll(ctx, led, sink, "t", t.TempDir(), 1, time.Minute)
+	if st.Failed != 0 {
+		t.Fatalf("an in-flight cancellation must NOT be counted as a genuine failure, got Failed=%d", st.Failed)
+	}
+	if st.Cancelled == 0 && st.Restored == 0 {
+		t.Fatalf("the object should be counted cancelled (or restored if it beat the cancel), got %+v", st)
 	}
 }
 

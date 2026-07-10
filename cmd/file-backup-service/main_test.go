@@ -345,33 +345,33 @@ func TestNewLogger(t *testing.T) {
 	syncLog() // must not panic
 }
 
-// ---- sinkFor --------------------------------------------------------------
+// ---- sourceSink -----------------------------------------------------------
 
-func TestSinkForOK(t *testing.T) {
+func TestSourceSinkOK(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	sink, cfg, err := sinkFor(cfgPath, "local")
+	sink, name, cfg, err := sourceSink(cfgPath, "local")
 	if err != nil {
-		t.Fatalf("sinkFor(local): %v", err)
+		t.Fatalf("sourceSink(local): %v", err)
 	}
 	if sink == nil || cfg == nil {
-		t.Fatal("sinkFor must return a sink and cfg")
+		t.Fatal("sourceSink must return a sink and cfg")
 	}
-	if sink.Name() != "local" {
-		t.Fatalf("wrong sink resolved: %q", sink.Name())
+	if sink.Name() != "local" || name != "local" {
+		t.Fatalf("wrong sink resolved: %q / %q", sink.Name(), name)
 	}
 }
 
-func TestSinkForMissingTarget(t *testing.T) {
+func TestSourceSinkMissingTarget(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	_, _, err := sinkFor(cfgPath, "does-not-exist")
+	_, _, _, err := sourceSink(cfgPath, "does-not-exist")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("an unknown target must yield a not-found error, got %v", err)
 	}
 }
 
-func TestSinkForNoTargets(t *testing.T) {
+func TestSourceSinkNoTargets(t *testing.T) {
 	cfgPath := writeConfig(t, t.TempDir(), "fileServiceBase: http://x\n")
-	if _, _, err := sinkFor(cfgPath, "local"); err == nil {
+	if _, _, _, err := sourceSink(cfgPath, "local"); err == nil {
 		t.Fatal("a config with no targets must error")
 	}
 }
@@ -381,9 +381,9 @@ func TestSinkForNoTargets(t *testing.T) {
 // storeObject puts content into the "local" filesystem target via its sink and returns the hash.
 func storeObject(t *testing.T, cfgPath string, content []byte) string {
 	t.Helper()
-	sink, _, err := sinkFor(cfgPath, "local")
+	sink, _, _, err := sourceSink(cfgPath, "local")
 	if err != nil {
-		t.Fatalf("sinkFor: %v", err)
+		t.Fatalf("sourceSink: %v", err)
 	}
 	h := sha3hex(content)
 	n, err := sink.Store(context.Background(), h, bytes.NewReader(content))

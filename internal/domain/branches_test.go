@@ -160,11 +160,11 @@ func TestSampleRPOCoverageReadFails(t *testing.T) {
 
 // ---------- audit.go ----------
 
-// TestAuditFailErrFlagsMissing: a nonzero silent-loss count fails the audit verdict.
+// TestAuditFailErrFlagsMissing: a drift (silent-loss) verdict fails the audit.
 func TestAuditFailErrFlagsMissing(t *testing.T) {
-	rep := AuditReport{Targets: []TargetAudit{{Target: "t", Checked: 3, Missing: 2}}}
-	if err := rep.FailErr(); err == nil || !strings.Contains(err.Error(), "missing") {
-		t.Fatalf("a missing object must fail the audit verdict, got %v", err)
+	rep := VerdictReport{Targets: []TargetVerdict{{Target: "t", Status: StatusDrift, Checked: 3, Missing: 2, Detail: "checked=3 missing=2 errors=0"}}}
+	if err := rep.FailErr(); err == nil || !strings.Contains(err.Error(), "DRIFT") {
+		t.Fatalf("a missing/drift object must fail the audit verdict, got %v", err)
 	}
 }
 
@@ -192,12 +192,12 @@ func TestAuditSampledDerivesRandomStart(t *testing.T) {
 		_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: id}, []TargetStatus{{Target: "a", State: StateStored}})
 		a.store[id] = []byte("x")
 	}
-	rep, err := Audit(ctx, led, []Target{{Sink: a}}, 3)
-	if err != nil {
-		t.Fatalf("sampled audit: %v", err)
-	}
+	rep := Audit(ctx, led, []Target{{Sink: a}}, 3)
 	if rep.Targets[0].Checked == 0 {
 		t.Fatal("a sampled audit must still check objects")
+	}
+	if rep.FailErr() != nil {
+		t.Fatalf("a clean sampled audit must pass, got %v", rep.FailErr())
 	}
 }
 
@@ -215,25 +215,25 @@ func (l auditPageLedger) StoredExternalIDsPage(context.Context, string, string, 
 	return nil, l.pageErr
 }
 
-// TestAuditLedgerReadErrorPropagates: a ledger page-read failure must surface as the audit's
-// error (an incomplete integrity check must not read as a clean pass).
+// TestAuditLedgerReadErrorPropagates: a ledger page-read failure must be a Fault verdict that fails
+// the audit (an incomplete integrity check must not read as a clean pass).
 func TestAuditLedgerReadErrorPropagates(t *testing.T) {
-	_, err := Audit(context.Background(),
+	rep := Audit(context.Background(),
 		auditPageLedger{pageErr: errors.New("scan boom")},
 		[]Target{{Sink: newMemSink("t")}}, 0)
-	if err == nil {
-		t.Fatal("a ledger read error during audit must propagate")
+	if rep.Targets[0].Status != StatusFault || rep.FailErr() == nil {
+		t.Fatalf("a ledger read error during audit must be a failing Fault, got %+v", rep.Targets[0])
 	}
 }
 
 // TestAuditTargetPanicIsolated: a panic in one target's sweep (e.g. a pgx scan on a drifted
-// column) becomes that target's error via RunParallel's recover, not a process crash.
+// column) becomes that target's Fault via probeTargets' recover, not a process crash.
 func TestAuditTargetPanicIsolated(t *testing.T) {
-	_, err := Audit(context.Background(),
+	rep := Audit(context.Background(),
 		auditPageLedger{panicPage: true},
 		[]Target{{Sink: newMemSink("t")}}, 0)
-	if err == nil {
-		t.Fatal("a panic in a target's audit must be recovered into an error, not crash")
+	if rep.Targets[0].Status != StatusFault || rep.FailErr() == nil {
+		t.Fatalf("a panic in a target's audit must be recovered into a failing Fault, got %+v", rep.Targets[0])
 	}
 }
 
@@ -242,18 +242,16 @@ type existsPanicSink struct{ stubSink }
 
 func (existsPanicSink) Exists(context.Context, string) (bool, error) { panic("exists boom") }
 
-// TestAuditExistsPanicContained: a panic in an Exists probe is recovered by existsWithCtx into
-// an errored probe result (counted, non-worm → unexpectedly unverifiable), never a crash.
-func TestAuditExistsPanicContained(t *testing.T) {
+// TestAuditExistsPanicIsFault (re-review B3): a panic in an Exists probe is recovered by existsWithCtx
+// (never a crash) and routed to Fault — a driver panic is a code bug, fail-loud, not swallowed to a
+// benign Unverifiable.
+func TestAuditExistsPanicIsFault(t *testing.T) {
 	ctx := context.Background()
 	led := newFakeLedger()
 	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "hashA"}, []TargetStatus{{Target: "t", State: StateStored}})
-	rep, err := Audit(ctx, led, []Target{{Sink: existsPanicSink{stubSink{name: "t"}}}}, 0)
-	if err != nil {
-		t.Fatalf("a panicking probe must be contained per-probe, not returned: %v", err)
-	}
-	if rep.Targets[0].Errors == 0 || !rep.Targets[0].UnexpectedlyUnverifiable() {
-		t.Fatalf("a panicking Exists must count as an errored probe: %+v", rep.Targets[0])
+	rep := Audit(ctx, led, []Target{{Sink: existsPanicSink{stubSink{name: "t"}}}}, 0)
+	if v := rep.Targets[0]; v.Status != StatusFault || !v.Failed() {
+		t.Fatalf("a panicking Exists must be a failing Fault (fail-loud on a code bug): %+v", v)
 	}
 }
 

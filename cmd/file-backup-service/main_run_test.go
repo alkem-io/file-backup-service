@@ -8,8 +8,9 @@ import (
 )
 
 // TestRunDispatch covers the run() exit-code mapping (extracted from main so it's testable):
-// no subcommand and an unknown one print usage and exit 2; drill exits 1 (not implemented); a
-// DB subcommand with an invalid config fails validation and exits 1 (before any pool opens).
+// no subcommand and an unknown one print usage and exit 2; every DB/DR subcommand with an invalid
+// config fails validation and exits 1 (before any pool opens). drill is now implemented — with an
+// invalid config it fails validation (exit 1), like the other DR subcommands.
 func TestRunDispatch(t *testing.T) {
 	bad := invalidCfg(t)
 	cases := []struct {
@@ -19,12 +20,14 @@ func TestRunDispatch(t *testing.T) {
 	}{
 		{"no-subcommand", []string{"file-backup-service"}, 2},
 		{"unknown", []string{"file-backup-service", "bogus"}, 2},
-		{"drill-not-implemented", []string{"file-backup-service", "drill"}, 1},
+		{"drill-bad-config", []string{"file-backup-service", "drill", "--config", bad}, 1},
 		{"migrate-bad-config", []string{"file-backup-service", "migrate", "--config", bad}, 1},
 		{"serve-bad-config", []string{"file-backup-service", "serve", "--config", bad}, 1},
 		{"reconcile-bad-config", []string{"file-backup-service", "reconcile", "--config", bad}, 1},
 		{"audit-bad-config", []string{"file-backup-service", "audit", "--config", bad}, 1},
 		{"backfill-bad-config", []string{"file-backup-service", "backfill", "--config", bad}, 1},
+		{"restore-all-bad-config", []string{"file-backup-service", "restore", "all", "--config", bad}, 1},
+		{"restore-current-bad-config", []string{"file-backup-service", "restore", "current", "--file-id", "6f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", "--at", "2026-07-01T00:00:00Z", "--config", bad}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

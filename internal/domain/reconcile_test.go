@@ -78,6 +78,70 @@ func TestReconcileSkipsWhenNoSource(t *testing.T) {
 	}
 }
 
+// TestReconcileFailsOnCorruptSource (T034 mismatch): the only holder's stored bytes no longer
+// hash to the key (silent corruption). Reconcile fetches+decodes from it, the hash-verify fails,
+// no other source has it → the object is counted FAILED (not falsely repaired), and the
+// destination is never given the bad bytes.
+func TestReconcileFailsOnCorruptSource(t *testing.T) {
+	ctx := context.Background()
+	data := []byte("the genuine content")
+	h, err := sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newMemSink("a")
+	a.store[h] = []byte("CORRUPT bytes that do not hash to h") // A's copy is silently corrupt
+	b := newMemSink("b")
+
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(data))},
+		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateFailed}})
+
+	rec := NewReconciler(led, []Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}}, time.Minute, "", 0, nil, 4)
+	st, err := rec.Run(ctx, 0)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if st.Failed != 1 || st.Repaired != 0 {
+		t.Fatalf("a corrupt-only source must fail the repair, got %+v", st)
+	}
+	if _, present := b.store[h]; present {
+		t.Fatal("the destination must NOT receive the corrupt bytes")
+	}
+}
+
+// TestReconcileRotatesPastCorruptSource (T034 mismatch): with TWO holders where the first
+// (alphabetically) is corrupt and the second is intact, reconcile rotates past the bad source to
+// the good one and repairs the missing target — a mismatched source doesn't defeat the repair.
+func TestReconcileRotatesPastCorruptSource(t *testing.T) {
+	ctx := context.Background()
+	data := []byte("rotate past the corrupt holder")
+	h, err := sum(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newMemSink("a")
+	a.store[h] = []byte("garbage") // A: corrupt
+	b := newMemSink("b")
+	b.store[h] = data // B: intact
+	c := newMemSink("c")
+
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: h, Size: int64(len(data))},
+		[]TargetStatus{{Target: "a", State: StateStored}, {Target: "b", State: StateStored}, {Target: "c", State: StateFailed}})
+
+	rec := NewReconciler(led,
+		[]Target{{Sink: a, Codec: CodecNone}, {Sink: b, Codec: CodecNone}, {Sink: c, Codec: CodecNone}},
+		time.Minute, "", 0, nil, 4)
+	st, err := rec.Run(ctx, 0)
+	if err != nil || st.Repaired != 1 {
+		t.Fatalf("reconcile must rotate past the corrupt source and repair, got stats=%+v err=%v", st, err)
+	}
+	if !bytes.Equal(c.store[h], data) {
+		t.Fatal("C should hold the intact plaintext, sourced from B")
+	}
+}
+
 // TestReconcileSurvivesCodecFlip: an object stored zstd on A while A's CONFIGURED codec
 // is now CodecNone (operator flipped compression after storage). decodingSource
 // arbitrates from the stored bytes (zstd magic), not the stale config, so reconcile

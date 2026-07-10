@@ -4,8 +4,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -170,6 +173,145 @@ func TestCountersCachedPerTarget(t *testing.T) {
 	m.ObjectStored("t2", 1)
 	if got := testutil.CollectAndCount(m.objects); got != 6 {
 		t.Errorf("objects series across two targets = %d, want 6", got)
+	}
+}
+
+// TestSetAndClearImmutabilityOK: the WORM drift gauge is a per-target series set to 1 (ok) / 0
+// (drift); ClearImmutabilityOK (the real adapter method — Cluster 4's structural-clear) DROPS a
+// series, so CollectAndCount reflects it.
+func TestSetAndClearImmutabilityOK(t *testing.T) {
+	m := New()
+	m.SetImmutabilityOK("good", true)
+	m.SetImmutabilityOK("drift", false)
+	if got := testutil.ToFloat64(m.immutabilityOK.WithLabelValues("good")); got != 1 {
+		t.Errorf("good immutability gauge = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.immutabilityOK.WithLabelValues("drift")); got != 0 {
+		t.Errorf("drift immutability gauge = %v, want 0", got)
+	}
+	if got := testutil.CollectAndCount(m.immutabilityOK); got != 2 {
+		t.Errorf("immutability series = %d, want exactly 2 (no series for unverifiable targets)", got)
+	}
+	// ClearImmutabilityOK drops the series (used for a structurally-unverifiable target).
+	m.ClearImmutabilityOK("good")
+	if got := testutil.CollectAndCount(m.immutabilityOK); got != 1 {
+		t.Errorf("after clear, immutability series = %d, want 1 (the cleared target's series is gone)", got)
+	}
+	m.ClearImmutabilityOK("never-set") // clearing an absent series is a harmless no-op
+	if got := testutil.CollectAndCount(m.immutabilityOK); got != 1 {
+		t.Errorf("clearing an absent series must be a no-op, got %d series", got)
+	}
+}
+
+// TestSetImmutabilityUnverifiable: the DISTINCT unverifiable signal is a per-target gauge raised to
+// 1 when a readable WORM target turns unreadable (so the dropped stale-green _ok series is not
+// silent), and DELETED again once it verifies. It is a separate GaugeVec from immutabilityOK — set
+// true → the series is present with value 1; set false → the series is dropped (CollectAndCount falls).
+func TestSetImmutabilityUnverifiable(t *testing.T) {
+	m := New()
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 0 {
+		t.Fatalf("no target should be unverifiable initially, got %d series", got)
+	}
+	m.SetImmutabilityUnverifiable("t", true)
+	if got := testutil.ToFloat64(m.immutabilityUnverifiable.WithLabelValues("t")); got != 1 {
+		t.Errorf("unverifiable gauge for t = %v, want 1", got)
+	}
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 1 {
+		t.Errorf("unverifiable series = %d, want exactly 1", got)
+	}
+	// Setting false drops the series (not a 0 value) so a recovered target goes silent, not stale-red.
+	m.SetImmutabilityUnverifiable("t", false)
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 0 {
+		t.Errorf("after clearing, unverifiable series = %d, want 0 (the series is dropped)", got)
+	}
+	// Dropping an absent series is a harmless no-op.
+	m.SetImmutabilityUnverifiable("never-set", false)
+	if got := testutil.CollectAndCount(m.immutabilityUnverifiable); got != 0 {
+		t.Errorf("dropping an absent series must be a no-op, got %d series", got)
+	}
+}
+
+// TestDrillMetricsSetAndTextfile: a full-pass drill sets pass=1 and a last-success timestamp; the
+// textfile export writes valid exposition with both drill gauges (and NO go_*/process_* series,
+// so it can't collide with the worker's own /metrics when the node exporter merges them).
+func TestDrillMetricsSetAndTextfile(t *testing.T) {
+	d := NewDrillMetrics()
+	now := time.Unix(1_700_000_000, 0)
+	d.SetPass(true, now)
+	if got := testutil.ToFloat64(d.pass); got != 1 {
+		t.Errorf("drill pass = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(d.lastSuccess); got != 1_700_000_000 {
+		t.Errorf("drill last-success = %v, want the unix timestamp", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	if err := d.WriteTextfile(path); err != nil {
+		t.Fatalf("WriteTextfile: %v", err)
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // test temp path
+	if err != nil {
+		t.Fatalf("read textfile: %v", err)
+	}
+	body := string(b)
+	for _, want := range []string{"filebackup_restore_drill_pass 1", "filebackup_drill_last_success_timestamp_seconds 1.7e+09"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("textfile missing %q\n---\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "go_goroutines") || strings.Contains(body, "process_") {
+		t.Errorf("drill textfile must NOT carry runtime collectors (would collide with /metrics):\n%s", body)
+	}
+	// "" path is a no-op (the exit code carries the signal when no textfile is wired).
+	if err := d.WriteTextfile(""); err != nil {
+		t.Fatalf("empty path must be a no-op, got %v", err)
+	}
+}
+
+// TestDrillWriteTextfileBadPath: a textfile whose parent dir doesn't exist fails the write. (The
+// durable CommitWrite MkdirAll's the parent, so a NONEXISTENT parent chain with a file in the way
+// is used to force the failure.)
+func TestDrillWriteTextfileBadPath(t *testing.T) {
+	d := NewDrillMetrics()
+	d.SetPass(true, time.Unix(1, 0))
+	// A regular file where a parent DIRECTORY is expected → MkdirAll fails (ENOTDIR).
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	if err := d.WriteTextfile(filepath.Join(blocker, "sub", "x.prom")); err == nil {
+		t.Fatal("WriteTextfile under a file-as-dir must error")
+	}
+}
+
+// TestDrillMetricsCarriesForwardLastSuccess (review Cluster 2): each drill is a SEPARATE process
+// overwriting the same textfile. A FAILING run (a fresh DrillMetrics, last-success 0 in memory) must
+// NOT clobber the file's true last-success to 0 — it reads the prior textfile and re-emits it.
+func TestDrillMetricsCarriesForwardLastSuccess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	// Process 1: a PASS at t=1700000000 writes the file.
+	pass := NewDrillMetrics()
+	pass.SetPass(true, time.Unix(1_700_000_000, 0))
+	if err := pass.WriteTextfile(path); err != nil {
+		t.Fatalf("pass write: %v", err)
+	}
+	// Process 2 (fresh metrics): a FAIL overwrites the file — last-success must be CARRIED FORWARD.
+	fail := NewDrillMetrics()
+	fail.SetPass(false, time.Unix(1_800_000_000, 0))
+	if err := fail.WriteTextfile(path); err != nil {
+		t.Fatalf("fail write: %v", err)
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // test temp path
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	body := string(b)
+	if !strings.Contains(body, "filebackup_restore_drill_pass 0") {
+		t.Errorf("failing run must record pass=0:\n%s", body)
+	}
+	if !strings.Contains(body, "filebackup_drill_last_success_timestamp_seconds 1.7e+09") {
+		t.Errorf("failing run must CARRY FORWARD the prior last-success (1.7e+09), not clobber to 0:\n%s", body)
 	}
 }
 
