@@ -22,12 +22,16 @@ const auditConcurrency = 16
 var auditProbeTimeout = 30 * time.Second
 
 // storedPageBounded fetches ONE keyset page of the externalIDs the ledger records stored on target,
-// bounded by a per-PAGE deadline (auditProbeTimeout) — the ONE owner of the bounded ledger-page read,
-// shared by every ledger sweep (audit existence, inventory diff, restore-all, drill) so none can
-// drift back into an UNBOUNDED raw-ctx read that a wedged ledger would hang. It is a per-page bound,
-// never a whole-sweep one, so a large HEALTHY corpus (many fast pages) never false-fails while a
-// black-holing ledger page is still caught. Callers wrap the error with their own tag (errLedgerRead
-// for audit/inventory, a command-specific message for drill/restore-all).
+// bounded by a per-PAGE deadline (auditProbeTimeout) — the domain-layer owner of the bounded
+// ledger-page read for the four DR read sweeps (audit existence, inventory diff, restore-all, drill),
+// which drive paging from the domain and run under a deadline-less signal ctx. reconcile's TargetGaps
+// and backfill's EachFile keyset-page from the DB ADAPTER instead, so they carry the equivalent
+// client-side bound THERE (db.keysetPageReadTimeout); between the two, every keyset ledger/corpus sweep
+// is client-side bounded and none can drift into an UNBOUNDED raw-ctx read a black-holed connection
+// would hang (the pool's server-side statement_timeout can't fire when no bytes ever return). It is a
+// per-page bound, never a whole-sweep one, so a large HEALTHY corpus (many fast pages) never
+// false-fails. Callers wrap the error with their own tag (errLedgerRead for audit/inventory, a
+// command-specific message for drill/restore-all).
 func storedPageBounded(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
 	pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
 	defer cancel()
@@ -44,6 +48,17 @@ func randKeysetStart() string {
 		return ""
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// sampledStart returns the keyset start for a sweep of `sample` ids: a rotating randKeysetStart() for a
+// SAMPLED sweep (sample>0), so successive runs cover a different band; "" for a FULL sweep (sample<=0),
+// which starts at the beginning and never wraps. The ONE owner of the sample→start pairing, shared by
+// Audit and the drill sampler so they can't drift on the band policy (keysetSample owns the wrap logic).
+func sampledStart(sample int) string {
+	if sample > 0 {
+		return randKeysetStart()
+	}
+	return ""
 }
 
 // Audit verifies the ledger against reality (FR-014 drift check / T030), returning one TargetVerdict
@@ -67,11 +82,7 @@ func randKeysetStart() string {
 // with budget remaining WRAPS ONCE to "" so it still checks min(sample, total) objects. A full audit
 // (samplePerTarget<=0) starts at "" and never wraps.
 func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int) VerdictReport {
-	startAfter := ""
-	if samplePerTarget > 0 {
-		startAfter = randKeysetStart()
-	}
-	return auditWithStart(ctx, led, targets, samplePerTarget, startAfter)
+	return auditWithStart(ctx, led, targets, samplePerTarget, sampledStart(samplePerTarget))
 }
 
 // auditWithStart is the deterministic core: it sweeps from an EXPLICIT startAfter (Audit derives a

@@ -32,35 +32,24 @@ func externalIDCollation(t *testing.T, p *Pool, table string) string {
 	return coll
 }
 
-// TestIntegrationExternalIDCollationIsC: the ledger migration (000001) must create BOTH "externalID"
-// columns BORN with collation "C" (byte order), so the COLLATE "C" keyset/inventory queries stay
-// index-backed and the DB order matches mergeInventory's byte-order merge. FAILS if the CREATE TABLE
-// loses the COLLATE "C" (the columns would take the database default collation).
+// TestIntegrationExternalIDCollationIsC: the 000002 forward migration must have re-collated BOTH
+// "externalID" columns to "C" (byte order), so the COLLATE "C" keyset/inventory queries stay
+// index-backed and the DB order matches mergeInventory's byte-order merge. FAILS if 000002 is
+// missing/reverted (the columns would keep the default collation).
 func TestIntegrationExternalIDCollationIsC(t *testing.T) {
 	p := ledgerPool(t)
 	for _, tbl := range []string{"file_backup_object", "file_backup_target_status"} {
 		if c := externalIDCollation(t, p, tbl); c != "C" {
-			t.Fatalf("%s.externalID collation = %q, want C (CREATE TABLE lost COLLATE \"C\"?)", tbl, c)
+			t.Fatalf("%s.externalID collation = %q, want C (000002 not applied?)", tbl, c)
 		}
 	}
 }
 
-// regClassText returns to_regclass(table) as text ("" when the relation does not exist).
-func regClassText(t *testing.T, p *Pool, table string) string {
-	t.Helper()
-	var reg sql.NullString
-	if err := p.QueryRow(context.Background(), `SELECT to_regclass($1)::text`, table).Scan(&reg); err != nil {
-		t.Fatalf("to_regclass %s: %v", table, err)
-	}
-	return reg.String
-}
-
-// TestIntegrationMigration000001Reversible: the ledger migration round-trips on a FRESH database — up
-// creates both tables with "externalID" BORN COLLATE "C", down drops them cleanly, up recreates them
-// with C — proving 000001 is reversible + idempotent. The collation is defined at CREATE TABLE, NOT
-// re-collated by a later migration: the ledger is a fresh, unreleased schema, so a brand-new (empty)
-// table is born with the right collation and there is no blocking ALTER COLUMN TYPE table rewrite.
-func TestIntegrationMigration000001Reversible(t *testing.T) {
+// TestIntegrationMigrationCollateReversible: the 000002 up/down round-trips on a FRESH database — up
+// sets "externalID" to C, down reverts it to the database default, up re-applies C — proving the
+// migration is reversible + idempotent (as a forward migration must be, NOT an in-place edit to the
+// already-applied 000001 that golang-migrate would no-op on an existing DB).
+func TestIntegrationMigrationCollateReversible(t *testing.T) {
 	ctx := context.Background()
 	h, err := pg.Start(ctx)
 	if err != nil {
@@ -79,19 +68,17 @@ func TestIntegrationMigration000001Reversible(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	for _, tbl := range []string{"file_backup_object", "file_backup_target_status"} {
-		if c := externalIDCollation(t, p, tbl); c != "C" {
-			t.Fatalf("after up: %s.externalID collation = %q, want C", tbl, c)
-		}
+	if c := externalIDCollation(t, p, "file_backup_object"); c != "C" {
+		t.Fatalf("after up: collation = %q, want C", c)
 	}
-	// Down → the whole ledger schema is dropped (000001 down is DROP TABLE); the tables must be gone.
-	if err := m.Down(); err != nil {
-		t.Fatalf("down: %v", err)
+	// Down ONE step (revert only 000002, keep the 000001 schema) → the default collation.
+	if err := m.Steps(-1); err != nil {
+		t.Fatalf("down 1: %v", err)
 	}
-	if reg := regClassText(t, p, "file_backup_object"); reg != "" {
-		t.Fatalf("after down: file_backup_object still exists (%q) — 000001 down must drop it", reg)
+	if c := externalIDCollation(t, p, "file_backup_object"); c == "C" {
+		t.Fatal("after down: collation still C — the 000002 down migration did not revert it")
 	}
-	// Up again → recreated with C, proving the migration is re-appliable (idempotent + reversible).
+	// Up again → C, proving the migration is re-appliable (idempotent + reversible).
 	if err := m.Up(); err != nil {
 		t.Fatalf("re-up: %v", err)
 	}

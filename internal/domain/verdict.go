@@ -140,7 +140,7 @@ func (r VerdictReport) FailErr() error {
 // (NoData, propagated), a per-target DeadlineExceeded while the parent is still live is a wedged
 // target (Unverifiable, which fails a non-worm target). Each direction supplies ONLY its per-target
 // closure, which returns a partial verdict (Status/Detail/counts/Err); probeTargets stamps
-// Target/Worm and guarantees an always-populated slice.
+// Target + ExemptUnverifiable and guarantees an always-populated slice.
 //
 // perTargetTimeout<=0 runs the closure on the parent ctx (no whole-probe deadline) — for the sweep
 // directions that must scale with the corpus and bound their own per-page/per-read operations
@@ -160,8 +160,8 @@ func probeTargets(ctx context.Context, targets []Target, perTargetTimeout time.D
 	// into an explicit failing Fault so no target can silently pass on a body panic. Never discard.
 	for i, err := range errs {
 		if err != nil {
-			// StatusFault always fails regardless of ReadCapable, so no need to compute it here (and the
-			// panic being folded may have come from probing the sink — don't re-touch it).
+			// StatusFault always fails regardless of ExemptUnverifiable, so no need to compute it here (and
+			// the panic being folded may have come from probing the sink — don't re-touch it).
 			out[i] = TargetVerdict{Target: safeSinkName(targets[i]), Status: StatusFault, Err: err}
 		}
 	}

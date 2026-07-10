@@ -59,7 +59,11 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	const q = `SELECT id, "externalID", "createdBy", "createdDate", COALESCE(size,0)
 	FROM file WHERE "temporaryLocation" IS NOT TRUE AND "externalID" IS NOT NULL AND "externalID" <> ''
 	  AND id > $1 ORDER BY id LIMIT $2`
-	rows, err := r.p.Query(ctx, q, after, limit)
+	// Client-side per-page bound (keysetPageReadTimeout): a black-holed Alkemio-DB connection can't
+	// hang backfill's enumeration, matching the DR read sweeps + reconcile's TargetGaps.
+	pctx, cancel := context.WithTimeout(ctx, keysetPageReadTimeout)
+	defer cancel()
+	rows, err := r.p.Query(pctx, q, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("files page: %w", err)
 	}

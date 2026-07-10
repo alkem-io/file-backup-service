@@ -28,6 +28,7 @@ type wormStub struct {
 	manifest         []byte
 	pointerName      string // if set, GET of _manifest/LATEST returns this (the pointer fast-path)
 	getFail          bool   // fail the object GET (the manifest fetch)
+	bucketGone       bool   // if set, a bucket-level HEAD (BucketExists) returns 404 (gone bucket)
 }
 
 // serveList renders the list-objects XML, honoring the bounded StartAfter (exclusive) query param.
@@ -72,6 +73,31 @@ func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
 	}
 }
 
+// serveHead answers a HEAD: a bucket-level HEAD (path "bkt"/"bkt/") is BucketExists; anything deeper is
+// a StatObject (LatestManifest's EAGER obj.Stat()).
+func (s *wormStub) serveHead(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimPrefix(r.URL.Path, "/")
+	parts := strings.SplitN(p, "/", 2)
+	if len(parts) < 2 || parts[1] == "" { // bucket-level HEAD → BucketExists
+		if s.bucketGone {
+			w.WriteHeader(http.StatusNotFound) // gone bucket → confirmBucket surfaces an error (Unverifiable)
+			return
+		}
+		w.WriteHeader(http.StatusOK) // bucket present
+		return
+	}
+	if s.getFail {
+		w.WriteHeader(http.StatusForbidden) // a read-deny surfaces at the eager stat → unverifiable
+		return
+	}
+	// StatObject parses Last-Modified (a missing one errors) + Content-Length into ObjectInfo.
+	w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", `"manifest-etag"`)
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.manifest)))
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	switch {
@@ -85,17 +111,8 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `<VersioningConfiguration><Status>%s</Status></VersioningConfiguration>`, s.versioningStatus)
 	case r.Method == http.MethodGet && q.Has("list-type"):
 		s.serveList(w, q.Get("start-after"))
-	case r.Method == http.MethodHead: // object HEAD = StatObject — LatestManifest's EAGER obj.Stat()
-		if s.getFail {
-			w.WriteHeader(http.StatusForbidden) // a read-deny surfaces at the eager stat → unverifiable
-			return
-		}
-		// StatObject parses Last-Modified (a missing one errors) + Content-Length into ObjectInfo.
-		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("ETag", `"manifest-etag"`)
-		w.Header().Set("Content-Length", strconv.Itoa(len(s.manifest)))
-		w.WriteHeader(http.StatusOK)
+	case r.Method == http.MethodHead:
+		s.serveHead(w, r)
 	case r.Method == http.MethodGet: // object GET
 		if s.getFail {
 			w.WriteHeader(http.StatusForbidden)
@@ -319,5 +336,20 @@ func TestLatestManifestListErrorPropagates(t *testing.T) {
 	_, err := sink.LatestManifest(context.Background())
 	if err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a list error must propagate as a real error, got %v", err)
+	}
+}
+
+// TestLatestManifestGoneBucketIsError (Altitude #4): a gone/unreachable bucket surfaces as an ERROR
+// (→ Unverifiable) from LatestManifest's upfront confirmBucket — symmetric with the filesystem sink's
+// confirmRoot — even though the (empty) LIST would otherwise resolve name="" → NoData. A vanished
+// target must not read as benign "no manifest yet" (it has NOT lost nothing).
+func TestLatestManifestGoneBucketIsError(t *testing.T) {
+	sink := newWormSink(t, &wormStub{bucketGone: true}) // no listKeys → an empty list would be NoData
+	_, err := sink.LatestManifest(context.Background())
+	if err == nil {
+		t.Fatal("LatestManifest against a gone bucket must return an error (Unverifiable), not (nil, NoData)")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a gone bucket must NOT map to os.ErrNotExist/NoData, got %v", err)
 	}
 }

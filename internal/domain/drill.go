@@ -116,11 +116,7 @@ func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectT
 // ids to the sweep rather than buffering the whole corpus in memory. A high random start wraps once
 // to the beginning, so the sample is never silently under-filled.
 func streamSampledStored(ctx context.Context, led Ledger, target string, sample int, yield func(string) error) error {
-	startAfter := ""
-	if sample > 0 {
-		startAfter = randKeysetStart()
-	}
-	return keysetSample(ctx, sample, startAfter,
+	return keysetSample(ctx, sample, sampledStart(sample),
 		func(after string, limit int) ([]string, error) {
 			// Bounded per-page (like audit/inventory): a wedged ledger during a scheduled drill must
 			// self-abort, not hang the CronJob indefinitely.

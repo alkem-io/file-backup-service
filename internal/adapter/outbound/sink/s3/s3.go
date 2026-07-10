@@ -339,6 +339,13 @@ func (s *Sink) versioningEnabled(ctx context.Context) bool {
 // (confirmBucket) → an error (Unverifiable, not a benign "no manifest"), a read-deny → an error
 // (Unverifiable) — matching the filesystem sink (sink parity).
 func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
+	// Upfront bucket confirmation, symmetric with the filesystem sink's confirmRoot: a gone/unreachable
+	// bucket surfaces as an ERROR (→ Unverifiable) even if a backend were to return an EMPTY non-erroring
+	// LIST for it — otherwise SelectLatestManifest would resolve name="" → NoData, and a vanished target
+	// would wrongly read as "no manifest yet" (lost nothing). Cached, so it's one HEAD per sink lifetime.
+	if err := s.confirmBucket(ctx); err != nil {
+		return nil, err
+	}
 	return fsutil.OpenLatestManifest(
 		func() (string, bool) { return s.readManifestPointer(ctx) },
 		func(after string) ([]string, error) { return s.listManifestNamesAfter(ctx, after) },

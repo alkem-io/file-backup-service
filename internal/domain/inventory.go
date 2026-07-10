@@ -66,6 +66,12 @@ func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
 	if !ok {
 		return TargetVerdict{Status: StatusNoData, Detail: "target type cannot enumerate its manifest"}
 	}
+	// A by-design write-only WORM copy (no audit/read credential) can't read its OWN manifest either,
+	// so the inventory diff is legitimately N/A → NoData — matching the immutability direction (the same
+	// targetUnverifiableExempt predicate) instead of burning a doomed 403 read to reach Unverifiable.
+	if targetUnverifiableExempt(t) {
+		return TargetVerdict{Status: StatusNoData, Detail: "no audit/read credential — cannot enumerate manifest"}
+	}
 	name := t.Sink.Name()
 	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
 	if err != nil {

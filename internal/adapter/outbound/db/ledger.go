@@ -113,9 +113,21 @@ type targetGap struct {
 	stored     map[string]bool
 }
 
-// targetGapsPage returns one keyset page (externalID order) of under-replicated objects.
+// keysetPageReadTimeout bounds ONE keyset-page read on the CLIENT side, catching a black-holed
+// connection (TCP alive, no bytes ever return) that the pool's SERVER-side statement_timeout cannot
+// fire on — the same failure the DR read sweeps guard with domain.storedPageBounded, applied here to
+// reconcile's TargetGaps + backfill's EachFile, which likewise keyset-page under a deadline-less signal
+// ctx. It is a per-PAGE bound, never a whole-sweep one, so a long (resumable) reconcile/backfill is
+// never aborted; a healthy indexed keyset page returns in milliseconds, far under this, so it never
+// false-aborts. 30s matches the DR sweeps' probe timeout and the default pool statement_timeout.
+const keysetPageReadTimeout = 30 * time.Second
+
+// targetGapsPage returns one keyset page (externalID order) of under-replicated objects, bounded on
+// the client side (keysetPageReadTimeout) so a black-holed ledger connection can't hang the sweep.
 func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, after string, limit int) ([]targetGap, error) {
-	rows, err := r.q.TargetGapsPage(ctx, queries.TargetGapsPageParams{
+	pctx, cancel := context.WithTimeout(ctx, keysetPageReadTimeout)
+	defer cancel()
+	rows, err := r.q.TargetGapsPage(pctx, queries.TargetGapsPageParams{
 		Targets:     allTargets,
 		After:       after,
 		TargetCount: int32(len(allTargets)), //nolint:gosec // configured target count, small

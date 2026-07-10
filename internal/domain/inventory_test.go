@@ -102,14 +102,16 @@ func TestAuditInventoryCleanAndMissingOnlyPasses(t *testing.T) {
 	}
 }
 
-// TestAuditInventoryUnverifiableBenign: a NoData target (no capability, or no manifest yet) and a
-// read-denied WORM target are benign — never a failure.
-func TestAuditInventoryUnverifiableBenign(t *testing.T) {
+// TestAuditInventoryBenignNoData: a target with no capability, no manifest yet, OR a by-design
+// write-only WORM copy (no audit/read credential) are all benign NoData — never a failure. A
+// write-only WORM short-circuits to NoData (like the immutability direction) rather than burning a
+// doomed 403 read to reach Unverifiable-exempt.
+func TestAuditInventoryBenignNoData(t *testing.T) {
 	led := newFakeLedger()
 	rep := AuditInventory(context.Background(), led, []Target{
 		{Sink: stubSink{name: "nocap"}},                                                                                   // no capability → NoData
 		{Sink: manifestSink{stubSink: stubSink{name: "empty"}, err: os.ErrNotExist}},                                      // no manifest yet → NoData
-		{Sink: manifestSink{stubSink: stubSink{name: "wormdenied"}, err: errors.New("403"), writeOnly: true}, Worm: true}, // write-only worm read-deny → Unverifiable but exempt
+		{Sink: manifestSink{stubSink: stubSink{name: "wormdenied"}, err: errors.New("403"), writeOnly: true}, Worm: true}, // write-only WORM (no read cred) → NoData (short-circuited)
 	})
 	by := byTarget(rep)
 	if v := by["nocap"]; v.Status != StatusNoData || v.Failed() {
@@ -118,8 +120,8 @@ func TestAuditInventoryUnverifiableBenign(t *testing.T) {
 	if v := by["empty"]; v.Status != StatusNoData || v.Failed() {
 		t.Fatalf("empty must be NoData+benign, got %+v", v)
 	}
-	if v := by["wormdenied"]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("wormdenied must be Unverifiable+benign, got %+v", v)
+	if v := by["wormdenied"]; v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("wormdenied (write-only WORM, no read cred) must short-circuit to NoData+benign, got %+v", v)
 	}
 	if err := rep.FailErr(); err != nil {
 		t.Fatalf("an all-benign report must pass, got %v", err)
@@ -127,21 +129,21 @@ func TestAuditInventoryUnverifiableBenign(t *testing.T) {
 }
 
 // TestAuditInventoryNonWormUnreadableFails: a target whose manifest can't be READ (a broken read path
-// — not "no manifest yet") FAILS unless it is a by-design write-only WORM copy. A non-worm target
-// fails; a read-capable target fails; only a write-only WORM copy (ImmutabilityReadable()==false) is
-// exempt (read-deny by design). The axis is read-capability, not the worm flag.
+// — not "no manifest yet") FAILS unless it is a by-design write-only WORM copy. A non-worm (or any
+// read-capable) target fails; a write-only WORM copy (ImmutabilityReadable()==false) short-circuits to
+// NoData before the doomed read. The axis is read-capability, not the worm flag.
 func TestAuditInventoryNonWormUnreadableFails(t *testing.T) {
 	led := newFakeLedger()
 	rep := AuditInventory(context.Background(), led, []Target{
 		{Sink: manifestSink{stubSink: stubSink{name: "broken"}, err: errors.New("connection refused")}},                                  // non-worm unreadable → FAIL
-		{Sink: manifestSink{stubSink: stubSink{name: "wormbroken"}, err: errors.New("connection refused"), writeOnly: true}, Worm: true}, // write-only worm unreadable → exempt
+		{Sink: manifestSink{stubSink: stubSink{name: "wormbroken"}, err: errors.New("connection refused"), writeOnly: true}, Worm: true}, // write-only WORM → short-circuit NoData
 	})
 	by := byTarget(rep)
 	if v := by["broken"]; v.Status != StatusUnverifiable || !v.Failed() {
 		t.Fatalf("a non-worm unreadable manifest must be Unverifiable+fail, got %+v", v)
 	}
-	if v := by["wormbroken"]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("a write-only worm target's unreadable manifest is by design, must not fail, got %+v", v)
+	if v := by["wormbroken"]; v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("a write-only WORM target short-circuits to NoData (never reaches the doomed read), got %+v", v)
 	}
 	if rep.FailErr() == nil {
 		t.Fatal("FailErr must flag the non-worm broken read path")
