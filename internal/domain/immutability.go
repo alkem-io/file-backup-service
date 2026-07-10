@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -127,11 +128,15 @@ func NewImmutabilitySampler(targets []Target, gauge ImmutabilityGauge) *Immutabi
 //     read failed this pass (a transient error, a wedged endpoint, a driver panic) — a genuinely
 //     unexpected fault that should alert, so the _ok series is dropped without going silent.
 //
-// It never returns an error for an unverifiable target; a genuine drift is surfaced via the gauge (0).
+// A transient/read-deny Unverifiable returns NO error (the gauge carries it); a Fault (a recovered
+// driver panic — a code bug on OUR side) is ALSO returned so the serve loop LOGS it distinctly rather
+// than flattening it into the same silent gauge flip as a benign read blip. A genuine drift is
+// surfaced via the gauge (0), never a returned error.
 func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	var faults []error
 	for _, v := range CheckImmutability(ctx, s.targets).Targets {
 		switch v.Status {
 		case StatusVerified:
@@ -146,7 +151,12 @@ func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 		default: // Unverifiable / Fault on a READ-CAPABLE target — drop stale-green AND alert
 			s.gauge.ClearImmutabilityOK(v.Target)
 			s.gauge.SetImmutabilityUnverifiable(v.Target, true)
+			// A Fault carries a recovered driver panic in Err — a code bug, not a benign read blip:
+			// surface it so it is LOGGED distinctly, while the gauge above still pages either way.
+			if v.Status == StatusFault && v.Err != nil {
+				faults = append(faults, v.Err)
+			}
 		}
 	}
-	return nil
+	return errors.Join(faults...)
 }

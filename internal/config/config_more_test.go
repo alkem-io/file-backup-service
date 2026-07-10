@@ -99,26 +99,27 @@ func TestValidateRejectsBadLedgerDB(t *testing.T) {
 	}
 }
 
-// TestValidateDR: the DR subcommand check validates limits + ledgerDB + targets but NOT
-// fileServiceBase (so it still runs in the degraded/DR environment).
-func TestValidateDR(t *testing.T) {
-	// A valid config with NO fileServiceBase still passes ValidateDR.
+// TestValidateDRLimits: the DR-common check every ledger-DB subcommand runs validates numeric limits
+// + ledgerDB but NOT fileServiceBase (so it still runs in the degraded/DR environment) and NOT the
+// target set (the single-source DR ops validate only their one --from target — Pillar 4c).
+func TestValidateDRLimits(t *testing.T) {
+	// A valid config with NO fileServiceBase still passes.
 	ok := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
 	ok.FileServiceBase = ""
-	if err := ok.ValidateDR(); err != nil {
-		t.Fatalf("ValidateDR must ignore fileServiceBase: %v", err)
+	if err := ok.ValidateDRLimits(); err != nil {
+		t.Fatalf("ValidateDRLimits must ignore fileServiceBase: %v", err)
 	}
-	// A bad numeric limit fails ValidateDR.
+	// A bad numeric limit fails.
 	badLimits := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
 	badLimits.CircuitThreshold = badLimits.MaxAttempts // circuitThreshold must be < maxAttempts
-	if err := badLimits.ValidateDR(); err == nil {
-		t.Fatal("ValidateDR must reject a bad numeric limit")
+	if err := badLimits.ValidateDRLimits(); err == nil {
+		t.Fatal("ValidateDRLimits must reject a bad numeric limit")
 	}
-	// A malformed ledgerDB fails ValidateDR (the DR subcommands connect to it).
+	// A malformed ledgerDB fails (the DR subcommands connect to it).
 	badLedger := validConfig(Target{Name: "fs", Type: "filesystem", Path: "/a"})
 	badLedger.LedgerDB.Host = ""
-	if err := badLedger.ValidateDR(); err == nil {
-		t.Fatal("ValidateDR must reject a malformed ledgerDB")
+	if err := badLedger.ValidateDRLimits(); err == nil {
+		t.Fatal("ValidateDRLimits must reject a malformed ledgerDB")
 	}
 }
 

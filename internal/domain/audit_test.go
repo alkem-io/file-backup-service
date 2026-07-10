@@ -73,6 +73,12 @@ func (existsErrSink) Exists(context.Context, string) (bool, error) {
 	return false, errors.New("AccessDenied")
 }
 
+// ImmutabilityReadable()==false models a by-design write-only WORM copy (a PutObject-only credential
+// that 403s Exists), so its Unverifiable is EXEMPT — the exemption axis is read-capability, not the
+// worm flag. A non-worm existsErrSink is not exempt regardless (targetUnverifiableExempt short-circuits
+// on !Worm), so the non-worm case in TestAuditWORMTargetUnverifiable still FAILS.
+func (existsErrSink) ImmutabilityReadable() bool { return false }
+
 // TestAuditWORMTargetUnverifiable: a target whose Exists always errors is Unverifiable, and that
 // FAILS the audit for a NON-worm target (a broken read path) but NOT for a worm target (read-denying
 // by design).
@@ -186,17 +192,21 @@ func TestClassifyAuditErr(t *testing.T) {
 	}
 }
 
-// TestAuditVerdictPolicy pins the shared pass/fail policy for the ledger→target direction on the
-// TargetVerdict: a non-worm partial-unverifiable fails; the same on a worm target passes; a clean
-// (Verified) sweep passes.
+// TestAuditVerdictPolicy pins the shared pass/fail policy on the TargetVerdict: the exemption axis is
+// READ-CAPABILITY, not worm. A read-capable partial-unverifiable fails; a NOT-read-capable (by-design
+// write-only WORM copy) unverifiable passes; a clean (Verified) sweep passes. A read-capable WORM
+// target (one WITH an audit credential) therefore FAILS an Unverifiable too — which is what aligns the
+// `audit` CLI with the serve immutability sampler (see targetReadCapable).
 func TestAuditVerdictPolicy(t *testing.T) {
+	// Not exempt (a read-capable target, the fail-closed default) → an Unverifiable fails.
 	partial := VerdictReport{Targets: []TargetVerdict{{Target: "t", Status: StatusUnverifiable, Checked: 10}}}
 	if err := partial.FailErr(); err == nil {
-		t.Fatal("a non-worm unverifiable target must fail the audit")
+		t.Fatal("a read-capable unverifiable target must fail the audit")
 	}
-	worm := VerdictReport{Targets: []TargetVerdict{{Target: "w", Worm: true, Status: StatusUnverifiable, Checked: 10}}}
-	if err := worm.FailErr(); err != nil {
-		t.Fatalf("a worm target's read-denied probes must not fail the audit: %v", err)
+	// Exempt (a by-design write-only WORM copy) → an Unverifiable passes.
+	writeOnly := VerdictReport{Targets: []TargetVerdict{{Target: "w", ExemptUnverifiable: true, Status: StatusUnverifiable, Checked: 10}}}
+	if err := writeOnly.FailErr(); err != nil {
+		t.Fatalf("a by-design write-only WORM target's read-denied probes must not fail the audit: %v", err)
 	}
 	clean := VerdictReport{Targets: []TargetVerdict{{Target: "t", Status: StatusVerified, Checked: 10}}}
 	if err := clean.FailErr(); err != nil {

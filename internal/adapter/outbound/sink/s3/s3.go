@@ -53,12 +53,13 @@ type Sink struct {
 	prefix      string
 	opts        minio.PutObjectOptions // constant for the sink's life (PartSize + SSE)
 
-	// bucketMu guards a one-shot, cached bucket-existence verdict (see confirmBucket): a 404
-	// from StatObject can't tell a missing OBJECT from a missing BUCKET, so Exists confirms the
-	// bucket once before ever reporting "absent".
+	// bucketMu guards a cached bucket-existence verdict (see confirmBucket): a 404 from StatObject
+	// can't tell a missing OBJECT from a missing BUCKET, so Exists confirms the bucket before ever
+	// reporting "absent". The DEFINITIVE verdict (present OR gone) is cached, so a burst of
+	// absent-object probes collapses to a single BucketExists instead of one HEAD each.
 	bucketMu      sync.Mutex
-	bucketChecked bool  // BucketExists returned a DEFINITIVE answer (present or gone)
-	bucketGone    error // non-nil once the bucket is confirmed gone; nil = present or unchecked
+	bucketChecked bool  // a DEFINITIVE BucketExists answer (present or gone) is cached in bucketGone
+	bucketGone    error // once bucketChecked: nil = present, non-nil = gone; a transient error is NOT cached
 }
 
 // New constructs an S3 Sink.
@@ -141,7 +142,10 @@ func (s *Sink) Preflight(ctx context.Context) error {
 // credential/endpoint fault returns) is likewise an ERROR, not "absent", so reconcile never
 // treats a permission fault as a gap to refill. Dedup is answered by the ledger, not this method.
 func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
-	_, err := s.client.StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
+	// Read via the audit/read credential when configured (a WORM target's worker credential is
+	// PutObject-only and 403s a HEAD): on a read-capable target this returns a true present/absent,
+	// on a write-only WORM copy it 403s → an error (Unverifiable, never false "absent").
+	_, err := s.readClient().StatObject(ctx, s.bucket, s.key(hash), minio.StatObjectOptions{})
 	if err == nil {
 		return true, nil
 	}
@@ -156,28 +160,32 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 }
 
 // confirmBucket verifies the bucket exists, so Exists never mistakes a missing bucket for a missing
-// object. It caches ONLY the terminal GONE verdict (a deleted bucket won't come back mid-run, and
-// caching it collapses N per-object HEADs to one); a PRESENT bucket is NOT cached, so a bucket that
-// vanishes MID-SWEEP is caught on the next absent-object probe (later 404s → Unverifiable, not false
-// silent-loss) — matching the filesystem sink's per-call confirmRoot re-check. A transient error is
-// not cached either (fail-closed re-check). The lock is held across the one network call so 16
-// concurrent audit probes collapse to a single BucketExists rather than a thundering herd.
+// object. It caches the DEFINITIVE verdict — present OR gone — for the sink's life: caching PRESENT is
+// what collapses a burst of absent-object probes (a silent-loss audit sample) to a SINGLE BucketExists
+// instead of one serialized HEAD per probe. Not caching present (the old behavior) let 16 concurrent
+// probes each block on bucketMu across the network BucketExists; a probe that timed out WHILE waiting
+// on the lock then ran BucketExists on a cancelled ctx and returned an error, so a genuinely-MISSING
+// object was miscounted as `errored` rather than `missing` — flipping a real Drift to Unverifiable
+// (which, for a WORM target, is a benign pass) and MASKING the silent loss the audit exists to catch.
+// With present cached, a mid-sweep bucket vanish instead reads as objects genuinely absent → Drift
+// (missing>0), which pages — the safe direction. A transient error is NOT cached (fail-closed
+// re-check). Reads go through the audit/read credential (a write-only WORM credential can't HEAD a
+// bucket). The lock is held across the one network call so concurrent probes collapse to one check.
 func (s *Sink) confirmBucket(ctx context.Context) error {
 	s.bucketMu.Lock()
 	defer s.bucketMu.Unlock()
-	if s.bucketChecked { // set ONLY once the bucket is confirmed GONE (terminal)
+	if s.bucketChecked { // a definitive present/gone verdict is cached
 		return s.bucketGone
 	}
-	ok, err := s.client.BucketExists(ctx, s.bucket)
+	ok, err := s.readClient().BucketExists(ctx, s.bucket)
 	if err != nil {
 		return fmt.Errorf("bucket %q existence check: %w", s.bucket, err) // transient — don't cache; re-check next probe
 	}
+	s.bucketChecked = true // cache the definitive verdict (present → bucketGone stays nil; gone → set below)
 	if !ok {
-		s.bucketChecked = true // cache the terminal gone verdict (no repeated HEADs on a gone bucket)
 		s.bucketGone = fmt.Errorf("bucket %q does not exist (deleted/renamed/misconfigured?)", s.bucket)
-		return s.bucketGone
 	}
-	return nil // present — NOT cached, so a mid-sweep vanish is caught on the next probe
+	return s.bucketGone
 }
 
 // putStream uploads r to key with SSE, size=-1 (streamed to EOF) so a commit is gated
@@ -220,9 +228,12 @@ func (s *Sink) Store(ctx context.Context, hash string, r io.Reader) (int64, erro
 	return s.putStream(ctx, s.key(hash), r)
 }
 
-// Fetch streams the stored object.
+// Fetch streams the stored object. It reads via the audit/read credential when configured, so a WORM
+// target with a read-capable audit credential can be restored/verified/drilled even though its worker
+// credential is PutObject-only (a write-only WORM copy with no audit credential still 403s here — the
+// operator must supply a read-capable credential, per wormReadSource's guidance).
 func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, s.key(hash), minio.GetObjectOptions{})
+	obj, err := s.readClient().GetObject(ctx, s.bucket, s.key(hash), minio.GetObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get: %w", err)
 	}
@@ -283,9 +294,13 @@ func (s *Sink) CheckImmutability(ctx context.Context) (objectLock, versioning bo
 	return true, ver.Enabled(), nil
 }
 
-// readClient returns the credential used for the immutability drift-check: the audit/read client
-// when configured, else the worker client (which will 403 — but ImmutabilityReadable gates the
-// caller so this fallback is only a defensive default).
+// readClient returns the credential used for EVERY read operation (Exists, Fetch, bucket-existence,
+// the immutability drift-check, and inventory/manifest reads): the audit/read client when configured,
+// else the worker client. On a normal (non-WORM) target no audit client is set, so the worker client
+// — which reads AND writes — is the real read path. On a WORM target the worker client is
+// PutObject-only, so a read WITHOUT an audit client 403s, surfacing as Unverifiable / read-deny (the
+// by-design write-only copy), never a false "absent"; WITH an audit client the WORM target becomes
+// fully readable, so existence/inventory/immutability all verify uniformly with a filesystem target.
 func (s *Sink) readClient() *minio.Client {
 	if s.auditClient != nil {
 		return s.auditClient
@@ -313,38 +328,40 @@ func (s *Sink) versioningEnabled(ctx context.Context) bool {
 	return ver.Enabled()
 }
 
-// LatestManifest returns the newest ledger-snapshot manifest object under _manifest/ — the s3
-// sink's half of domain's optional inventoryReader capability (audit target→ledger). The newest name
-// is resolved by the shared fsutil.SelectLatestManifest (pointer fast-path, else a prefix scan
-// filtered to VALID timestamped manifests), so s3 and filesystem can't diverge on selection. When no
-// manifest exists yet it returns a wrapped os.ErrNotExist (the domain maps that to NoData, not a
-// failure). It then EAGERLY confirms the object is readable (a Stat) so a not-found/read-deny
-// surfaces NOW — a vanished object as os.ErrNotExist (benign, like the filesystem sink), a read-deny
-// as an error (unverifiable) — rather than letting a LAZY GetObject 404 surface mid-READ, where the
-// inventory diff would misread it as a non-worm read-path failure while the filesystem sink stays
-// benign (sink parity).
+// LatestManifest returns the newest ledger-snapshot manifest object that STILL EXISTS under
+// _manifest/ — the s3 sink's half of domain's optional inventoryReader capability (audit
+// target→ledger). Selection + the stale/deleted-pointer fallback are owned by the shared
+// fsutil.OpenLatestManifest (pointer fast-path, else a prefix scan filtered to VALID timestamped
+// manifests; if the selected tip is GONE it scans for the newest SURVIVING manifest), so s3 and
+// filesystem can't diverge. The open closure reads via the audit/read credential and EAGERLY confirms
+// the object (a Stat) so the outcome surfaces NOW: a vanished object → a wrapped os.ErrNotExist (the
+// resolver falls back / the domain maps it to NoData), a 404 that is really a gone/unreachable BUCKET
+// (confirmBucket) → an error (Unverifiable, not a benign "no manifest"), a read-deny → an error
+// (Unverifiable) — matching the filesystem sink (sink parity).
 func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
-	name, err := fsutil.SelectLatestManifest(
+	return fsutil.OpenLatestManifest(
 		func() (string, bool) { return s.readManifestPointer(ctx) },
-		func(after string) ([]string, error) { return s.listManifestNamesAfter(ctx, after) })
-	if err != nil {
-		return nil, err
-	}
-	if name == "" {
-		return nil, fmt.Errorf("no manifest under %s: %w", s.prefixed(fsutil.ManifestDir()), os.ErrNotExist)
-	}
-	obj, err := s.client.GetObject(ctx, s.bucket, s.prefixed(fsutil.ManifestKey(name)), minio.GetObjectOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get manifest %s: %w", name, err)
-	}
-	if _, serr := obj.Stat(); serr != nil {
-		_ = obj.Close()
-		if resp := minio.ToErrorResponse(serr); resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
-			return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist) // benign — like fs
-		}
-		return nil, fmt.Errorf("stat manifest %s: %w", name, serr) // read-deny / other → unverifiable
-	}
-	return obj, nil
+		func(after string) ([]string, error) { return s.listManifestNamesAfter(ctx, after) },
+		func(name string) (io.ReadCloser, error) {
+			obj, err := s.readClient().GetObject(ctx, s.bucket, s.prefixed(fsutil.ManifestKey(name)), minio.GetObjectOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("get manifest %s: %w", name, err)
+			}
+			if _, serr := obj.Stat(); serr != nil {
+				_ = obj.Close()
+				if resp := minio.ToErrorResponse(serr); resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+					// A 404 on the object HEAD can be a gone OBJECT or a gone BUCKET (NoSuchBucket is also
+					// 404). Distinguish: a confirmed-present bucket → the manifest vanished (os.ErrNotExist,
+					// the resolver tries an older one); a gone/unreachable bucket → an error (Unverifiable).
+					if berr := s.confirmBucket(ctx); berr != nil {
+						return nil, berr
+					}
+					return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)
+				}
+				return nil, fmt.Errorf("stat manifest %s: %w", name, serr) // read-deny / other → unverifiable
+			}
+			return obj, nil
+		})
 }
 
 // readManifestPointer reads the `_manifest/LATEST` pointer's raw contents (a manifest base name),
@@ -352,7 +369,7 @@ func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 // SelectLatestManifest falls back to the scan — which surfaces the same 403 as the audit's
 // unverifiable signal. The name is VALIDATED by SelectLatestManifest, not here.
 func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
-	obj, err := s.client.GetObject(ctx, s.bucket, s.prefixed(fsutil.ManifestLatestKey()), minio.GetObjectOptions{})
+	obj, err := s.readClient().GetObject(ctx, s.bucket, s.prefixed(fsutil.ManifestLatestKey()), minio.GetObjectOptions{})
 	if err != nil {
 		return "", false
 	}
@@ -379,7 +396,7 @@ func (s *Sink) listManifestNamesAfter(ctx context.Context, after string) ([]stri
 		opts.StartAfter = s.prefixed(fsutil.ManifestKey(after)) // exclusive: only keys after the pointer
 	}
 	var names []string
-	for obj := range s.client.ListObjects(lctx, s.bucket, opts) {
+	for obj := range s.readClient().ListObjects(lctx, s.bucket, opts) {
 		if obj.Err != nil {
 			return nil, fmt.Errorf("list manifests under %s: %w", prefix, obj.Err)
 		}

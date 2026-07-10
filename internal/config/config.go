@@ -413,15 +413,6 @@ func (c *Config) ValidateDRLimits() error {
 	return c.LedgerDB.Validate("ledgerDB")
 }
 
-// ValidateDR is ValidateDRLimits PLUS the full target set — for the DR ops that touch EVERY target
-// (audit probes all, reconcile repairs across all).
-func (c *Config) ValidateDR() error {
-	if err := c.ValidateDRLimits(); err != nil {
-		return err
-	}
-	return c.ValidateTargets()
-}
-
 // ValidateTargets validates the target set — each target's fields plus no env-token
 // collisions (two names mapping to one FBS_TARGET_<TOKEN>_* would silently share
 // secrets). Used by restore/verify (which need only a single sink built).

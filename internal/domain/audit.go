@@ -21,6 +21,19 @@ const auditConcurrency = 16
 // operations) never false-fails. A var (not const) only so tests can lower it.
 var auditProbeTimeout = 30 * time.Second
 
+// storedPageBounded fetches ONE keyset page of the externalIDs the ledger records stored on target,
+// bounded by a per-PAGE deadline (auditProbeTimeout) — the ONE owner of the bounded ledger-page read,
+// shared by every ledger sweep (audit existence, inventory diff, restore-all, drill) so none can
+// drift back into an UNBOUNDED raw-ctx read that a wedged ledger would hang. It is a per-page bound,
+// never a whole-sweep one, so a large HEALTHY corpus (many fast pages) never false-fails while a
+// black-holing ledger page is still caught. Callers wrap the error with their own tag (errLedgerRead
+// for audit/inventory, a command-specific message for drill/restore-all).
+func storedPageBounded(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
+	pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
+	defer cancel()
+	return led.StoredExternalIDsPage(pctx, target, after, limit)
+}
+
 // randKeysetStart returns a random externalID-shaped hex string — a rotating keyset start so a
 // SAMPLED audit checks a different band each run instead of the same fixed lowest-prefix band
 // (a permanent blind spot). A failed rand falls back to "" (the beginning) so a sampled audit
@@ -82,9 +95,7 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 	name := t.Sink.Name()
 	err := keysetSample(ctx, samplePerTarget, startAfter,
 		func(after string, limit int) ([]string, error) {
-			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
-			defer cancel()
-			page, perr := led.StoredExternalIDsPage(pctx, name, after, limit)
+			page, perr := storedPageBounded(ctx, led, name, after, limit)
 			if perr != nil {
 				return nil, fmt.Errorf("%w: audit target %s: %w", errLedgerRead, name, perr)
 			}
@@ -129,8 +140,11 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 }
 
 // classifyAuditErr folds a ledger→target sweep error into a verdict: a PARENT cancel (SIGTERM) →
-// NoData (benign; the top-level ctx.Err() fold surfaces the abort); a ledger read error → Fault;
-// anything else (a per-page deadline while the parent is live) → Unverifiable.
+// NoData (benign; the top-level ctx.Err() fold surfaces the abort); a ledger read error → Fault —
+// this INCLUDES a per-page auditProbeTimeout DeadlineExceeded, which auditTarget wraps as
+// errLedgerRead, because a stalled/unreadable OWN ledger is our-side infra: page loudly, never
+// worm-exempt. The `default` is a defensive catch-all for a sweep error that is NOT a ledger read (a
+// wedged existence probe surfacing ctx.Err() other than a parent cancel) → Unverifiable.
 func classifyAuditErr(parentCtx context.Context, name string, err error) TargetVerdict {
 	switch {
 	case cancelledInFlight(parentCtx, err):

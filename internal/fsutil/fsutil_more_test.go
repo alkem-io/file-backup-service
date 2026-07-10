@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -439,5 +440,181 @@ func TestSyncDirSyncError(t *testing.T) {
 	// the sync error rather than report a false-durable success.
 	if err := syncDir(devNull); err == nil {
 		t.Fatalf("syncDir(%s) must surface the fsync failure", devNull)
+	}
+}
+
+// openManifestStub models a sink's open(name) for OpenLatestManifest: a reader for a name in
+// `present`, the configured error for a name in `denied`, else os.ErrNotExist (this manifest is gone).
+func openManifestStub(present map[string]bool, denied map[string]error) func(string) (io.ReadCloser, error) {
+	return func(name string) (io.ReadCloser, error) {
+		if err, ok := denied[name]; ok {
+			return nil, err
+		}
+		if present[name] {
+			return io.NopCloser(strings.NewReader(name)), nil
+		}
+		return nil, os.ErrNotExist // this specific manifest has been deleted
+	}
+}
+
+func readAllClose(t *testing.T, rc io.ReadCloser) string {
+	t.Helper()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	_ = rc.Close()
+	return string(b)
+}
+
+// TestOpenLatestManifestPointerTipExists: the fast path — a valid pointer whose tip still exists is
+// opened directly (no fallback scan).
+func TestOpenLatestManifestPointerTipExists(t *testing.T) {
+	const tip = "2026-06-01T000000.000000000Z.jsonl"
+	rc, err := OpenLatestManifest(
+		func() (string, bool) { return tip, true },
+		func(string) ([]string, error) { return nil, nil }, // nothing newer than the pointer
+		openManifestStub(map[string]bool{tip: true}, nil),
+	)
+	if err != nil {
+		t.Fatalf("open tip must succeed: %v", err)
+	}
+	if got := readAllClose(t, rc); got != tip {
+		t.Fatalf("opened %q, want the tip %q", got, tip)
+	}
+}
+
+// TestOpenLatestManifestNoneIsNotExist: no manifest at all → os.ErrNotExist (the caller maps to NoData).
+func TestOpenLatestManifestNoneIsNotExist(t *testing.T) {
+	_, err := OpenLatestManifest(
+		func() (string, bool) { return "", false },
+		func(string) ([]string, error) { return nil, nil },
+		openManifestStub(nil, nil),
+	)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("no manifest must be os.ErrNotExist (→ NoData), got %v", err)
+	}
+}
+
+// TestOpenLatestManifestDeletedTipFallsBackToOlder: the pointer names a since-DELETED tip while an
+// OLDER manifest survives — OpenLatestManifest must full-scan and return the newest SURVIVING manifest,
+// not read the vanished tip as NoData (which would miss an orphan the older manifest still reveals).
+func TestOpenLatestManifestDeletedTipFallsBackToOlder(t *testing.T) {
+	const tip = "2026-06-01T000000.000000000Z.jsonl"   // pointed-at, DELETED
+	const older = "2026-03-01T000000.000000000Z.jsonl" // survives
+	rc, err := OpenLatestManifest(
+		func() (string, bool) { return tip, true },
+		func(after string) ([]string, error) {
+			if after == "" { // the fallback full scan
+				return []string{older, "backup.jsonl"}, nil // stray must be ignored by latestFirst
+			}
+			return nil, nil // the bounded staleness check finds nothing newer than the tip
+		},
+		openManifestStub(map[string]bool{older: true}, nil), // tip gone, older survives
+	)
+	if err != nil {
+		t.Fatalf("deleted-tip fallback must succeed: %v", err)
+	}
+	if got := readAllClose(t, rc); got != older {
+		t.Fatalf("fallback opened %q, want the newest surviving %q", got, older)
+	}
+}
+
+// TestOpenLatestManifestAllGoneIsNotExist: the tip AND every fallback candidate are gone → os.ErrNotExist.
+func TestOpenLatestManifestAllGoneIsNotExist(t *testing.T) {
+	const tip = "2026-06-01T000000.000000000Z.jsonl"
+	const older = "2026-03-01T000000.000000000Z.jsonl"
+	_, err := OpenLatestManifest(
+		func() (string, bool) { return tip, true },
+		func(after string) ([]string, error) {
+			if after == "" {
+				return []string{older}, nil
+			}
+			return nil, nil
+		},
+		openManifestStub(nil, nil), // everything gone
+	)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("all manifests gone must be os.ErrNotExist (→ NoData), got %v", err)
+	}
+}
+
+// TestOpenLatestManifestReadDenySurfaces: a non-ErrNotExist open error on the selected tip (a read-deny
+// / gone container) surfaces unchanged (Unverifiable), NOT swallowed into the NoData fallback.
+func TestOpenLatestManifestReadDenySurfaces(t *testing.T) {
+	const tip = "2026-06-01T000000.000000000Z.jsonl"
+	denied := errors.New("403 read denied")
+	_, err := OpenLatestManifest(
+		func() (string, bool) { return tip, true },
+		func(string) ([]string, error) { return nil, nil },
+		openManifestStub(nil, map[string]error{tip: denied}),
+	)
+	if !errors.Is(err, denied) {
+		t.Fatalf("a read-deny must surface (Unverifiable), got %v", err)
+	}
+}
+
+// TestOpenLatestManifestFallbackListErrorSurfaces: a listFrom error DURING the deleted-tip fallback
+// scan is surfaced (Unverifiable), not swallowed.
+func TestOpenLatestManifestFallbackListErrorSurfaces(t *testing.T) {
+	const tip = "2026-06-01T000000.000000000Z.jsonl"
+	boom := errors.New("scan denied")
+	_, err := OpenLatestManifest(
+		func() (string, bool) { return tip, true },
+		func(after string) ([]string, error) {
+			if after == "" {
+				return nil, boom // the fallback scan itself fails
+			}
+			return nil, nil
+		},
+		openManifestStub(nil, nil), // tip gone → triggers the fallback scan
+	)
+	if !errors.Is(err, boom) {
+		t.Fatalf("fallback scan error must surface, got %v", err)
+	}
+}
+
+// TestOpenLatestManifestFallbackReadDenySurfaces: during the fallback scan, a candidate whose open
+// returns a non-ErrNotExist error surfaces it (Unverifiable) rather than skipping past it.
+func TestOpenLatestManifestFallbackReadDenySurfaces(t *testing.T) {
+	const tip = "2026-06-01T000000.000000000Z.jsonl"
+	const older = "2026-03-01T000000.000000000Z.jsonl"
+	denied := errors.New("403 on older")
+	_, err := OpenLatestManifest(
+		func() (string, bool) { return tip, true },
+		func(after string) ([]string, error) {
+			if after == "" {
+				return []string{older}, nil
+			}
+			return nil, nil
+		},
+		openManifestStub(nil, map[string]error{older: denied}), // tip gone (ErrNotExist), older read-denied
+	)
+	if !errors.Is(err, denied) {
+		t.Fatalf("a read-deny on a fallback candidate must surface, got %v", err)
+	}
+}
+
+// TestLatestFirst: newest-first order, dropping non-timestamped strays (never picked as newest).
+func TestLatestFirst(t *testing.T) {
+	got := latestFirst([]string{
+		"2026-01-01T000000.000000000Z.jsonl",
+		"backup.jsonl", // stray — dropped
+		"2026-06-01T000000.000000000Z.jsonl",
+		"LATEST", // dropped
+		"2026-03-01T000000.000000000Z.jsonl",
+	})
+	want := []string{
+		"2026-06-01T000000.000000000Z.jsonl",
+		"2026-03-01T000000.000000000Z.jsonl",
+		"2026-01-01T000000.000000000Z.jsonl",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("latestFirst got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("latestFirst[%d]=%q want %q (full: %v)", i, got[i], want[i], got)
+		}
 	}
 }

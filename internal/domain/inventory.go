@@ -307,9 +307,7 @@ func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 func ledgerStoredPull(ctx context.Context, led Ledger, target string) func() (string, bool, error) {
 	return keysetPull("", KeysetPageSize,
 		func(after string, limit int) ([]string, error) {
-			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
-			defer cancel()
-			page, err := led.StoredExternalIDsPage(pctx, target, after, limit)
+			page, err := storedPageBounded(ctx, led, target, after, limit)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %w", errLedgerRead, err)
 			}

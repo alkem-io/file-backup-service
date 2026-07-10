@@ -221,6 +221,10 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 		domain.TickLoop(ctx, 15*time.Minute, 2*time.Minute, immSampler.Sample, func(cause any, isPanic bool) {
 			if isPanic {
 				logger.Warn("immutability sampler panicked", zap.Any("panic", cause))
+			} else if err, ok := cause.(error); ok {
+				// A Fault the sampler returns is a recovered driver panic in the drift-check — logged
+				// distinctly (the gauge already dropped stale-green + raised the unverifiable signal).
+				logger.Warn("immutability drift-check fault", zap.Error(err))
 			}
 		})
 	}()
@@ -515,7 +519,14 @@ func runRestoreCurrent(args []string) error {
 	if err := domain.RestoreObject(rctx, src, hash, *to); err != nil {
 		return err
 	}
-	fmt.Printf("restored current version of %s (in effect at %s) from %s -> %s/%s\n", fid, atTime.Format(time.RFC3339), srcName, *to, hash)
+	// Only the resolved-from-DB path VERIFIED the current version was in effect at --at (updatedDate
+	// <= --at). With an operator-supplied --hash we restored exactly that content and verified NOTHING
+	// about its version/time, so make NO "current version in effect at --at" provenance claim.
+	if *hashOverride != "" {
+		fmt.Printf("restored operator-supplied hash %s for file %s from %s -> %s/%s (version provenance is the operator's PITR recovery, not verified here)\n", hash, fid, srcName, *to, hash)
+	} else {
+		fmt.Printf("restored current version of %s (verified in effect at %s) from %s -> %s/%s\n", fid, atTime.Format(time.RFC3339), srcName, *to, hash)
+	}
 	return nil
 }
 
@@ -839,9 +850,10 @@ func printAudit(label string, rep domain.VerdictReport, verdicts *[]error) {
 // kube_job_status_failed alert, exactly like the audit job. It also records the drill gauges and,
 // when --metrics-file (or FBS_DRILL_METRICS_FILE) is set, exports them as a Prometheus textfile
 // (a short-lived CronJob can't be scraped). Needs the ledger DB + only the SOURCE target (built
-// alone — Pillar 4c). On INTERRUPTION it writes NO gauges at all (Pillar 6): an interrupted drill
-// proved less than it sampled, so it must not clobber the textfile with a RED pass=0 or reset the
-// prior last_success — a clean SIGTERM would otherwise page a week-long false failure.
+// alone — Pillar 4c). On a non-clean sweep — a SIGTERM interruption OR an enumeration/infra fault
+// (e.g. a wedged-ledger per-page timeout) — it writes NO gauges at all (Pillar 6): the drill proved
+// neither pass nor fail, so it must not clobber the textfile with a RED pass=0 or reset the prior
+// last_success — either would otherwise page a week-long false failure.
 func runDrill(args []string) error {
 	fs := flag.NewFlagSet("drill", flag.ExitOnError)
 	cfgPath := registerConfigFlag(fs)
@@ -894,25 +906,22 @@ func runDrill(args []string) error {
 }
 
 // drillReport records + exports the drill gauges and maps the outcome to an exit error — extracted
-// so the interruption invariant is unit-testable. On an INTERRUPTION (derr is a ctx cancellation) it
-// records NO gauges at all: writing a red pass=0 would page a false week-long failure and clobbering
-// last_success would reset a genuinely-recent success, so a clean SIGTERM must leave the prior
-// textfile untouched and just exit nonzero. Otherwise it writes the gauges (a full pass only when
-// nothing failed AND the drill wasn't interrupted; a textfile write failure is a warning, not a
-// drill failure — the exit code is the primary signal) and returns: an enumeration error, a distinct
-// 0-sampled failure (proved nothing — a renamed target / empty ledger), a not-every-object-passed
-// failure, or nil.
+// so the interruption invariant is unit-testable. On ANY non-nil derr — a SIGTERM cancellation OR an
+// enumeration/infra fault (e.g. a wedged-ledger per-page timeout) — the drill did NOT complete a
+// clean sweep, so it proved NEITHER pass nor fail and records NO gauges: writing a red pass=0 would
+// page a false week-long failure and clobbering last_success would reset a genuinely-recent success,
+// so it leaves the prior textfile untouched and just exits nonzero. Only a CLEAN completion writes the
+// gauges (pass iff nothing failed AND >0 sampled; a textfile write failure is a warning, not a drill
+// failure — the exit code is the primary signal) and returns: a distinct 0-sampled failure (proved
+// nothing — a renamed target / empty ledger), a not-every-object-passed failure, or nil.
 func drillReport(outcome domain.DrillOutcome, derr error, metricsFile, name string) error {
-	if derr != nil && errors.Is(derr, context.Canceled) {
-		return derr
+	if derr != nil {
+		return derr // interrupted OR an enumeration/infra fault — nonzero exit, prior textfile untouched
 	}
 	dm := metrics.NewDrillMetrics()
-	dm.SetPass(outcome.Pass() && derr == nil, time.Now())
+	dm.SetPass(outcome.Pass(), time.Now())
 	if werr := dm.WriteTextfile(metricsFile); werr != nil {
 		fmt.Fprintln(os.Stderr, "warning: drill metrics textfile:", werr)
-	}
-	if derr != nil {
-		return derr // an enumeration error — nonzero exit, never a clean pass
 	}
 	if outcome.Checked() == 0 {
 		return fmt.Errorf("restore drill sampled 0 objects on %s — nothing to drill (renamed/misconfigured target, or an empty/wrong ledger?)", name)

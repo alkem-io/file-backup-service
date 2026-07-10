@@ -122,7 +122,9 @@ func streamSampledStored(ctx context.Context, led Ledger, target string, sample 
 	}
 	return keysetSample(ctx, sample, startAfter,
 		func(after string, limit int) ([]string, error) {
-			page, err := led.StoredExternalIDsPage(ctx, target, after, limit)
+			// Bounded per-page (like audit/inventory): a wedged ledger during a scheduled drill must
+			// self-abort, not hang the CronJob indefinitely.
+			page, err := storedPageBounded(ctx, led, target, after, limit)
 			if err != nil {
 				return nil, fmt.Errorf("drill sample %s: %w", target, err)
 			}

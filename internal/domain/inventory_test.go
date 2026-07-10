@@ -17,8 +17,9 @@ import (
 // satisfying the inventoryReader capability.
 type manifestSink struct {
 	stubSink
-	manifest []byte
-	err      error
+	manifest  []byte
+	err       error
+	writeOnly bool // a by-design write-only WORM copy (no audit/read credential) → ImmutabilityReadable()==false
 }
 
 func (s manifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
@@ -27,6 +28,11 @@ func (s manifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
 	}
 	return io.NopCloser(bytes.NewReader(s.manifest)), nil
 }
+
+// ImmutabilityReadable reports read-capability: a normal manifestSink is readable (it returns a
+// manifest), a writeOnly one is not — modelling a WORM copy whose Unverifiable is EXEMPT (the axis is
+// read-capability, not the worm flag).
+func (s manifestSink) ImmutabilityReadable() bool { return !s.writeOnly }
 
 // manifestOf renders a JSONL manifest listing the given externalIDs in ASCENDING byte order (a real
 // manifest is written from StoredObjectsPage ORDER BY "externalID" COLLATE "C", which the streaming
@@ -101,9 +107,9 @@ func TestAuditInventoryCleanAndMissingOnlyPasses(t *testing.T) {
 func TestAuditInventoryUnverifiableBenign(t *testing.T) {
 	led := newFakeLedger()
 	rep := AuditInventory(context.Background(), led, []Target{
-		{Sink: stubSink{name: "nocap"}},                                                                  // no capability → NoData
-		{Sink: manifestSink{stubSink: stubSink{name: "empty"}, err: os.ErrNotExist}},                     // no manifest yet → NoData
-		{Sink: manifestSink{stubSink: stubSink{name: "wormdenied"}, err: errors.New("403")}, Worm: true}, // worm read-deny → Unverifiable but benign
+		{Sink: stubSink{name: "nocap"}},                                                                                   // no capability → NoData
+		{Sink: manifestSink{stubSink: stubSink{name: "empty"}, err: os.ErrNotExist}},                                      // no manifest yet → NoData
+		{Sink: manifestSink{stubSink: stubSink{name: "wormdenied"}, err: errors.New("403"), writeOnly: true}, Worm: true}, // write-only worm read-deny → Unverifiable but exempt
 	})
 	by := byTarget(rep)
 	if v := by["nocap"]; v.Status != StatusNoData || v.Failed() {
@@ -120,21 +126,22 @@ func TestAuditInventoryUnverifiableBenign(t *testing.T) {
 	}
 }
 
-// TestAuditInventoryNonWormUnreadableFails: a NON-worm target whose manifest can't be READ (a broken
-// read path — not "no manifest yet") FAILS, consistent with ledger→target's Unverifiable; a worm
-// target with the same error does NOT (read-deny by design).
+// TestAuditInventoryNonWormUnreadableFails: a target whose manifest can't be READ (a broken read path
+// — not "no manifest yet") FAILS unless it is a by-design write-only WORM copy. A non-worm target
+// fails; a read-capable target fails; only a write-only WORM copy (ImmutabilityReadable()==false) is
+// exempt (read-deny by design). The axis is read-capability, not the worm flag.
 func TestAuditInventoryNonWormUnreadableFails(t *testing.T) {
 	led := newFakeLedger()
 	rep := AuditInventory(context.Background(), led, []Target{
-		{Sink: manifestSink{stubSink: stubSink{name: "broken"}, err: errors.New("connection refused")}},                 // non-worm unreadable → FAIL
-		{Sink: manifestSink{stubSink: stubSink{name: "wormbroken"}, err: errors.New("connection refused")}, Worm: true}, // worm unreadable → benign
+		{Sink: manifestSink{stubSink: stubSink{name: "broken"}, err: errors.New("connection refused")}},                                  // non-worm unreadable → FAIL
+		{Sink: manifestSink{stubSink: stubSink{name: "wormbroken"}, err: errors.New("connection refused"), writeOnly: true}, Worm: true}, // write-only worm unreadable → exempt
 	})
 	by := byTarget(rep)
 	if v := by["broken"]; v.Status != StatusUnverifiable || !v.Failed() {
 		t.Fatalf("a non-worm unreadable manifest must be Unverifiable+fail, got %+v", v)
 	}
 	if v := by["wormbroken"]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("a worm target's unreadable manifest is by design, must not fail, got %+v", v)
+		t.Fatalf("a write-only worm target's unreadable manifest is by design, must not fail, got %+v", v)
 	}
 	if rep.FailErr() == nil {
 		t.Fatal("FailErr must flag the non-worm broken read path")

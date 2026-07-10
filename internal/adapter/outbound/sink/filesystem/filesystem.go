@@ -138,29 +138,27 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // filesystem WORM target is reported unverifiable for the drift check, which is correct (POSIX has no
 // bucket object-lock to read).
 //
-// Parity with the s3 sink: a present root with no manifest yet returns a wrapped os.ErrNotExist (the
-// domain maps that to NoData — benign), while a GONE root (a detached mount) returns a NON-ErrNotExist
-// error so the audit reports the target Unverifiable rather than benignly "no manifest" — a
-// disappeared target has NOT lost nothing, it has lost everything.
+// Selection + the stale/DELETED-pointer fallback (if the selected tip is gone, scan for the newest
+// SURVIVING manifest) are owned by the shared fsutil.OpenLatestManifest, so s3 and filesystem can't
+// diverge. Parity with the s3 sink: a present root with no manifest yet returns a wrapped
+// os.ErrNotExist (the domain maps that to NoData — benign), while a GONE root (a detached mount) is
+// caught by the confirmRoot above and returns a NON-ErrNotExist error so the audit reports the target
+// Unverifiable rather than benignly "no manifest" — a disappeared target has NOT lost nothing.
 func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
 	if err := s.confirmRoot(); err != nil {
 		return nil, err
 	}
-	name, err := fsutil.SelectLatestManifest(s.readManifestPointer, s.listManifestNamesAfter)
-	if err != nil {
-		return nil, err
-	}
-	if name == "" {
-		return nil, fmt.Errorf("no manifest in %s: %w", s.osPath(fsutil.ManifestDir()), os.ErrNotExist)
-	}
-	f, err := os.Open(s.osPath(fsutil.ManifestKey(name))) //nolint:gosec // name is a manifest base name under the configured root, not caller-supplied
-	if err != nil {
-		if os.IsNotExist(err) { // named by the pointer/scan but vanished — eager not-found (benign, like s3)
-			return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)
-		}
-		return nil, fmt.Errorf("open manifest %s: %w", name, err)
-	}
-	return f, nil
+	return fsutil.OpenLatestManifest(s.readManifestPointer, s.listManifestNamesAfter,
+		func(name string) (io.ReadCloser, error) {
+			f, err := os.Open(s.osPath(fsutil.ManifestKey(name))) //nolint:gosec // name is a manifest base name under the configured root, not caller-supplied
+			if err != nil {
+				if os.IsNotExist(err) { // named by the pointer/scan but vanished — the resolver tries an older one
+					return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)
+				}
+				return nil, fmt.Errorf("open manifest %s: %w", name, err)
+			}
+			return f, nil
+		})
 }
 
 // confirmRoot verifies the sink root still exists and is a directory — the filesystem analogue of

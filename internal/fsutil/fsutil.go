@@ -8,10 +8,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -213,6 +216,73 @@ func SelectLatestManifest(readPointer func() (string, bool), listFrom func(after
 		}
 	}
 	return latest, nil
+}
+
+// OpenLatestManifest opens the newest manifest that STILL EXISTS, owning — in ONE place, so the s3
+// and filesystem sinks can't diverge — the pointer fast-path, the stale/DELETED-pointer fallback, and
+// newest-first existence confirmation. readPointer/listFrom are as SelectLatestManifest; `open` opens a
+// manifest by base name, signalling a since-DELETED manifest as a wrapped os.ErrNotExist (any OTHER
+// error — a read-deny, a gone container — is surfaced so the caller reports the target Unverifiable,
+// not "no manifest"). It returns the opened newest surviving manifest; a wrapped os.ErrNotExist when
+// NONE exist (the caller maps that to NoData); or any non-ErrNotExist open/list error.
+//
+// The healthy case is one list + one open. Only when the SELECTED newest is gone (a deleted/expired
+// pointer target, or a since-deleted tip) does it pay a full scan to find the newest SURVIVING
+// manifest — so a vanished tip can't hide an orphan an OLDER surviving manifest would still reveal
+// (SelectLatestManifest alone would return the gone tip and the caller would misread NoData).
+func OpenLatestManifest(
+	readPointer func() (string, bool),
+	listFrom func(after string) ([]string, error),
+	open func(name string) (io.ReadCloser, error),
+) (io.ReadCloser, error) {
+	name, err := SelectLatestManifest(readPointer, listFrom)
+	if err != nil {
+		return nil, err
+	}
+	if name == "" {
+		return nil, fmt.Errorf("no manifest: %w", os.ErrNotExist)
+	}
+	rc, err := open(name)
+	if err == nil {
+		return rc, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err // read-deny / gone container → Unverifiable, not a benign "no manifest"
+	}
+	// The selected newest manifest is GONE. Full-scan for the newest SURVIVING manifest so an older
+	// one still diffs against the ledger rather than the target reading as NoData (lost nothing).
+	names, err := listFrom("")
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range latestFirst(names) {
+		if n == name {
+			continue // the selected tip we already found gone
+		}
+		rc, err := open(n)
+		if err == nil {
+			return rc, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("no surviving manifest: %w", os.ErrNotExist)
+}
+
+// latestFirst returns the VALID timestamped manifest base names in descending (newest-first) order,
+// dropping any non-timestamped stray so it can never be picked as "newest". The fixed-width UTC
+// ManifestName layout makes lexical order == chronological order, so a reverse string sort is
+// newest-first.
+func latestFirst(names []string) []string {
+	valid := make([]string, 0, len(names))
+	for _, n := range names {
+		if IsTimestampedManifest(n) {
+			valid = append(valid, n)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(valid)))
+	return valid
 }
 
 // syncDir fsyncs a directory so a create/rename within it is durable
