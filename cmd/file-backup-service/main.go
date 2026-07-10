@@ -350,8 +350,9 @@ func boundedRestoreCtx(ctx context.Context, cfg *config.Config) (context.Context
 
 // runRestore dispatches the restore sub-verbs (contracts/restore-and-ops.md): `restore all`
 // (whole store), `restore current` (a file's current backed-up version, guarded by --at), and
-// `restore object` (a single hash). A bare `restore --hash …` (no sub-verb) is an alias for
-// `restore object` (kept for v0.0.2 CLI compatibility).
+// `restore object` (a single hash). A bare `restore --hash …` (no sub-verb) DEFAULTS to `restore
+// object` — the single-object case is by far the most common restore, and it is the form the
+// quickstart documents, so the object verb is the deliberate default rather than requiring the word.
 func runRestore(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {

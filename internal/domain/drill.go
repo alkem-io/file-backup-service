@@ -84,15 +84,13 @@ func drillInterruptErr(ctx context.Context, sweepErr error, checked, dispatched 
 }
 
 // drillOne restores one object to scratchDir under a per-object deadline, removes the restored file
-// (bounding scratch disk to one object at a time), and folds the outcome into out under mu. A poison
-// object whose sink panics is contained by the restore path's own callWithCtx (RestoreObject →
-// decodeStream), which turns the panic into an error — so it lands here as a GENUINE failure, not a
-// crash; drillOne has NO panic path of its own (RestoreObject's only panic sources are the sink,
-// behind callWithCtx, and the os-spine + mutex ops don't panic — a drill's fresh scratch never hits
-// the pre-existing-file read). A cancellation aborting this object in flight (parent ctx cancelled —
-// a SIGTERM) is NOT counted: the sweep surfaces it as its returned error, not a failed object.
+// (bounding scratch disk to one object at a time), and folds the outcome into out under mu. A sink
+// panic is already contained as an error by the restore path's callWithCtx, so it lands here as a
+// GENUINE failure; recoverFailed is the uniform per-worker guard (see its doc). A cancellation
+// aborting this object in flight (a SIGTERM) is NOT counted — the sweep surfaces it as its returned
+// error, not a failed object.
 func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectTimeout time.Duration, out *DrillOutcome, mu *sync.Mutex) {
-	defer recoverFailed(mu, &out.Failed) // symmetry with restoreAllOne: a stray panic is one Failed, not a crash
+	defer recoverFailed(mu, &out.Failed)
 	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
 	defer cancel()
 	err := RestoreObject(octx, src, hash, scratchDir)

@@ -315,6 +315,30 @@ func TestDrillMetricsCarriesForwardLastSuccess(t *testing.T) {
 	}
 }
 
+// TestReadPriorLastSuccessErrorPaths: the carry-forward parse yields 0 (nothing to carry) for a
+// missing file, a malformed exposition body, and a valid file that lacks the last-success metric — so
+// a failing drill never fabricates a last-success from an unreadable/irrelevant prior textfile.
+func TestReadPriorLastSuccessErrorPaths(t *testing.T) {
+	dir := t.TempDir()
+	if v := readPriorLastSuccess(filepath.Join(dir, "nope.prom")); v != 0 {
+		t.Fatalf("missing file must yield 0, got %v", v)
+	}
+	bad := filepath.Join(dir, "bad.prom")
+	if err := os.WriteFile(bad, []byte("this is not { valid prometheus\n"), 0o600); err != nil {
+		t.Fatalf("write bad: %v", err)
+	}
+	if v := readPriorLastSuccess(bad); v != 0 {
+		t.Fatalf("malformed exposition must yield 0, got %v", v)
+	}
+	other := filepath.Join(dir, "other.prom")
+	if err := os.WriteFile(other, []byte("# TYPE other_metric gauge\nother_metric 5\n"), 0o600); err != nil {
+		t.Fatalf("write other: %v", err)
+	}
+	if v := readPriorLastSuccess(other); v != 0 {
+		t.Fatalf("a file without the last-success metric must yield 0, got %v", v)
+	}
+}
+
 // scrape does a GET against the Metrics HTTP handler and returns the 200 exposition body.
 func scrape(t *testing.T, m *Metrics) string {
 	t.Helper()

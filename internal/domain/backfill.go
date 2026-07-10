@@ -29,9 +29,13 @@ func newPacer(ratePerSec int) (wait func(context.Context) error, stop func()) {
 	}, t.Stop
 }
 
-// recoverFailed converts a panic in a per-item sweep step (reconcile repair / backfill
-// backup) into a counted failure, so one poison object can't crash the whole pass. mu guards
-// the counter because the sweeps run items concurrently (runBoundedPaced).
+// recoverFailed converts a panic in a per-item sweep step (reconcile repair / backfill backup /
+// restore-all / drill) into a counted failure, so one poison object can't crash the whole pass — the
+// UNIFORM per-worker guard at every runBoundedPaced site. It is kept even where the direct panic path
+// is already contained behind callWithCtx (the sink ops turn a driver panic into an error): a bare
+// panic in a background WORKER goroutine would otherwise take down the process, and the uniform guard
+// also catches a future change that introduces a panic path. mu guards the counter because the sweeps
+// run items concurrently (runBoundedPaced).
 func recoverFailed(mu *sync.Mutex, failed *int) {
 	if r := recover(); r != nil { //nolint:revive // recover works here — recoverFailed is invoked directly via `defer recoverFailed(...)`
 		bump(mu, failed)

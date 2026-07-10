@@ -83,20 +83,29 @@ func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
 	defer func() { _ = sr.Close() }()
 
 	extra, missing, msize, merr := mergeInventory(manifestIterator(sr), ledgerStoredPull(ctx, led, name))
-	if merr != nil {
-		// A definitive orphan (Extra>0) observed BEFORE a transient read fault is a REAL drift — report
-		// it, don't discard it and relabel the target Unverifiable (mirrors the immutability 404-drift
-		// preservation). A non-monotonic (old-format / locale) manifest is not a fault: retry with an
-		// order-independent diff so a legitimately-written older manifest doesn't hard-fail.
-		if extra > 0 {
-			return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
-		}
-		if errors.Is(merr, errNonAscendingManifest) {
-			return inventorySortedDiff(ctx, ir, led, name)
-		}
-		return classifyInventoryErr(ctx, name, merr)
+	// A non-monotonic (old-format / locale) manifest with NO definitive orphan yet is not a fault: retry
+	// with an order-independent diff so a legitimately-written older manifest doesn't hard-fail. (An
+	// orphan already seen — extra>0 — is a REAL drift mergeToVerdict preserves, so don't discard it.)
+	if merr != nil && extra == 0 && errors.Is(merr, errNonAscendingManifest) {
+		return inventorySortedDiff(ctx, ir, led, name)
 	}
-	return inventoryVerdict(extra, missing, msize)
+	return mergeToVerdict(ctx, name, extra, missing, msize, merr)
+}
+
+// mergeToVerdict maps a completed-or-faulted inventory merge to a verdict — the ONE owner of the
+// counts→verdict + fault rules, shared by the streaming and the order-independent (sorted) paths so
+// they can't diverge. A definitive orphan (Extra>0) observed BEFORE a transient read fault is a REAL
+// drift (report it, don't relabel the target Unverifiable — mirrors the immutability 404-drift
+// preservation); any other merge fault classifies via classifyInventoryErr; a clean merge → the
+// counts verdict.
+func mergeToVerdict(ctx context.Context, name string, extra, missing, msize int, merr error) TargetVerdict {
+	if merr == nil {
+		return inventoryVerdict(extra, missing, msize)
+	}
+	if extra > 0 {
+		return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
+	}
+	return classifyInventoryErr(ctx, name, merr)
 }
 
 // inventoryVerdict maps a completed diff's counts to a verdict: an orphan (Extra>0) is Drift; a
@@ -130,13 +139,9 @@ func inventorySortedDiff(ctx context.Context, ir inventoryReader, led Ledger, na
 	}
 	sort.Strings(ids)
 	extra, missing, msize, merr := mergeInventory(sliceIterator(ids), ledgerStoredPull(ctx, led, name))
-	if merr != nil {
-		if extra > 0 {
-			return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
-		}
-		return classifyInventoryErr(ctx, name, merr)
-	}
-	return inventoryVerdict(extra, missing, msize)
+	// Same counts→verdict + orphan-preservation rule as the streaming path (one owner: mergeToVerdict).
+	// The non-ascending signal can't recur here (ids are sorted), so there's no further fallback.
+	return mergeToVerdict(ctx, name, extra, missing, msize, merr)
 }
 
 // collectManifestIDs reads every externalID from a (possibly non-ascending) manifest into a slice,
@@ -368,6 +373,12 @@ type stallReader struct {
 	abandoned bool // an abandon happened → the abandon path owns rc.Close(); Read/Close must not touch rc
 }
 
+// readResult carries one stallReader read across the RunAbandonableClose boundary.
+type readResult struct {
+	n   int
+	err error
+}
+
 func (s *stallReader) Read(p []byte) (int, error) {
 	if err := s.ctx.Err(); err != nil {
 		return 0, err
@@ -381,31 +392,18 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	buf := s.own[:len(p)]
 	rctx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	defer cancel()
-	type res struct {
-		n   int
-		err error
-	}
-	ch := make(chan res, 1) // buffered so an abandoned read's send never blocks
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ch <- res{err: PanicErr("manifest read", r)}
-			}
-		}()
-		n, err := s.rc.Read(buf)
-		ch <- res{n, err}
-	}()
-	select {
-	case <-rctx.Done():
-		s.abandoned = true
-		// Own the close: hand rc to a goroutine that waits for the wedged read to finish, THEN closes
-		// it — so a deferred Close() in the caller can't race the in-flight Read (an fd race).
-		go func() { <-ch; _ = s.rc.Close() }()
-		return 0, rctx.Err()
-	case out := <-ch:
-		n := copy(p, buf[:out.n])
-		return n, out.err
-	}
+	// Delegate the abandon + cap-1-buffer + recover + late-close to the shared RunAbandonableClose
+	// primitive rather than a hand-rolled copy: on the per-read deadline it marks the reader abandoned
+	// (so later Reads short-circuit) and closes rc only AFTER the wedged read goroutine finishes via
+	// onLateResult (no fd race with a caller's deferred Close). The read fills s.own; on success we copy
+	// into the caller's p, so an abandoned late read never races p.
+	res := RunAbandonableClose(rctx,
+		func() readResult { n, err := s.rc.Read(buf); return readResult{n, err} },
+		func() readResult { s.abandoned = true; return readResult{err: rctx.Err()} },
+		func(r any) readResult { return readResult{err: PanicErr("manifest read", r)} },
+		func(readResult) { _ = s.rc.Close() }) // free rc once the abandoned read finally completes
+	n := copy(p, buf[:res.n])
+	return n, res.err
 }
 
 // Close closes the underlying reader UNLESS a read was abandoned — in which case the abandon path

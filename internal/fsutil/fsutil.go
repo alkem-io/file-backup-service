@@ -235,30 +235,33 @@ func OpenLatestManifest(
 	listFrom func(after string) ([]string, error),
 	open func(name string) (io.ReadCloser, error),
 ) (io.ReadCloser, error) {
-	name, err := SelectLatestManifest(readPointer, listFrom)
-	if err != nil {
-		return nil, err
+	// Fast path: a VALID pointer bounds the staleness check to manifests NEWER than it (a cheap
+	// StartAfter list), so a healthy audit never full-scans. SelectLatestManifest owns that selection;
+	// the canned pointer reuses the one already read here. On the selected tip being GONE we fall
+	// through to ONE full scan below — never two (the fast path only did a bounded list, so the
+	// invalid-pointer case skips straight to the single full scan instead of scanning twice).
+	if pointer, ok := readPointer(); ok && IsTimestampedManifest(pointer) {
+		name, err := SelectLatestManifest(func() (string, bool) { return pointer, true }, listFrom)
+		if err != nil {
+			return nil, err
+		}
+		rc, err := open(name) // a valid pointer is always a candidate, so name is non-empty
+		if err == nil {
+			return rc, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err // read-deny / gone container → Unverifiable, not a benign "no manifest"
+		}
+		// the fast-path tip is GONE → fall through to a single full scan for the newest surviving.
 	}
-	if name == "" {
-		return nil, fmt.Errorf("no manifest: %w", os.ErrNotExist)
-	}
-	rc, err := open(name)
-	if err == nil {
-		return rc, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, err // read-deny / gone container → Unverifiable, not a benign "no manifest"
-	}
-	// The selected newest manifest is GONE. Full-scan for the newest SURVIVING manifest so an older
-	// one still diffs against the ledger rather than the target reading as NoData (lost nothing).
+	// No valid pointer (SelectLatestManifest would full-scan anyway), OR the fast-path tip is gone →
+	// ONE full scan, newest-surviving first, so a deleted tip can't hide an orphan an OLDER manifest
+	// still reveals (the target must not misread NoData). latestFirst tries each candidate newest-down.
 	names, err := listFrom("")
 	if err != nil {
 		return nil, err
 	}
 	for _, n := range latestFirst(names) {
-		if n == name {
-			continue // the selected tip we already found gone
-		}
 		rc, err := open(n)
 		if err == nil {
 			return rc, nil
@@ -267,7 +270,7 @@ func OpenLatestManifest(
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("no surviving manifest: %w", os.ErrNotExist)
+	return nil, fmt.Errorf("no manifest: %w", os.ErrNotExist)
 }
 
 // latestFirst returns the VALID timestamped manifest base names in descending (newest-first) order,
