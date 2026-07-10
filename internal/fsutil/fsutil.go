@@ -184,68 +184,43 @@ func IsTimestampedManifest(base string) bool {
 	return err == nil
 }
 
-// SelectLatestManifest resolves the newest manifest's base name from a pointer read + a
-// bounded-after lister, owning the policy in ONE place so the s3 and filesystem sinks provide only
-// primitive reads and can't diverge on selection. readPointer returns the `_manifest/LATEST` contents
-// (ok=false when absent/unreadable/empty). The pointer is only a HINT (its write is best-effort, so
-// it can be STALE — name an OLDER manifest): SelectLatestManifest VALIDATES it by listing only the
-// manifests strictly AFTER it (a bounded `StartAfter=<pointer>` list — cheap, since the pointer is
-// updated each write) and, if any newer timestamped manifest exists, uses that newer one instead of
-// the stale pointer (so the diff can't miss an orphan added after a stale pointer). An invalid/absent
-// pointer lists from "" (a full scan). Returns "" (nil error) when none exist — the caller maps that
-// to os.ErrNotExist / NoData — and propagates a listFrom error (a read-deny / gone container → the
-// caller reports the target Unverifiable, not "no manifest").
-func SelectLatestManifest(readPointer func() (string, bool), listFrom func(after string) ([]string, error)) (string, error) {
-	pointer, ok := readPointer()
-	valid := ok && IsTimestampedManifest(pointer)
-	after := ""
-	if valid { // list only what is NEWER than the pointer — a bounded staleness check
-		after = pointer
-	}
-	names, err := listFrom(after)
-	if err != nil {
-		return "", err
-	}
-	latest := ""
-	if valid { // the pointer is a candidate; a newer listed manifest below overrides a stale pointer
-		latest = pointer
-	}
-	for _, n := range names {
-		if IsTimestampedManifest(n) && n > latest {
-			latest = n
-		}
-	}
-	return latest, nil
-}
-
-// OpenLatestManifest opens the newest manifest that STILL EXISTS, owning — in ONE place, so the s3
-// and filesystem sinks can't diverge — the pointer fast-path, the stale/DELETED-pointer fallback, and
-// newest-first existence confirmation. readPointer/listFrom are as SelectLatestManifest; `open` opens a
-// manifest by base name, signalling a since-DELETED manifest as a wrapped os.ErrNotExist (any OTHER
-// error — a read-deny, a gone container — is surfaced so the caller reports the target Unverifiable,
-// not "no manifest"). It returns the opened newest surviving manifest; a wrapped os.ErrNotExist when
-// NONE exist (the caller maps that to NoData); or any non-ErrNotExist open/list error.
+// OpenLatestManifest opens the newest manifest that STILL EXISTS — the SINGLE owner of manifest
+// selection, so the s3 and filesystem sinks provide only primitive reads (readPointer/listFrom/open)
+// and can't diverge on which object is "newest". readPointer returns the `_manifest/LATEST` hint
+// (ok=false when absent/unreadable/empty); listFrom lists manifest base names strictly AFTER its arg
+// (""=full scan); open opens a manifest by base name, signalling a since-DELETED manifest as a wrapped
+// os.ErrNotExist (any OTHER error — a read-deny, a gone container — is surfaced so the caller reports
+// the target Unverifiable, not "no manifest"). It returns the opened newest surviving manifest; a
+// wrapped os.ErrNotExist when NONE exist (the caller maps that to NoData); or a non-ErrNotExist
+// open/list error.
 //
-// The healthy case is one list + one open. Only when the SELECTED newest is gone (a deleted/expired
-// pointer target, or a since-deleted tip) does it pay a full scan to find the newest SURVIVING
-// manifest — so a vanished tip can't hide an orphan an OLDER surviving manifest would still reveal
-// (SelectLatestManifest alone would return the gone tip and the caller would misread NoData).
+// The healthy case is ONE bounded list + ONE open. Only when the selected newest is GONE (a
+// deleted/expired pointer target, or a since-deleted tip) does it pay a full scan for the newest
+// SURVIVING manifest — so a vanished tip can't hide an orphan an OLDER surviving manifest would still
+// reveal (returning the gone tip would make the caller misread NoData).
 func OpenLatestManifest(
 	readPointer func() (string, bool),
 	listFrom func(after string) ([]string, error),
 	open func(name string) (io.ReadCloser, error),
 ) (io.ReadCloser, error) {
-	// Fast path: a VALID pointer bounds the staleness check to manifests NEWER than it (a cheap
-	// StartAfter list), so a healthy audit never full-scans. SelectLatestManifest owns that selection;
-	// the canned pointer reuses the one already read here. On the selected tip being GONE we fall
-	// through to ONE full scan below — never two (the fast path only did a bounded list, so the
-	// invalid-pointer case skips straight to the single full scan instead of scanning twice).
+	// Fast path: a VALID pointer is a HINT (its write is best-effort, so it can be STALE — name an
+	// OLDER manifest). Bound the staleness check to manifests strictly NEWER than it (a cheap
+	// `StartAfter=<pointer>` list, since the pointer is rewritten each snapshot); a newer listed
+	// manifest overrides the stale pointer, so the diff can't miss an orphan added after it. On the
+	// selected tip being GONE, fall through to the single full scan below (the fast path did only the
+	// bounded list, so an invalid/absent pointer skips straight to that one full scan — never two).
 	if pointer, ok := readPointer(); ok && IsTimestampedManifest(pointer) {
-		name, err := SelectLatestManifest(func() (string, bool) { return pointer, true }, listFrom)
+		names, err := listFrom(pointer)
 		if err != nil {
 			return nil, err
 		}
-		rc, err := open(name) // a valid pointer is always a candidate, so name is non-empty
+		newest := pointer // the pointer is a candidate; a newer listed name overrides it below
+		for _, n := range names {
+			if IsTimestampedManifest(n) && n > newest {
+				newest = n
+			}
+		}
+		rc, err := open(newest)
 		if err == nil {
 			return rc, nil
 		}
@@ -254,9 +229,8 @@ func OpenLatestManifest(
 		}
 		// the fast-path tip is GONE → fall through to a single full scan for the newest surviving.
 	}
-	// No valid pointer (SelectLatestManifest would full-scan anyway), OR the fast-path tip is gone →
-	// ONE full scan, newest-surviving first, so a deleted tip can't hide an orphan an OLDER manifest
-	// still reveals (the target must not misread NoData). latestFirst tries each candidate newest-down.
+	// No valid pointer, OR the fast-path tip is gone → ONE full scan, newest-surviving first, so a
+	// deleted tip can't hide an orphan an OLDER manifest still reveals. latestFirst tries newest-down.
 	names, err := listFrom("")
 	if err != nil {
 		return nil, err

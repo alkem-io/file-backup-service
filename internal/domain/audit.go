@@ -22,16 +22,16 @@ const auditConcurrency = 16
 var auditProbeTimeout = 30 * time.Second
 
 // storedPageBounded fetches ONE keyset page of the externalIDs the ledger records stored on target,
-// bounded by a per-PAGE deadline (auditProbeTimeout) — the domain-layer owner of the bounded
-// ledger-page read for the four DR read sweeps (audit existence, inventory diff, restore-all, drill),
-// which drive paging from the domain and run under a deadline-less signal ctx. reconcile's TargetGaps
-// and backfill's EachFile keyset-page from the DB ADAPTER instead, so they carry the equivalent
-// client-side bound THERE (db.keysetPageReadTimeout); between the two, every keyset ledger/corpus sweep
-// is client-side bounded and none can drift into an UNBOUNDED raw-ctx read a black-holed connection
-// would hang (the pool's server-side statement_timeout can't fire when no bytes ever return). It is a
-// per-page bound, never a whole-sweep one, so a large HEALTHY corpus (many fast pages) never
-// false-fails. Callers wrap the error with their own tag (errLedgerRead for audit/inventory, a
-// command-specific message for drill/restore-all).
+// bounded by a per-PAGE deadline (auditProbeTimeout) — the domain-layer bound for the ONE ledger read
+// the DR audit sweeps drive from the domain (StoredExternalIDsPage, used by audit existence, inventory
+// diff, restore-all, drill), so the ledger page shares the sweep's per-operation timeout (the same
+// auditProbeTimeout that bounds a sink Exists/manifest read). EVERY OTHER adapter DB read self-bounds
+// at the DB ADAPTER with db.boundRead (StoredObjectsPage, StoredCountByTarget, TargetGapsPage,
+// filesPage, FileByID, the Probes, …). Between the two, every client-side DB read is bounded and none
+// can drift into an UNBOUNDED raw-ctx read a black-holed connection would hang (the pool's server-side
+// statement_timeout can't fire when no bytes ever return). It is a per-page bound, never a whole-sweep
+// one, so a large HEALTHY corpus (many fast pages) never false-fails. Callers wrap the error with their
+// own tag (errLedgerRead for audit/inventory, a command-specific message for drill/restore-all).
 func storedPageBounded(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
 	pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
 	defer cancel()
@@ -101,6 +101,15 @@ func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePer
 // confirm the target still holds them (Sink.Exists), keyset-paged from startAfter with a single
 // wrap. It tallies checked/missing/errored probes and classifies the result into a verdict.
 func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int, startAfter string) TargetVerdict {
+	// A by-design write-only WORM copy (no audit/read credential) can't be probed by Sink.Exists (its
+	// worker credential is PutObject-only, so every StatObject 403s), so the existence sweep is
+	// legitimately N/A → NoData — matching the immutability + inventory directions (the SAME
+	// targetUnverifiableExempt predicate) instead of a doomed HEAD on every ledger-stored object just to
+	// reach Unverifiable-exempt. (A read-capable WORM target — one WITH an audit credential — is not
+	// exempt, so it is probed normally.)
+	if targetUnverifiableExempt(t) {
+		return TargetVerdict{Status: StatusNoData, Detail: "no audit/read credential — cannot probe object existence"}
+	}
 	var checked, missing, errored int
 	var panicErr error
 	name := t.Sink.Name()

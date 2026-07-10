@@ -86,11 +86,13 @@ func drillInterruptErr(ctx context.Context, sweepErr error, checked, dispatched 
 // drillOne restores one object to scratchDir under a per-object deadline, removes the restored file
 // (bounding scratch disk to one object at a time), and folds the outcome into out under mu. A sink
 // panic is already contained as an error by the restore path's callWithCtx, so it lands here as a
-// GENUINE failure; recoverFailed is the uniform per-worker guard (see its doc). A cancellation
-// aborting this object in flight (a SIGTERM) is NOT counted — the sweep surfaces it as its returned
-// error, not a failed object.
+// GENUINE failure. Its own recover (recoverDrillFailure) counts a stray panic AS a failure AND records
+// the DrillFailure with this object's hash — so the operator's per-object FAIL list is never missing a
+// failed object (unlike the counter-only recoverFailed the other sweeps use, which have no per-object
+// detail to record). A cancellation aborting this object in flight (a SIGTERM) is NOT counted — the
+// sweep surfaces it as its returned error, not a failed object.
 func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectTimeout time.Duration, out *DrillOutcome, mu *sync.Mutex) {
-	defer recoverFailed(mu, &out.Failed)
+	defer recoverDrillFailure(mu, out, hash)
 	octx, cancel := context.WithTimeout(ctx, perObjectTimeout)
 	defer cancel()
 	err := RestoreObject(octx, src, hash, scratchDir)
@@ -101,11 +103,29 @@ func drillOne(ctx context.Context, src Sink, hash, scratchDir string, perObjectT
 		return // interrupted mid-object — the sweep's cancellation error surfaces it, not a Failed count
 	}
 	if err != nil {
-		out.Failed++
-		out.Failures = append(out.Failures, DrillFailure{Hash: hash, Err: err})
+		recordDrillFailure(out, hash, err)
 		return
 	}
 	out.Passed++
+}
+
+// recordDrillFailure appends a failure (hash + cause) and bumps the count — the ONE place both stay in
+// lock-step, so a panic-recover and the normal error path can't record one without the other. The
+// caller holds mu.
+func recordDrillFailure(out *DrillOutcome, hash string, err error) {
+	out.Failed++
+	out.Failures = append(out.Failures, DrillFailure{Hash: hash, Err: err})
+}
+
+// recoverDrillFailure is drillOne's deferred guard: a stray panic (one NOT already turned into an error
+// by the restore path's callWithCtx) is recorded as a failure WITH this object's hash, so the drill's
+// FAIL list is complete. It takes mu itself because the panic unwinds before drillOne's own mu.Lock().
+func recoverDrillFailure(mu *sync.Mutex, out *DrillOutcome, hash string) {
+	if r := recover(); r != nil { //nolint:revive // recover works here — invoked directly via defer
+		mu.Lock()
+		defer mu.Unlock()
+		recordDrillFailure(out, hash, PanicErr("drill "+hash, r))
+	}
 }
 
 // streamSampledStored yields up to `sample` externalIDs the ledger records stored on target, drawn

@@ -99,21 +99,16 @@ func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
 // preservation); any other merge fault classifies via classifyInventoryErr; a clean merge → the
 // counts verdict.
 func mergeToVerdict(ctx context.Context, name string, extra, missing, msize int, merr error) TargetVerdict {
-	if merr == nil {
-		return inventoryVerdict(extra, missing, msize)
+	if merr != nil {
+		if extra > 0 { // a definitive orphan seen BEFORE the read fault is a real drift — don't discard it
+			return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
+		}
+		return classifyInventoryErr(ctx, name, merr)
 	}
+	// A clean, complete diff → the counts verdict: an orphan (Extra>0) is Drift (a lost ledger record);
+	// a clean or merely snapshot-stale (Missing-only) diff is Verified.
+	detail := fmt.Sprintf("manifest=%d extra=%d missing=%d", msize, extra, missing)
 	if extra > 0 {
-		return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
-	}
-	return classifyInventoryErr(ctx, name, merr)
-}
-
-// inventoryVerdict maps a completed diff's counts to a verdict: an orphan (Extra>0) is Drift; a
-// clean or merely snapshot-stale (Missing-only) diff is Verified — shared by the streaming and the
-// order-independent (sorted) paths so they can't diverge on the counts→verdict rule.
-func inventoryVerdict(extra, missing, manifestSize int) TargetVerdict {
-	detail := fmt.Sprintf("manifest=%d extra=%d missing=%d", manifestSize, extra, missing)
-	if extra > 0 { // an orphan / lost ledger record — the genuine target→ledger drift
 		return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: detail}
 	}
 	return TargetVerdict{Status: StatusVerified, Extra: extra, Missing: missing, Detail: detail}
@@ -273,7 +268,13 @@ func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 			if len(line) == 0 {
 				continue
 			}
-			var ml manifestLine
+			// Decode ONLY externalID — the diff compares ids by byte order and never touches
+			// size/createdBy/sourceCreatedDate, so unmarshaling the full manifestLine (a string alloc for
+			// createdBy + a *time.Time RFC3339 parse per line) would be pure waste over a whole-corpus
+			// manifest. json ignores the unlisted keys.
+			var ml struct {
+				ExternalID string `json:"externalID"`
+			}
 			if uerr := json.Unmarshal(line, &ml); uerr != nil {
 				return "", false, fmt.Errorf("%w: parse line: %w", errCorruptManifest, uerr)
 			}

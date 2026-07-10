@@ -31,6 +31,12 @@ import (
 
 const envPrefix = "FBS_"
 
+// defaultDBTimeoutSec is the default single-DB-operation bound (pool statement_timeout + client
+// deadline) — the ONE owner, used both by the applyDefaults floor and by DBTimeout's degrade-to-default
+// overflow guard, so a non-positive/absurd DBTimeoutSec on the unvalidated DR path can't yield a
+// negative Duration (an unbounded pool).
+const defaultDBTimeoutSec = 30
+
 // Target type vocabulary — one owner, so config validation and the sink builder can't
 // disagree on a type string (as compression is owned by domain.ParseCodec).
 const (
@@ -61,9 +67,15 @@ type Target struct {
 	UseSSL         bool   `yaml:"useSSL,omitempty"`
 	SSE            bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
 	Insecure       bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
-	// Worm marks a write-once target whose credential can't read (PutObject-only, e.g. the
-	// immutable off-site copy): audit EXPECTS its Exists to always deny, so it isn't an
-	// alert — whereas a normally-readable target that suddenly can't be verified IS.
+	// Worm marks a write-once (object-lock/immutable) target. It is the target's IMMUTABILITY
+	// declaration, NOT a claim that the target is unreadable: whether a WORM target can be VERIFIED
+	// depends on whether an audit/read credential is set (AuditAccessKey/AuditSecretKey), not on this
+	// flag. A WORM target WITH an audit credential is fully verified (existence + immutability +
+	// inventory all run via the read credential); a WORM target WITHOUT one is legitimately N/A →
+	// NoData (silent, no false alert AND no false pass), its immutability asserted by object-lock + the
+	// audit + never_verified. The pass/fail axis is read-capability, not this flag (see
+	// domain.targetUnverifiableExempt): only a WORM target that CANNOT be read is exempt from an
+	// Unverifiable failing the audit. Configure the audit credential to enable the drift-check.
 	Worm bool `yaml:"worm,omitempty"`
 }
 
@@ -182,8 +194,19 @@ func (c *Config) FanoutStall() time.Duration {
 
 // DBTimeout bounds a single DB operation — the pool's server-side statement_timeout AND the
 // client-side deadline on the otherwise-unbounded claim/reap queries — so a slow or wedged
-// Alkemio/ledger DB fails the op (retried) instead of parking a worker forever.
-func (c *Config) DBTimeout() time.Duration { return time.Duration(c.DBTimeoutSec) * time.Second }
+// Alkemio/ledger DB fails the op (retried) instead of parking a worker forever. It degrades a
+// non-positive OR overflowing DBTimeoutSec to the default (defaultDBTimeoutSec) rather than to a
+// NEGATIVE Duration: the single-object DR path (restore current → resolveCurrentHash → openPool) does
+// NOT run validateLimits, and a negative Duration would make NewPool's `statementTimeout > 0` gate skip
+// setting statement_timeout ENTIRELY — silently opening an UNBOUNDED pool, the opposite of the bound
+// the operator asked for. (The validated serve path never hits the guard: validateLimits keeps
+// DBTimeoutSec >= the bookkeeping timeout.) This mirrors PerObjectTimeout's overflow guard.
+func (c *Config) DBTimeout() time.Duration {
+	if c.DBTimeoutSec <= 0 || int64(c.DBTimeoutSec) > math.MaxInt64/int64(time.Second) {
+		return defaultDBTimeoutSec * time.Second
+	}
+	return time.Duration(c.DBTimeoutSec) * time.Second
+}
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env
 // (FBS_* scalars/DB, FBS_TARGET_<NAME>_* per target), then applies defaults.
@@ -324,11 +347,11 @@ func (c *Config) applyDefaults() {
 	c.PollEverySec = orDefault(c.PollEverySec, 10)
 	c.MaxAttempts = orDefault(c.MaxAttempts, 10)
 	c.MaxDeliveries = orDefault(c.MaxDeliveries, 50)
-	c.ManifestEverySec = orDefault(c.ManifestEverySec, 24*60*60) // daily
-	c.CircuitThreshold = orDefault(c.CircuitThreshold, 5)        // trip a target's circuit at 5 failures within its last 10 outcomes
-	c.CircuitCooldownSec = orDefault(c.CircuitCooldownSec, 60)   // re-probe a down target once a minute
-	c.FanoutStallSec = orDefault(c.FanoutStallSec, 60)           // a target not draining a 1 MiB chunk in 60s is hung, not slow
-	c.DBTimeoutSec = orDefault(c.DBTimeoutSec, 30)               // generous vs any healthy indexed/paged query; bounds a wedged DB
+	c.ManifestEverySec = orDefault(c.ManifestEverySec, 24*60*60)    // daily
+	c.CircuitThreshold = orDefault(c.CircuitThreshold, 5)           // trip a target's circuit at 5 failures within its last 10 outcomes
+	c.CircuitCooldownSec = orDefault(c.CircuitCooldownSec, 60)      // re-probe a down target once a minute
+	c.FanoutStallSec = orDefault(c.FanoutStallSec, 60)              // a target not draining a 1 MiB chunk in 60s is hung, not slow
+	c.DBTimeoutSec = orDefault(c.DBTimeoutSec, defaultDBTimeoutSec) // generous vs any healthy indexed/paged query; bounds a wedged DB
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {
 			d.Port = 5432

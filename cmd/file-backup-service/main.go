@@ -219,6 +219,10 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 	go func() {
 		defer bgWG.Done()
 		domain.TickLoop(ctx, 15*time.Minute, 2*time.Minute, immSampler.Sample, func(cause any, isPanic bool) {
+			// SampleError on ANY failed pass (a returned Fault OR a panic in the sampler's own body),
+			// same as the RPO/coverage samplers — so a frozen stale-green immutability_ok gauge is
+			// detectable via filebackup_metrics_sample_errors_total, not only via a log line.
+			mx.SampleError()
 			if isPanic {
 				logger.Warn("immutability sampler panicked", zap.Any("panic", cause))
 			} else if err, ok := cause.(error); ok {
@@ -265,7 +269,14 @@ func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(
 	if *hash == "" || *from == "" {
 		return fmt.Errorf("%s requires --hash and --from", name)
 	}
-	sink, _, cfg, err := sourceSink(*cfgPath, *from)
+	// Load config + build ONLY the resolved read source (the --from, or the first readable) — so an
+	// unrelated misconfigured target can't block a restore/verify from a healthy one (Pillar 4c). Same
+	// shape as runRestoreAll/runRestoreCurrent/runDrill.
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	sink, _, err := buildReadSource(cfg, *from)
 	if err != nil {
 		return err
 	}
@@ -274,21 +285,6 @@ func sourceOp(name string, args []string, register func(*flag.FlagSet), op func(
 	ctx, cancel := boundedRestoreCtx(ctx, cfg)
 	defer cancel()
 	return op(ctx, sink, *hash)
-}
-
-// sourceSink loads config and builds ONLY the DR read source target (the --from, or the first
-// readable) — so an unrelated misconfigured target can't block a restore/drill from a healthy one
-// (Pillar 4c). Returns the (worm-aware) sink, its resolved name, and the loaded config.
-func sourceSink(cfgPath, from string) (domain.Sink, string, *config.Config, error) {
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("load config: %w", err)
-	}
-	sink, name, err := buildReadSource(cfg, from)
-	if err != nil {
-		return nil, "", nil, err
-	}
-	return sink, name, cfg, nil
 }
 
 // buildReadSource validates + builds ONLY the chosen read target from an already-loaded config: the
@@ -551,9 +547,10 @@ func resolveCurrentHash(ctx context.Context, cfg *config.Config, fid uuid.UUID, 
 	}
 	defer pool.Close()
 	files := db.NewFileRepo(pool)
-	// Preflight the `file` columns (incl. updatedDate) so a schema drift fails loud up front, not
-	// mid-DR on FileByID's Scan.
-	if err := files.Probe(ctx); err != nil {
+	// Preflight the columns FileByID reads (id/externalID/updatedDate) so a schema drift or a missing
+	// updatedDate SELECT grant fails loud up front, not mid-DR on FileByID's Scan. ProbeCurrentVersion
+	// (not the corpus Probe) so restore-current's updatedDate need doesn't gate backfill.
+	if err := files.ProbeCurrentVersion(ctx); err != nil {
 		return "", err
 	}
 	hash, versionTime, found, err := files.FileByID(ctx, fid)
@@ -648,12 +645,9 @@ func runReconcile(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	// reconcile repairs across EVERY target, so validate the whole set (ledgerJob validated only the
-	// limits + ledger DSN).
-	if err := cfg.ValidateTargets(); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
-	}
-	targets, err := buildTargets(cfg.Targets)
+	// reconcile repairs across EVERY target, so validate + build the whole set (ledgerJob validated only
+	// the limits + ledger DSN).
+	targets, err := validateAndBuildTargets(cfg)
 	if err != nil {
 		return err
 	}
@@ -807,12 +801,9 @@ func runAudit(args []string) error {
 		return err
 	}
 	defer pool.Close()
-	// audit probes EVERY target, so validate the whole set (ledgerJob validated only the limits +
-	// ledger DSN).
-	if err := cfg.ValidateTargets(); err != nil {
-		return fmt.Errorf("invalid config: %w", err)
-	}
-	targets, err := buildTargets(cfg.Targets)
+	// audit probes EVERY target, so validate + build the whole set (ledgerJob validated only the limits
+	// + ledger DSN).
+	targets, err := validateAndBuildTargets(cfg)
 	if err != nil {
 		return err
 	}
@@ -1052,6 +1043,18 @@ func preflightTargets(ctx context.Context, logger *zap.Logger, targets []domain.
 func isolatedPipeline(cfg *config.Config, src domain.Source, ledger domain.Ledger, targets []domain.Target) (*domain.Pipeline, *domain.CircuitBreaker) {
 	breaker := cfg.NewCircuitBreaker()
 	return domain.NewPipeline(src, ledger, targets).WithIsolation(cfg.FanoutStall(), breaker), breaker
+}
+
+// validateAndBuildTargets validates the WHOLE target set then builds every sink — the shared step for
+// the every-target DR commands (audit, reconcile), which run ledgerJob (limits + ledger DSN only) and
+// must add the full-set validation + build themselves. One owner so the two can't diverge on the
+// validation or the error wrapping (mirrors buildReadSource bundling validate+build for the
+// single-source DR path).
+func validateAndBuildTargets(cfg *config.Config) ([]domain.Target, error) {
+	if err := cfg.ValidateTargets(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	return buildTargets(cfg.Targets)
 }
 
 func buildTargets(cfgs []config.Target) ([]domain.Target, error) {

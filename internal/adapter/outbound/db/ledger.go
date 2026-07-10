@@ -64,6 +64,8 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 // externalID (the connection is released when the page returns). Audit uses the lighter
 // index-only StoredExternalIDsPage, which needs only the id.
 func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]domain.ObjectMeta, error) {
+	ctx, cancel := boundRead(ctx)
+	defer cancel()
 	rows, err := r.q.StoredObjectsPage(ctx, queries.StoredObjectsPageParams{
 		Target: target, After: after, PageLimit: int32(limit), //nolint:gosec // limit is domain.KeysetPageSize (1000)
 	})
@@ -113,21 +115,32 @@ type targetGap struct {
 	stored     map[string]bool
 }
 
-// keysetPageReadTimeout bounds ONE keyset-page read on the CLIENT side, catching a black-holed
-// connection (TCP alive, no bytes ever return) that the pool's SERVER-side statement_timeout cannot
-// fire on — the same failure the DR read sweeps guard with domain.storedPageBounded, applied here to
-// reconcile's TargetGaps + backfill's EachFile, which likewise keyset-page under a deadline-less signal
-// ctx. It is a per-PAGE bound, never a whole-sweep one, so a long (resumable) reconcile/backfill is
-// never aborted; a healthy indexed keyset page returns in milliseconds, far under this, so it never
-// false-aborts. 30s matches the DR sweeps' probe timeout and the default pool statement_timeout.
-const keysetPageReadTimeout = 30 * time.Second
+// dbReadTimeout bounds ONE adapter DB read on the CLIENT side, catching a black-holed connection (TCP
+// alive, no bytes ever return) that the pool's SERVER-side statement_timeout cannot fire on. Every
+// DIRECT LedgerRepo/FileRepo read wraps its ctx with it via boundRead, so a wedged connection can't
+// hang a read no matter the caller's ctx (the DR/manifest reads run under a deadline-less signal ctx or
+// a coarse TickLoop deadline). It is a per-READ bound, never a whole-sweep one, so a long (resumable)
+// reconcile/backfill/manifest snapshot is never aborted; a healthy indexed read returns in
+// milliseconds, far under this, so it never false-aborts. NOTE: this is the DB-layer read bound and is
+// INDEPENDENT of the domain's per-sink-probe/operation timeout (domain.auditProbeTimeout) — both are
+// 30s today for the same black-hole reason but bound different things (a DB read here vs a sink
+// Exists/manifest-fetch there), so they are not a coupling to keep in lockstep. The ONE read the
+// adapter does NOT self-bound is StoredExternalIDsPage: the DR audit sweeps drive it through
+// domain.storedPageBounded so it shares the sweep's (test-lowerable) per-operation timeout.
+const dbReadTimeout = 30 * time.Second
 
-// targetGapsPage returns one keyset page (externalID order) of under-replicated objects, bounded on
-// the client side (keysetPageReadTimeout) so a black-holed ledger connection can't hang the sweep.
+// boundRead derives a client-side per-read deadline (dbReadTimeout) from ctx — the ONE owner of the
+// adapter read bound, so every read method wraps identically. The caller defers the returned cancel.
+func boundRead(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, dbReadTimeout)
+}
+
+// targetGapsPage returns one keyset page (externalID order) of under-replicated objects, self-bounded
+// (boundRead) so a black-holed ledger connection can't hang the sweep.
 func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, after string, limit int) ([]targetGap, error) {
-	pctx, cancel := context.WithTimeout(ctx, keysetPageReadTimeout)
+	ctx, cancel := boundRead(ctx)
 	defer cancel()
-	rows, err := r.q.TargetGapsPage(pctx, queries.TargetGapsPageParams{
+	rows, err := r.q.TargetGapsPage(ctx, queries.TargetGapsPageParams{
 		Targets:     allTargets,
 		After:       after,
 		TargetCount: int32(len(allTargets)), //nolint:gosec // configured target count, small
@@ -155,6 +168,8 @@ func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int
 	if len(allTargets) == 0 {
 		return 0, nil // no targets configured → nothing can be under-replicated (matches TargetGaps)
 	}
+	ctx, cancel := boundRead(ctx)
+	defer cancel()
 	n, err := r.q.CoverageGaps(ctx, queries.CoverageGapsParams{
 		Targets: allTargets, TargetCount: int32(len(allTargets)), //nolint:gosec // configured target count, small
 	})
@@ -173,6 +188,8 @@ func (r *LedgerRepo) LastVerifiedAge(ctx context.Context, allTargets []string) (
 	if len(allTargets) == 0 {
 		return 0, 0, false, nil
 	}
+	ctx, cancel := boundRead(ctx)
+	defer cancel()
 	row, qerr := r.q.LastVerifiedAge(ctx, allTargets)
 	if qerr != nil {
 		return 0, 0, false, fmt.Errorf("last verified age: %w", qerr)
@@ -184,6 +201,8 @@ func (r *LedgerRepo) LastVerifiedAge(ctx context.Context, allTargets []string) (
 // Probe verifies both ledger tables exist + are readable via the pool's role. A missing
 // table (skipped migration) errors; an empty table is success (EXISTS returns false, not NULL).
 func (r *LedgerRepo) Probe(ctx context.Context) error {
+	ctx, cancel := boundRead(ctx)
+	defer cancel()
 	if _, err := r.q.Probe(ctx); err != nil {
 		return fmt.Errorf("ledger probe (schema/migrate?): %w", err)
 	}
@@ -199,6 +218,8 @@ func (r *LedgerRepo) StoredCountByTarget(ctx context.Context, targets []string) 
 	for _, t := range targets {
 		counts[t] = 0
 	}
+	ctx, cancel := boundRead(ctx)
+	defer cancel()
 	rows, err := r.q.StoredCountByTarget(ctx, targets)
 	if err != nil {
 		return nil, fmt.Errorf("stored count by target: %w", err)
@@ -212,6 +233,8 @@ func (r *LedgerRepo) StoredCountByTarget(ctx context.Context, targets []string) 
 // StoredTargets returns the set of target names already in state='stored' for externalID
 // (the dedup source of truth) — the 'stored' filter is in SQL (ListStoredTargets), not Go.
 func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[string]bool, error) {
+	ctx, cancel := boundRead(ctx)
+	defer cancel()
 	targets, err := r.q.ListStoredTargets(ctx, externalID)
 	if err != nil {
 		return nil, fmt.Errorf("list stored targets: %w", err)

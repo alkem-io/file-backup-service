@@ -18,6 +18,7 @@ import (
 	httpapi "github.com/alkem-io/file-backup-service/internal/adapter/inbound/http"
 	"github.com/alkem-io/file-backup-service/internal/adapter/inbound/metrics"
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db"
+	"github.com/alkem-io/file-backup-service/internal/config"
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
@@ -39,9 +40,13 @@ func TestOpenPoolBadDSN(t *testing.T) {
 // match the key, exercising the DR verify/restore integrity check.
 func storeRaw(t *testing.T, cfgPath, hash string, content []byte) {
 	t.Helper()
-	sink, _, _, err := sourceSink(cfgPath, "local")
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		t.Fatalf("sourceSink: %v", err)
+		t.Fatalf("load config: %v", err)
+	}
+	sink, _, err := buildReadSource(cfg, "local")
+	if err != nil {
+		t.Fatalf("build read source: %v", err)
 	}
 	if _, err := sink.Store(context.Background(), hash, bytes.NewReader(content)); err != nil {
 		t.Fatalf("store raw object: %v", err)

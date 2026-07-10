@@ -79,9 +79,10 @@ func (existsErrSink) Exists(context.Context, string) (bool, error) {
 // on !Worm), so the non-worm case in TestAuditWORMTargetUnverifiable still FAILS.
 func (existsErrSink) ImmutabilityReadable() bool { return false }
 
-// TestAuditWORMTargetUnverifiable: a target whose Exists always errors is Unverifiable, and that
-// FAILS the audit for a NON-worm target (a broken read path) but NOT for a worm target (read-denying
-// by design).
+// TestAuditWORMTargetUnverifiable: a NON-worm target whose Exists always errors is Unverifiable and
+// FAILS (a broken read path); a by-design write-only WORM target (ImmutabilityReadable()==false) is
+// short-circuited to NoData BEFORE any doomed probe — it can't be verified, matching the immutability +
+// inventory directions.
 func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	ctx := context.Background()
 	led := newFakeLedger()
@@ -94,8 +95,8 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	}
 
 	repWorm := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}, Worm: true}}, 0)
-	if v := repWorm.Targets[0]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("a worm all-errored target must be Unverifiable but NOT fail: %+v", v)
+	if v := repWorm.Targets[0]; v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("a write-only WORM target short-circuits to NoData (never probes), got %+v", v)
 	}
 }
 
