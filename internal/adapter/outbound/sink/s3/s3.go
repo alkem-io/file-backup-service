@@ -245,7 +245,7 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 // with the snapshot's name, so a reader single-GETs the pointer instead of scanning the whole
 // prefix. The pointer PUT creates a new object VERSION on a versioned/object-lock bucket
 // (object-lock requires versioning), so it's WORM-safe. The pointer is only a read-time
-// OPTIMIZATION — SelectLatestManifest falls back to a prefix scan when it is absent/stale, so it is
+// OPTIMIZATION — OpenLatestManifest falls back to a prefix scan when it is absent/stale, so it is
 // self-healing — therefore a pointer-only write failure must NOT fail the whole PutManifest: the
 // manifest object itself is durably written, and the next successful pass rewrites the pointer.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
@@ -341,7 +341,7 @@ func (s *Sink) versioningEnabled(ctx context.Context) bool {
 func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 	// Upfront bucket confirmation, symmetric with the filesystem sink's confirmRoot: a gone/unreachable
 	// bucket surfaces as an ERROR (→ Unverifiable) even if a backend were to return an EMPTY non-erroring
-	// LIST for it — otherwise SelectLatestManifest would resolve name="" → NoData, and a vanished target
+	// LIST for it — otherwise OpenLatestManifest would resolve name="" → NoData, and a vanished target
 	// would wrongly read as "no manifest yet" (lost nothing). Cached, so it's one HEAD per sink lifetime.
 	if err := s.confirmBucket(ctx); err != nil {
 		return nil, err
@@ -373,8 +373,8 @@ func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 
 // readManifestPointer reads the `_manifest/LATEST` pointer's raw contents (a manifest base name),
 // returning ok=false when the pointer is absent/unreadable/empty (or a 403 read-deny) so
-// SelectLatestManifest falls back to the scan — which surfaces the same 403 as the audit's
-// unverifiable signal. The name is VALIDATED by SelectLatestManifest, not here.
+// OpenLatestManifest falls back to the scan — which surfaces the same 403 as the audit's
+// unverifiable signal. The name is VALIDATED by OpenLatestManifest, not here.
 func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
 	obj, err := s.readClient().GetObject(ctx, s.bucket, s.prefixed(fsutil.ManifestLatestKey()), minio.GetObjectOptions{})
 	if err != nil {
@@ -391,7 +391,7 @@ func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
 
 // listManifestNamesAfter lists the _manifest/ prefix for object base names STRICTLY AFTER `after`
 // (a bounded StartAfter list — when `after` is the LATEST pointer this returns only manifests newer
-// than it, so SelectLatestManifest cheaply detects a stale pointer; `after==""` is a full scan). The
+// than it, so OpenLatestManifest cheaply detects a stale pointer; `after==""` is a full scan). The
 // list runs under a CHILD ctx cancelled on return, so minio's producer goroutine is torn down whether
 // the scan finishes or bails (a leaked list goroutine per audit would otherwise accumulate).
 func (s *Sink) listManifestNamesAfter(ctx context.Context, after string) ([]string, error) {

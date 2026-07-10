@@ -19,12 +19,20 @@ import (
 // in this repo's migrations for sqlc to type against).
 type LedgerRepo struct {
 	q *queries.Queries
+	// readTimeout is the client-side per-read bound (boundRead). 0 → defaultDBReadTimeout; production
+	// sets it to cfg.DBTimeout() (matching the pool's server statement_timeout) via WithReadTimeout.
+	readTimeout time.Duration
 }
 
 // NewLedgerRepo binds a LedgerRepo to the ledger pool. It takes the PgxDB interface (satisfied
 // by *Pool and by pgxmock), which also drives sqlc's queries.New, so the ledger queries are
 // unit-testable against a mocked pool without a live DB.
 func NewLedgerRepo(p PgxDB) *LedgerRepo { return &LedgerRepo{q: queries.New(p)} }
+
+// WithReadTimeout sets the client-side per-read bound (boundRead) to match the pool's server-side
+// statement_timeout (the operator's cfg.DBTimeout()), so a client bound never fires BEFORE the server
+// would for a slow-but-alive query. Returns the repo for chaining. Unset → defaultDBReadTimeout.
+func (r *LedgerRepo) WithReadTimeout(d time.Duration) *LedgerRepo { r.readTimeout = d; return r }
 
 // statusRow is the per-target status shape marshaled into the jsonb array RecordBackup's
 // jsonb_to_recordset decodes — the json keys MUST match the query's t(target, state, bytes)
@@ -64,7 +72,7 @@ func (r *LedgerRepo) RecordBackup(ctx context.Context, obj domain.ObjectMeta, st
 // externalID (the connection is released when the page returns). Audit uses the lighter
 // index-only StoredExternalIDsPage, which needs only the id.
 func (r *LedgerRepo) StoredObjectsPage(ctx context.Context, target, after string, limit int) ([]domain.ObjectMeta, error) {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	rows, err := r.q.StoredObjectsPage(ctx, queries.StoredObjectsPageParams{
 		Target: target, After: after, PageLimit: int32(limit), //nolint:gosec // limit is domain.KeysetPageSize (1000)
@@ -115,30 +123,36 @@ type targetGap struct {
 	stored     map[string]bool
 }
 
-// dbReadTimeout bounds ONE adapter DB read on the CLIENT side, catching a black-holed connection (TCP
-// alive, no bytes ever return) that the pool's SERVER-side statement_timeout cannot fire on. Every
-// DIRECT LedgerRepo/FileRepo read wraps its ctx with it via boundRead, so a wedged connection can't
-// hang a read no matter the caller's ctx (the DR/manifest reads run under a deadline-less signal ctx or
-// a coarse TickLoop deadline). It is a per-READ bound, never a whole-sweep one, so a long (resumable)
-// reconcile/backfill/manifest snapshot is never aborted; a healthy indexed read returns in
-// milliseconds, far under this, so it never false-aborts. NOTE: this is the DB-layer read bound and is
-// INDEPENDENT of the domain's per-sink-probe/operation timeout (domain.auditProbeTimeout) — both are
-// 30s today for the same black-hole reason but bound different things (a DB read here vs a sink
-// Exists/manifest-fetch there), so they are not a coupling to keep in lockstep. The ONE read the
-// adapter does NOT self-bound is StoredExternalIDsPage: the DR audit sweeps drive it through
-// domain.storedPageBounded so it shares the sweep's (test-lowerable) per-operation timeout.
-const dbReadTimeout = 30 * time.Second
+// defaultDBReadTimeout is the fallback client-side per-read bound when a repo is built WITHOUT an
+// explicit one (unit tests via NewLedgerRepo/NewFileRepo + pgxmock). Production wires the OPERATOR's
+// configured cfg.DBTimeout() via WithReadTimeout, so the client bound MATCHES the pool's server-side
+// statement_timeout — see boundRead.
+const defaultDBReadTimeout = 30 * time.Second
 
-// boundRead derives a client-side per-read deadline (dbReadTimeout) from ctx — the ONE owner of the
-// adapter read bound, so every read method wraps identically. The caller defers the returned cancel.
-func boundRead(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, dbReadTimeout)
+// boundRead derives a client-side per-read deadline from ctx — the ONE owner of the adapter read bound,
+// so every read method wraps identically. It catches a black-holed connection (TCP alive, no bytes ever
+// return) that the pool's SERVER-side statement_timeout cannot fire on. The budget is the SAME as that
+// server statement_timeout (the operator's cfg.DBTimeout(), threaded via WithReadTimeout; the const
+// only when a repo is built without one): a query legitimately running up to that budget is bounded by
+// whichever side fires first, so a fixed sub-budget client bound can NEVER false-abort a slow-but-alive
+// query the operator allowed — it distinguishes "slow but progressing" from "connection dead". It is a
+// per-READ bound, never a whole-sweep one, so a long (resumable) reconcile/backfill/manifest snapshot is
+// never aborted. This DB-layer read bound is INDEPENDENT of the domain's per-sink-probe/operation
+// timeout (domain.auditProbeTimeout) — different things (a DB read here vs a sink Exists/manifest-fetch
+// there). The ONE read the adapter does NOT self-bound is StoredExternalIDsPage: the DR audit sweeps
+// drive it through domain.storedPageBounded so it shares the sweep's (test-lowerable) per-operation
+// timeout. The caller defers the returned cancel.
+func boundRead(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = defaultDBReadTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // targetGapsPage returns one keyset page (externalID order) of under-replicated objects, self-bounded
 // (boundRead) so a black-holed ledger connection can't hang the sweep.
 func (r *LedgerRepo) targetGapsPage(ctx context.Context, allTargets []string, after string, limit int) ([]targetGap, error) {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	rows, err := r.q.TargetGapsPage(ctx, queries.TargetGapsPageParams{
 		Targets:     allTargets,
@@ -168,7 +182,7 @@ func (r *LedgerRepo) CoverageGaps(ctx context.Context, allTargets []string) (int
 	if len(allTargets) == 0 {
 		return 0, nil // no targets configured → nothing can be under-replicated (matches TargetGaps)
 	}
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	n, err := r.q.CoverageGaps(ctx, queries.CoverageGapsParams{
 		Targets: allTargets, TargetCount: int32(len(allTargets)), //nolint:gosec // configured target count, small
@@ -188,7 +202,7 @@ func (r *LedgerRepo) LastVerifiedAge(ctx context.Context, allTargets []string) (
 	if len(allTargets) == 0 {
 		return 0, 0, false, nil
 	}
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	row, qerr := r.q.LastVerifiedAge(ctx, allTargets)
 	if qerr != nil {
@@ -201,7 +215,7 @@ func (r *LedgerRepo) LastVerifiedAge(ctx context.Context, allTargets []string) (
 // Probe verifies both ledger tables exist + are readable via the pool's role. A missing
 // table (skipped migration) errors; an empty table is success (EXISTS returns false, not NULL).
 func (r *LedgerRepo) Probe(ctx context.Context) error {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	if _, err := r.q.Probe(ctx); err != nil {
 		return fmt.Errorf("ledger probe (schema/migrate?): %w", err)
@@ -218,7 +232,7 @@ func (r *LedgerRepo) StoredCountByTarget(ctx context.Context, targets []string) 
 	for _, t := range targets {
 		counts[t] = 0
 	}
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	rows, err := r.q.StoredCountByTarget(ctx, targets)
 	if err != nil {
@@ -233,7 +247,7 @@ func (r *LedgerRepo) StoredCountByTarget(ctx context.Context, targets []string) 
 // StoredTargets returns the set of target names already in state='stored' for externalID
 // (the dedup source of truth) — the 'stored' filter is in SQL (ListStoredTargets), not Go.
 func (r *LedgerRepo) StoredTargets(ctx context.Context, externalID string) (map[string]bool, error) {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	targets, err := r.q.ListStoredTargets(ctx, externalID)
 	if err != nil {

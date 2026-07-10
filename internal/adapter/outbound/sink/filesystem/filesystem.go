@@ -116,7 +116,7 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 // can't leave a truncated manifest a DR restore would trust, then BEST-EFFORT overwrites the
 // `_manifest/LATEST` pointer with the snapshot's name so a reader single-opens the pointer instead of
 // scanning the dir. It uses the same 0644 durable spine as Store — a DR restore on a different uid
-// must be able to read it. The pointer is only a read-time OPTIMIZATION (SelectLatestManifest falls
+// must be able to read it. The pointer is only a read-time OPTIMIZATION (OpenLatestManifest falls
 // back to a dir scan when it is absent/stale, so it is self-healing) — therefore a pointer-only
 // write failure must NOT fail the whole PutManifest: the manifest object itself is durably written.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
@@ -132,7 +132,7 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 
 // LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem
 // sink's half of domain's optional inventoryReader capability (audit target→ledger). The newest name
-// is resolved by the shared fsutil.SelectLatestManifest (pointer fast-path, else a dir scan filtered
+// is resolved by the shared fsutil.OpenLatestManifest (pointer fast-path, else a dir scan filtered
 // to VALID timestamped manifests), so s3 and filesystem can't diverge on selection. Filesystem
 // targets have no object-lock, so this sink deliberately does NOT implement CheckImmutability — a
 // filesystem WORM target is reported unverifiable for the drift check, which is correct (POSIX has no
@@ -181,7 +181,7 @@ func (s *Sink) confirmRoot() error {
 
 // readManifestPointer reads the `_manifest/LATEST` pointer's raw contents (a manifest base name),
 // returning ok=false when the pointer is absent/unreadable/empty. The name is VALIDATED by
-// SelectLatestManifest, not here.
+// OpenLatestManifest, not here.
 func (s *Sink) readManifestPointer() (string, bool) {
 	b, err := os.ReadFile(s.osPath(fsutil.ManifestLatestKey())) //nolint:gosec // fixed pointer key under the configured root
 	if err != nil {
@@ -192,7 +192,7 @@ func (s *Sink) readManifestPointer() (string, bool) {
 }
 
 // listManifestNamesAfter returns every non-dir base name under _manifest/ STRICTLY AFTER `after` (so
-// SelectLatestManifest can bound its stale-pointer check to newer manifests; `after==""` = all). A
+// OpenLatestManifest can bound its stale-pointer check to newer manifests; `after==""` = all). A
 // missing manifest dir is not necessarily benign: the ROOT could have vanished between confirmRoot and
 // this ReadDir (a TOCTOU on a detached mount), so an ENOENT re-checks the root — a gone root → an
 // ERROR (Unverifiable), a present root with no manifest dir yet → benign NoData (no names).

@@ -145,7 +145,7 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 	defer ledgerPool.Close()
 
 	outbox := db.NewOutboxRepo(alkemioPool, cfg.MaxAttempts, cfg.MaxDeliveries)
-	ledger := db.NewLedgerRepo(ledgerPool)
+	ledger := db.NewLedgerRepo(ledgerPool).WithReadTimeout(cfg.DBTimeout())
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err
@@ -546,7 +546,7 @@ func resolveCurrentHash(ctx context.Context, cfg *config.Config, fid uuid.UUID, 
 		return "", err
 	}
 	defer pool.Close()
-	files := db.NewFileRepo(pool)
+	files := db.NewFileRepo(pool).WithReadTimeout(cfg.DBTimeout())
 	// Preflight the columns FileByID reads (id/externalID/updatedDate) so a schema drift or a missing
 	// updatedDate SELECT grant fails loud up front, not mid-DR on FileByID's Scan. ProbeCurrentVersion
 	// (not the corpus Probe) so restore-current's updatedDate need doesn't gate backfill.
@@ -622,7 +622,7 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	ledger := db.NewLedgerRepo(pool)
+	ledger := db.NewLedgerRepo(pool).WithReadTimeout(cfg.DBTimeout())
 	if err := ledger.Probe(ctx); err != nil {
 		pool.Close()
 		return nil, nil, nil, fmt.Errorf("ledger not accessible (schema / migrate?): %w", err)
@@ -723,8 +723,8 @@ func runBackfill(args []string) error {
 	}
 	defer ledgerPool.Close()
 
-	ledger := db.NewLedgerRepo(ledgerPool)
-	files := db.NewFileRepo(alkemioPool)
+	ledger := db.NewLedgerRepo(ledgerPool).WithReadTimeout(cfg.DBTimeout())
+	files := db.NewFileRepo(alkemioPool).WithReadTimeout(cfg.DBTimeout())
 	fsClient := fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil)
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {

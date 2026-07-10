@@ -23,10 +23,20 @@ import (
 // ledger migrations that sqlc's schema points at — so sqlc has no schema to type it. The
 // column-covering Probe is the compensating control (a server-side schema drift fails at
 // startup, not mid-backfill).
-type FileRepo struct{ p PgxDB }
+type FileRepo struct {
+	p PgxDB
+	// readTimeout is the client-side per-read bound (boundRead). 0 → defaultDBReadTimeout; production
+	// sets it to cfg.DBTimeout() (matching the pool's server statement_timeout) via WithReadTimeout.
+	readTimeout time.Duration
+}
 
 // NewFileRepo binds a FileRepo to the alkemio pool.
 func NewFileRepo(p PgxDB) *FileRepo { return &FileRepo{p: p} }
+
+// WithReadTimeout sets the client-side per-read bound (boundRead) to match the pool's server-side
+// statement_timeout (the operator's cfg.DBTimeout()). Returns the repo for chaining. Unset →
+// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout.
+func (r *FileRepo) WithReadTimeout(d time.Duration) *FileRepo { r.readTimeout = d; return r }
 
 // EachFile invokes fn for every non-temporary file (the backfill work-list), ordered by
 // id for a stable, resumable pass. It KEYSET-PAGES the `file` table (id > after ORDER BY
@@ -61,7 +71,7 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	  AND id > $1 ORDER BY id LIMIT $2`
 	// Client-side per-read bound (boundRead): a black-holed Alkemio-DB connection can't hang backfill's
 	// enumeration — the same self-bounding every adapter read does.
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	rows, err := r.p.Query(ctx, q, after, limit)
 	if err != nil {
@@ -93,7 +103,7 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 // the foreign, server-owned table; ProbeCurrentVersion covers these columns). Self-bounded (boundRead)
 // so a black-holed alkemio-DB connection can't hang the DR hash resolution.
 func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, versionTime time.Time, found bool, err error) {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	const q = `SELECT "externalID", "updatedDate" FROM file WHERE id = $1`
 	var ext pgtype.Text
@@ -118,7 +128,7 @@ func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID strin
 // least-privilege, column-scoped SELECT grant that omits updatedDate. Restore-current preflights it
 // separately via ProbeCurrentVersion.
 func (r *FileRepo) Probe(ctx context.Context) error {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	const q = `SELECT id, "externalID", "createdBy", "createdDate", size, "temporaryLocation"
 	FROM file LIMIT 1`
@@ -133,7 +143,7 @@ func (r *FileRepo) Probe(ctx context.Context) error {
 // LOUD up front rather than mid-DR on FileByID's Scan. Separate from Probe so restore-current's
 // updatedDate need does not gate backfill (which never reads it).
 func (r *FileRepo) ProbeCurrentVersion(ctx context.Context) error {
-	ctx, cancel := boundRead(ctx)
+	ctx, cancel := boundRead(ctx, r.readTimeout)
 	defer cancel()
 	const q = `SELECT id, "externalID", "updatedDate" FROM file LIMIT 1`
 	if _, err := r.p.Exec(ctx, q); err != nil {

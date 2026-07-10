@@ -76,7 +76,7 @@ func TestValidateContentHashInvariants(t *testing.T) {
 // TestIsTimestampedManifest locks in that a manifest name is accepted ONLY when it both carries
 // the `.jsonl` suffix AND parses as the fixed-width ManifestName layout — so a stray `.jsonl`
 // (which sorts ABOVE every real 2026-…Z name) can never be picked as "newest". This is the ONE
-// naming rule shared by the s3 + filesystem sinks and SelectLatestManifest.
+// naming rule shared by the s3 + filesystem sinks and OpenLatestManifest.
 func TestIsTimestampedManifest(t *testing.T) {
 	// A hand-written genuine name, and a name freshly stamped from the canonical layout (the exact
 	// shape domain.ManifestName produces) must both be accepted.
@@ -104,7 +104,7 @@ func TestIsTimestampedManifest(t *testing.T) {
 }
 
 // The selection tests below exercise OpenLatestManifest's fast-path/scan selection through the public
-// entry point (SelectLatestManifest was inlined into it). openManifestStub/readAllClose are defined
+// entry point (OpenLatestManifest was inlined into it). openManifestStub/readAllClose are defined
 // alongside the other OpenLatestManifest tests.
 
 // TestOpenLatestPointerCurrentBoundedList: a VALID pointer with NOTHING newer (the bounded
