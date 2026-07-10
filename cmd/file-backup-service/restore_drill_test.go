@@ -286,12 +286,17 @@ func TestDrillReportPassWritesGauges(t *testing.T) {
 	}
 }
 
-// TestRunRestoreVersionVerbRenamed: the old `restore version` verb errors loud pointing at
-// `restore current` (Pillar 7), rather than silently falling through to the bare-hash alias.
-func TestRunRestoreVersionVerbRenamed(t *testing.T) {
+// TestRunRestoreUnknownSubcommand: a non-flag first arg that isn't a known verb (e.g. the pre-release
+// `version`, or a typo) errors loud as an unknown subcommand — rather than silently falling through to
+// the bare-hash alias and doing a surprising object restore. A bare `--hash` (a flag) still falls
+// through to the alias.
+func TestRunRestoreUnknownSubcommand(t *testing.T) {
 	err := runRestore([]string{"version", "--file-id", "x", "--at", "y"})
-	if err == nil || !strings.Contains(err.Error(), "renamed to `restore current`") {
-		t.Fatalf("`restore version` must error pointing at `restore current`, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown restore subcommand") {
+		t.Fatalf("`restore version` must error as an unknown subcommand, got %v", err)
+	}
+	if err := runRestore([]string{"bogus"}); err == nil || !strings.Contains(err.Error(), "unknown restore subcommand") {
+		t.Fatalf("an unknown verb must error, got %v", err)
 	}
 }
 

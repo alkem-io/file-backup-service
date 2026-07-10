@@ -264,15 +264,23 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 // the error is returned and the domain reports the target UNVERIFIABLE, not drifted — the
 // immutable off-site copy's write-only credential legitimately can't read its own config.
 //
-// A DEFINITIVE object-lock-removed answer (ObjectLockConfigurationNotFoundError / HTTP 404) — or a
-// present-but-not-"Enabled" config — is DRIFT (lock=false), and is returned as such REGARDLESS of
-// the subsequent versioning read: versioning is read only best-effort for the detail, so a transient
-// versioning-read failure can no longer DISCARD a definitive drift and mask it as "unverifiable".
+// A DEFINITIVE object-lock-removed answer (ObjectLockConfigurationNotFoundError / HTTP 404), a
+// present-but-not-"Enabled" config, OR object-lock Enabled but with NO DEFAULT RETENTION RULE is DRIFT
+// (lock=false), returned REGARDLESS of the subsequent versioning read: versioning is read only
+// best-effort for the detail, so a transient versioning-read failure can no longer DISCARD a definitive
+// drift and mask it as "unverifiable".
+//
+// The default-retention-rule check is load-bearing: the worker PUTs objects with NO per-object
+// retention header (putStream uses only PartSize+SSE), so an object is immutable ONLY if the bucket's
+// object-lock DEFAULT retention rule applies one. GetObjectLockConfig returns that rule's mode
+// (nil when no default rule is configured); object-lock Enabled but mode==nil means new objects get NO
+// retention (deletable/overwritable) — the WORM guarantee is lost even though the Enabled flag is still
+// on, so it MUST read as drift, not Verified.
 func (s *Sink) CheckImmutability(ctx context.Context) (objectLock, versioning bool, err error) {
 	// Read via the AUDIT credential (ImmutabilityReadable gates the caller, so it is non-nil here); the
 	// worker's own PutObject-only credential can't read these.
 	rc := s.readClient()
-	lockStatus, _, _, _, lerr := rc.GetObjectLockConfig(ctx, s.bucket)
+	lockStatus, mode, _, _, lerr := rc.GetObjectLockConfig(ctx, s.bucket)
 	switch {
 	case lerr != nil && isObjectLockNotFound(lerr):
 		// Definitive: object-lock removed → DRIFT. lock=false regardless of versioning (a failed
@@ -283,6 +291,10 @@ func (s *Sink) CheckImmutability(ctx context.Context) (objectLock, versioning bo
 		return false, false, fmt.Errorf("object-lock config %q: %w", s.bucket, lerr)
 	case !strings.EqualFold(lockStatus, "Enabled"):
 		// Definitive: object-lock present but not enabled → DRIFT; versioning best-effort.
+		return false, s.versioningEnabled(ctx), nil
+	case mode == nil || *mode == "":
+		// Definitive: object-lock Enabled but NO default retention rule → the worker's no-retention-header
+		// PUTs land unretained → WORM guarantee lost → DRIFT; versioning best-effort.
 		return false, s.versioningEnabled(ctx), nil
 	}
 	// Object-lock enabled → versioning is now load-bearing (a manual Suspend silently defeats WORM),

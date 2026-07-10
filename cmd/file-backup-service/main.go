@@ -144,7 +144,7 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 	}
 	defer ledgerPool.Close()
 
-	outbox := db.NewOutboxRepo(alkemioPool, cfg.MaxAttempts, cfg.MaxDeliveries)
+	outbox := db.NewOutboxRepo(alkemioPool, cfg.MaxAttempts, cfg.MaxDeliveries).WithReadTimeout(cfg.DBTimeout())
 	ledger := db.NewLedgerRepo(ledgerPool).WithReadTimeout(cfg.DBTimeout())
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
@@ -346,9 +346,12 @@ func boundedRestoreCtx(ctx context.Context, cfg *config.Config) (context.Context
 
 // runRestore dispatches the restore sub-verbs (contracts/restore-and-ops.md): `restore all`
 // (whole store), `restore current` (a file's current backed-up version, guarded by --at), and
-// `restore object` (a single hash). A bare `restore --hash …` (no sub-verb) DEFAULTS to `restore
-// object` — the single-object case is by far the most common restore, and it is the form the
-// quickstart documents, so the object verb is the deliberate default rather than requiring the word.
+// `restore object` (a single hash). A bare `restore --hash …` (first arg is a FLAG, no sub-verb)
+// DEFAULTS to `restore object` — the single-object case is by far the most common restore, and it is
+// the form the quickstart documents. But a first arg that is a WORD (not a flag) and not a known verb
+// is an unknown subcommand and FAILS LOUD — so `restore version …` (the pre-release name for
+// `restore current`) or a typo can't SILENTLY fall through to a bare-hash object restore and do
+// something surprising.
 func runRestore(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
@@ -358,11 +361,12 @@ func runRestore(args []string) error {
 			return runRestoreCurrent(args[1:])
 		case "object":
 			return runRestoreObject(args[1:])
-		case "version":
-			// The old `restore version` verb was renamed to `restore current` (it restores the CURRENT
-			// backed-up version guarded by --at, never an arbitrary historical one). Fail loud with the
-			// new name rather than silently falling through to the bare-hash alias.
-			return errors.New("`restore version` was renamed to `restore current` (it restores the current backed-up version, guarded by --at; see contracts/restore-and-ops.md)")
+		}
+		// A non-flag first arg that isn't a known verb is an unknown subcommand — fail loud rather than
+		// silently treating the word as a bare-hash `restore object` (which would ignore it). A bare
+		// `restore --hash …` has a FLAG first arg (leading '-'), so it still falls through to the alias.
+		if len(args[0]) > 0 && args[0][0] != '-' {
+			return fmt.Errorf("unknown restore subcommand %q (want: all | current | object | a bare --hash; `restore current` replaced the old `restore version`; see contracts/restore-and-ops.md)", args[0])
 		}
 	}
 	return runRestoreObject(args)

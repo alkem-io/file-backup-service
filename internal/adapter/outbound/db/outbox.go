@@ -22,6 +22,11 @@ type OutboxRepo struct {
 	p             PgxDB
 	maxAttempts   int // genuine-failure dead-letter threshold
 	maxDeliveries int // crash-loop dead-letter threshold (counted by the reaper)
+	// readTimeout is the client-side per-read bound (boundRead), same as LedgerRepo/FileRepo — so the
+	// outbox READS (Probe, BacklogStats) on the shared Alkemio pool self-bound at the adapter rather than
+	// relying on their callers. 0 → defaultDBReadTimeout; production wires cfg.DBTimeout() via
+	// WithReadTimeout.
+	readTimeout time.Duration
 }
 
 // NewOutboxRepo binds an OutboxRepo to the alkemio pool with the dead-letter limits. It takes
@@ -29,6 +34,11 @@ type OutboxRepo struct {
 func NewOutboxRepo(p PgxDB, maxAttempts, maxDeliveries int) *OutboxRepo {
 	return &OutboxRepo{p: p, maxAttempts: maxAttempts, maxDeliveries: maxDeliveries}
 }
+
+// WithReadTimeout sets the client-side per-read bound for the outbox READs (Probe, BacklogStats) to the
+// pool's server-side statement_timeout (cfg.DBTimeout()). Returns the repo for chaining. Unset →
+// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout.
+func (r *OutboxRepo) WithReadTimeout(d time.Duration) *OutboxRepo { r.readTimeout = d; return r }
 
 const claimSQL = `UPDATE file_backup_outbox
 SET status='in_progress', "claimedAt"=now()
@@ -137,6 +147,8 @@ func (r *OutboxRepo) Probe(ctx context.Context) error {
 	const q = `SELECT id, "fileId", "externalID", priority, status, attempts,
 	  deliveries, "lastError", "createdBy", "createdDate", size, "claimedAt", "visibleAt"
 	FROM file_backup_outbox LIMIT 1`
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
 	err := r.p.QueryRow(ctx, q).Scan(&id, &cols, &cols, &cols, &cols, &cols,
 		&cols, &cols, &cols, &cols, &cols, &cols, &cols)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -173,6 +185,8 @@ func (r *OutboxRepo) BacklogStats(ctx context.Context) (pending int, oldestAgeSe
 	FROM file_backup_outbox
 	WHERE status='pending'
 	  AND ("visibleAt" IS NULL OR ("visibleAt" <= now() AND COALESCE(attempts,0) > 0))`
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
 	if err := r.p.QueryRow(ctx, q).Scan(&pending, &oldestAgeSec); err != nil {
 		return 0, 0, fmt.Errorf("backlog stats: %w", err)
 	}

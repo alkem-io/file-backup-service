@@ -123,25 +123,32 @@ type targetGap struct {
 	stored     map[string]bool
 }
 
-// defaultDBReadTimeout is the fallback client-side per-read bound when a repo is built WITHOUT an
-// explicit one (unit tests via NewLedgerRepo/NewFileRepo + pgxmock). Production wires the OPERATOR's
-// configured cfg.DBTimeout() via WithReadTimeout, so the client bound MATCHES the pool's server-side
-// statement_timeout — see boundRead.
+// defaultDBReadTimeout is the fallback client-side per-read bound used ONLY when a repo is built WITHOUT
+// an explicit one — i.e. the pgxmock unit tests (NewLedgerRepo/NewFileRepo/NewOutboxRepo with no
+// WithReadTimeout). PRODUCTION ALWAYS chains .WithReadTimeout(cfg.DBTimeout()) at every construction
+// site, so this fallback never runs in production and its value is intentionally NOT linked to
+// config.defaultDBTimeoutSec (a different package's default): the two being equal today is incidental,
+// not a coupling — production's bound is always the operator's cfg.DBTimeout(), never this const.
 const defaultDBReadTimeout = 30 * time.Second
 
 // boundRead derives a client-side per-read deadline from ctx — the ONE owner of the adapter read bound,
-// so every read method wraps identically. It catches a black-holed connection (TCP alive, no bytes ever
-// return) that the pool's SERVER-side statement_timeout cannot fire on. The budget is the SAME as that
-// server statement_timeout (the operator's cfg.DBTimeout(), threaded via WithReadTimeout; the const
-// only when a repo is built without one): a query legitimately running up to that budget is bounded by
-// whichever side fires first, so a fixed sub-budget client bound can NEVER false-abort a slow-but-alive
-// query the operator allowed — it distinguishes "slow but progressing" from "connection dead". It is a
-// per-READ bound, never a whole-sweep one, so a long (resumable) reconcile/backfill/manifest snapshot is
-// never aborted. This DB-layer read bound is INDEPENDENT of the domain's per-sink-probe/operation
-// timeout (domain.auditProbeTimeout) — different things (a DB read here vs a sink Exists/manifest-fetch
-// there). The ONE read the adapter does NOT self-bound is StoredExternalIDsPage: the DR audit sweeps
-// drive it through domain.storedPageBounded so it shares the sweep's (test-lowerable) per-operation
-// timeout. The caller defers the returned cancel.
+// so every read method (LedgerRepo, FileRepo, OutboxRepo) wraps identically. It catches a black-holed
+// connection (TCP alive, no bytes ever return) that the pool's SERVER-side statement_timeout cannot fire
+// on. The budget is the SAME as that server statement_timeout (the operator's cfg.DBTimeout(), threaded
+// via WithReadTimeout; the const only when a repo is built without one): a query legitimately running up
+// to that budget is bounded by whichever side fires first, so a fixed sub-budget client bound can NEVER
+// false-abort a slow-but-alive query the operator allowed — it distinguishes "slow but progressing" from
+// "connection dead". It is a per-READ bound, never a whole-sweep one, so a long (resumable) reconcile/
+// backfill/manifest snapshot is never aborted. This DB-layer read bound is INDEPENDENT of the domain's
+// per-sink-probe/operation timeout (domain.auditProbeTimeout) — different things (a DB read here vs a
+// sink Exists/manifest-fetch there).
+//
+// Scope — every adapter READ self-bounds here EXCEPT StoredExternalIDsPage, which the DR audit sweeps
+// drive through domain.storedPageBounded so it shares the sweep's (test-lowerable) per-operation timeout.
+// WRITES are NOT boundRead-wrapped (RecordBackup, and the outbox claim/transition/fail/reap UPDATEs):
+// they run on the CALLER's already-bounded op ctx — the pipeline's perObjectTimeout for RecordBackup,
+// the consumer's per-op ctx for the outbox writes — which is the write-path bound. The caller defers the
+// returned cancel.
 func boundRead(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		timeout = defaultDBReadTimeout

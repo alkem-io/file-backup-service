@@ -62,12 +62,15 @@ func immutabilityProbe(pctx context.Context, t Target) TargetVerdict {
 	if !ok {
 		return TargetVerdict{Status: StatusNoData, Detail: "target type cannot report object-lock (not an S3 target)"}
 	}
-	// A by-design write-only WORM copy (no read/audit credential) can't be checked by the worker's
-	// write-only credential — the drift-check is legitimately N/A → NoData (silent), never a false pass
-	// and never a false alert. This is the SAME predicate targetUnverifiableExempt stamps for the
-	// pass/fail policy (both pivot on "a WORM target that declares !ImmutabilityReadable"), so the
-	// NoData gate here and the ExemptUnverifiable stamp can't drift. Its immutability is asserted by
-	// object-lock + the audit + never_verified.
+	// This is the ONLY audit direction that short-circuits a no-audit-credential WORM target to NoData
+	// (the existence + inventory directions probe such a target via the worker credential, since object
+	// reads work on an object-lock bucket). The drift-check reads GetObjectLockConfig / GetBucketVersioning
+	// — BUCKET-config reads that a PutObject-only worker credential can't do AND that even a read-capable
+	// OBJECT credential typically lacks the permission for — so without the dedicated audit credential the
+	// check is legitimately N/A → NoData (silent), never a false pass and never a false alert (and, unlike
+	// existence/inventory, the serve immutability sampler treats an Unverifiable here as ALERTABLE, so a
+	// by-design write-only copy must land on NoData, not Unverifiable, to avoid a continuous false page).
+	// Its immutability is asserted by object-lock + the audit (with a read cred) + never_verified.
 	if targetUnverifiableExempt(t) {
 		return TargetVerdict{Status: StatusNoData, Detail: "no audit/read credential — immutability asserted by object-lock + never_verified"}
 	}

@@ -130,20 +130,19 @@ func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error 
 	return nil
 }
 
-// LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem
-// sink's half of domain's optional inventoryReader capability (audit target→ledger). The newest name
-// is resolved by the shared fsutil.OpenLatestManifest (pointer fast-path, else a dir scan filtered
-// to VALID timestamped manifests), so s3 and filesystem can't diverge on selection. Filesystem
-// targets have no object-lock, so this sink deliberately does NOT implement CheckImmutability — a
-// filesystem WORM target is reported unverifiable for the drift check, which is correct (POSIX has no
-// bucket object-lock to read).
+// LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem sink's
+// half of domain's optional inventoryReader capability (audit target→ledger). Selection AND the
+// stale/DELETED-pointer fallback (if the selected tip is gone, scan for the newest SURVIVING manifest)
+// are owned by the shared fsutil.OpenLatestManifest (pointer fast-path, else a dir scan filtered to
+// VALID timestamped manifests), so s3 and filesystem can't diverge. Filesystem targets have no
+// object-lock, so this sink deliberately does NOT implement CheckImmutability — a filesystem WORM
+// target is reported unverifiable for the drift check, which is correct (POSIX has no bucket object-lock
+// to read).
 //
-// Selection + the stale/DELETED-pointer fallback (if the selected tip is gone, scan for the newest
-// SURVIVING manifest) are owned by the shared fsutil.OpenLatestManifest, so s3 and filesystem can't
-// diverge. Parity with the s3 sink: a present root with no manifest yet returns a wrapped
-// os.ErrNotExist (the domain maps that to NoData — benign), while a GONE root (a detached mount) is
-// caught by the confirmRoot above and returns a NON-ErrNotExist error so the audit reports the target
-// Unverifiable rather than benignly "no manifest" — a disappeared target has NOT lost nothing.
+// Parity with the s3 sink: a present root with no manifest yet returns a wrapped os.ErrNotExist (the
+// domain maps that to NoData — benign), while a GONE root (a detached mount) is caught by the
+// confirmRoot above and returns a NON-ErrNotExist error so the audit reports the target Unverifiable
+// rather than benignly "no manifest" — a disappeared target has NOT lost nothing.
 func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
 	if err := s.confirmRoot(); err != nil {
 		return nil, err

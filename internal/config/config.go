@@ -152,17 +152,23 @@ type Config struct {
 	ScratchDir string `yaml:"scratchDir"`
 }
 
-// PerObjectTimeout is the per-object backup deadline. It returns 0 for a non-positive value OR one
-// so large that PerObjectTimeoutSec*time.Second would OVERFLOW int64 nanoseconds and wrap to a
-// positive near-instant (or negative) deadline — the single-object DR read paths (cmd's sourceOp /
-// restore current) do NOT run validateLimits, so a hostile/absurd perObjectTimeoutSec must degrade to
-// "use the default" (via domain.NormalizePerObjectTimeout downstream), never to an instant-expiry
-// deadline that fails every restore. A 0 return signals the caller to floor to the default.
-func (c *Config) PerObjectTimeout() time.Duration {
-	if c.PerObjectTimeoutSec <= 0 || int64(c.PerObjectTimeoutSec) > math.MaxInt64/int64(time.Second) {
-		return 0
+// secondsToDuration converts a whole-seconds config value to a Duration, degrading a non-positive OR
+// int64-nanosecond-OVERFLOWING value to fallback rather than to a negative/instant-expiry Duration — the
+// ONE owner of that overflow guard, shared by the DR-path duration knobs (PerObjectTimeout, DBTimeout)
+// which are read on paths that do NOT run validateLimits, so a hostile/absurd seconds value must degrade
+// safely, never to a deadline that fails every op or (via NewPool's `>0` gate) unbounds the pool.
+func secondsToDuration(sec int, fallback time.Duration) time.Duration {
+	if sec <= 0 || int64(sec) > math.MaxInt64/int64(time.Second) {
+		return fallback
 	}
-	return time.Duration(c.PerObjectTimeoutSec) * time.Second
+	return time.Duration(sec) * time.Second
+}
+
+// PerObjectTimeout is the per-object backup deadline. It returns 0 for a non-positive/overflowing value
+// (the single-object DR read paths — cmd's sourceOp / restore current — do NOT run validateLimits); a 0
+// return signals the caller to floor to the default via domain.NormalizePerObjectTimeout.
+func (c *Config) PerObjectTimeout() time.Duration {
+	return secondsToDuration(c.PerObjectTimeoutSec, 0)
 }
 
 // StaleTTL is how long a claim may stay in_progress before the reaper requeues it.
@@ -195,17 +201,12 @@ func (c *Config) FanoutStall() time.Duration {
 // DBTimeout bounds a single DB operation — the pool's server-side statement_timeout AND the
 // client-side deadline on the otherwise-unbounded claim/reap queries — so a slow or wedged
 // Alkemio/ledger DB fails the op (retried) instead of parking a worker forever. It degrades a
-// non-positive OR overflowing DBTimeoutSec to the default (defaultDBTimeoutSec) rather than to a
-// NEGATIVE Duration: the single-object DR path (restore current → resolveCurrentHash → openPool) does
-// NOT run validateLimits, and a negative Duration would make NewPool's `statementTimeout > 0` gate skip
-// setting statement_timeout ENTIRELY — silently opening an UNBOUNDED pool, the opposite of the bound
-// the operator asked for. (The validated serve path never hits the guard: validateLimits keeps
-// DBTimeoutSec >= the bookkeeping timeout.) This mirrors PerObjectTimeout's overflow guard.
+// non-positive/overflowing DBTimeoutSec to the default (defaultDBTimeoutSec) rather than a NEGATIVE
+// Duration, which would make NewPool's `statementTimeout > 0` gate skip statement_timeout ENTIRELY —
+// silently opening an UNBOUNDED pool on the unvalidated DR path (restore current → openPool). Same
+// overflow guard as PerObjectTimeout (secondsToDuration).
 func (c *Config) DBTimeout() time.Duration {
-	if c.DBTimeoutSec <= 0 || int64(c.DBTimeoutSec) > math.MaxInt64/int64(time.Second) {
-		return defaultDBTimeoutSec * time.Second
-	}
-	return time.Duration(c.DBTimeoutSec) * time.Second
+	return secondsToDuration(c.DBTimeoutSec, defaultDBTimeoutSec*time.Second)
 }
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env

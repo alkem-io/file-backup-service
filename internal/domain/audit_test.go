@@ -79,10 +79,22 @@ func (existsErrSink) Exists(context.Context, string) (bool, error) {
 // on !Worm), so the non-worm case in TestAuditWORMTargetUnverifiable still FAILS.
 func (existsErrSink) ImmutabilityReadable() bool { return false }
 
+// readableWormSink models a WORM (object-lock) target whose WORKER credential IS read-capable but which
+// has NO separate audit credential (ImmutabilityReadable()==false): object-lock restricts delete/
+// overwrite, not GET, so Exists reads fine. This is the config B (removed-behavior) flagged as silently
+// skipped by the old short-circuit — it must now be PROBED and get a real Verified/Drift verdict.
+type readableWormSink struct {
+	stubSink
+	present bool // Exists result (models present vs a silently-lost object)
+}
+
+func (s readableWormSink) Exists(context.Context, string) (bool, error) { return s.present, nil }
+func (readableWormSink) ImmutabilityReadable() bool                     { return false }
+
 // TestAuditWORMTargetUnverifiable: a NON-worm target whose Exists always errors is Unverifiable and
-// FAILS (a broken read path); a by-design write-only WORM target (ImmutabilityReadable()==false) is
-// short-circuited to NoData BEFORE any doomed probe — it can't be verified, matching the immutability +
-// inventory directions.
+// FAILS (a broken read path); a by-design WRITE-ONLY WORM target (worker cred 403s Exists, no audit
+// cred) is PROBED and reaches Unverifiable, which targetUnverifiableExempt makes benign (never a
+// short-circuit-to-NoData — a read-capable WORM must not be skipped).
 func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	ctx := context.Background()
 	led := newFakeLedger()
@@ -95,8 +107,27 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	}
 
 	repWorm := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}, Worm: true}}, 0)
-	if v := repWorm.Targets[0]; v.Status != StatusNoData || v.Failed() {
-		t.Fatalf("a write-only WORM target short-circuits to NoData (never probes), got %+v", v)
+	if v := repWorm.Targets[0]; v.Status != StatusUnverifiable || v.Failed() {
+		t.Fatalf("a write-only WORM target is probed → Unverifiable but EXEMPT (benign), got %+v", v)
+	}
+}
+
+// TestAuditReadableWORMIsProbed (regression for B): a WORM target whose worker credential can READ (no
+// separate audit cred) must be existence-probed, NOT skipped. A present object → Verified; a silently
+// lost object → Drift (missing>0, failing). The old short-circuit reported NoData (exit 0), silently
+// hiding silent loss on an 'immutable' target.
+func TestAuditReadableWORMIsProbed(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "hashA"}, []TargetStatus{{Target: "w", State: StateStored}})
+
+	present := Audit(ctx, led, []Target{{Sink: readableWormSink{stubSink{name: "w"}, true}, Worm: true}}, 0)
+	if v := present.Targets[0]; v.Status != StatusVerified || v.Failed() {
+		t.Fatalf("a read-capable WORM with a present object must be Verified (probed, not skipped): %+v", v)
+	}
+	lost := Audit(ctx, led, []Target{{Sink: readableWormSink{stubSink{name: "w"}, false}, Worm: true}}, 0)
+	if v := lost.Targets[0]; v.Status != StatusDrift || v.Missing != 1 || !v.Failed() {
+		t.Fatalf("a read-capable WORM with a LOST object must be Drift+fail (silent loss detected): %+v", v)
 	}
 }
 

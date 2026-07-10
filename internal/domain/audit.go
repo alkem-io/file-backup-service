@@ -101,15 +101,15 @@ func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePer
 // confirm the target still holds them (Sink.Exists), keyset-paged from startAfter with a single
 // wrap. It tallies checked/missing/errored probes and classifies the result into a verdict.
 func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int, startAfter string) TargetVerdict {
-	// A by-design write-only WORM copy (no audit/read credential) can't be probed by Sink.Exists (its
-	// worker credential is PutObject-only, so every StatObject 403s), so the existence sweep is
-	// legitimately N/A → NoData — matching the immutability + inventory directions (the SAME
-	// targetUnverifiableExempt predicate) instead of a doomed HEAD on every ledger-stored object just to
-	// reach Unverifiable-exempt. (A read-capable WORM target — one WITH an audit credential — is not
-	// exempt, so it is probed normally.)
-	if targetUnverifiableExempt(t) {
-		return TargetVerdict{Status: StatusNoData, Detail: "no audit/read credential — cannot probe object existence"}
-	}
+	// This direction ALWAYS probes via Sink.Exists (readClient) — it does NOT short-circuit a WORM target
+	// on the a-priori "has a separate audit credential" predicate. That predicate mis-classifies a
+	// READ-CAPABLE worker credential on a WORM (object-lock) bucket — object-lock restricts delete/
+	// overwrite, NOT GET — so such a target IS existence-verifiable and MUST be probed for silent loss;
+	// short-circuiting it to NoData silently disabled its DR verification. So: probe every target. A
+	// genuinely write-only WORM copy (PutObject-only creds) instead read-denies on each StatObject →
+	// errored++ → Unverifiable, which targetUnverifiableExempt (worm && no audit cred) then makes benign.
+	// The cost is a doomed HEAD per object on a full audit of a strictly-write-only target — the honest
+	// price of not silently skipping a verifiable one (correctness over the doomed-read optimization).
 	var checked, missing, errored int
 	var panicErr error
 	name := t.Sink.Name()

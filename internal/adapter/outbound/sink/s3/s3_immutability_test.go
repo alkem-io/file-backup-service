@@ -21,6 +21,7 @@ type wormStub struct {
 	lockStatus       int    // HTTP status for GET ?object-lock (200 or 403)
 	lockErrCode      string // on a 404 lockStatus, the S3 <Code> to emit (default ObjectLockConfigurationNotFoundError)
 	lockEnabled      bool   // ObjectLockEnabled value in the 200 body
+	lockNoRule       bool   // if set, an Enabled config with NO default retention Rule (drift — objects get no retention)
 	versioningStatus string // Status in the versioning body ("Enabled"/"Suspended")
 	versioningErr    int    // non-zero HTTP status to fail the versioning GET
 	listErr          int    // non-zero HTTP status to fail the list-objects call
@@ -56,7 +57,14 @@ func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
 		if s.lockEnabled {
 			lock = "Enabled"
 		}
-		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled></ObjectLockConfiguration>`, lock)
+		// A real WORM bucket carries a DEFAULT retention Rule (mode+period); the sink treats Enabled
+		// WITHOUT a Rule as drift (objects get no retention). Emit the Rule unless lockNoRule exercises
+		// that drift case.
+		rule := `<Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>30</Days></DefaultRetention></Rule>`
+		if s.lockNoRule {
+			rule = ""
+		}
+		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled>%s</ObjectLockConfiguration>`, lock, rule)
 	case http.StatusNotFound:
 		// A 404 — but the CODE decides the meaning. Only ObjectLockConfigurationNotFoundError is the
 		// definitive DRIFT signal (a WORM bucket that lost its lock config); any OTHER 404 code (e.g.
@@ -181,6 +189,20 @@ func TestCheckImmutabilityEnabled(t *testing.T) {
 	}
 	if !lock || !ver {
 		t.Fatalf("want object-lock + versioning enabled, got lock=%v versioning=%v", lock, ver)
+	}
+}
+
+func TestCheckImmutabilityEnabledNoRetentionRuleIsDrift(t *testing.T) {
+	// Object-lock Enabled but with NO default retention Rule: the worker PUTs with no per-object
+	// retention header, so new objects get NO retention (deletable) — the WORM guarantee is lost even
+	// though the Enabled flag is on. Must read as drift (lock=false), not Verified.
+	sink := newWormSink(t, &wormStub{lockStatus: http.StatusOK, lockEnabled: true, lockNoRule: true, versioningStatus: "Enabled"})
+	lock, _, err := sink.CheckImmutability(context.Background())
+	if err != nil {
+		t.Fatalf("CheckImmutability: %v", err)
+	}
+	if lock {
+		t.Fatal("object-lock Enabled with no default retention rule must read as drift (lock=false), got lock=true")
 	}
 }
 

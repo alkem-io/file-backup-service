@@ -66,12 +66,12 @@ func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
 	if !ok {
 		return TargetVerdict{Status: StatusNoData, Detail: "target type cannot enumerate its manifest"}
 	}
-	// A by-design write-only WORM copy (no audit/read credential) can't read its OWN manifest either,
-	// so the inventory diff is legitimately N/A → NoData — matching the immutability direction (the same
-	// targetUnverifiableExempt predicate) instead of burning a doomed 403 read to reach Unverifiable.
-	if targetUnverifiableExempt(t) {
-		return TargetVerdict{Status: StatusNoData, Detail: "no audit/read credential — cannot enumerate manifest"}
-	}
+	// This direction ALWAYS attempts the manifest read via readClient() — it does NOT short-circuit a
+	// WORM target on "has a separate audit credential". A read-capable worker credential on a WORM bucket
+	// CAN read its manifest (object-lock restricts delete/overwrite, not GET), so it MUST be diffed for
+	// orphans/lost records; skipping it to NoData silently disabled that. A genuinely write-only WORM
+	// copy instead read-denies → Unverifiable, which targetUnverifiableExempt (worm && no audit cred)
+	// makes benign — same policy as the existence direction.
 	name := t.Sink.Name()
 	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
 	if err != nil {

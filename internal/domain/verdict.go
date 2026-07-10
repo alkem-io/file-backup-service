@@ -85,9 +85,11 @@ func (s VerdictStatus) Failed(exemptUnverifiable bool) bool {
 }
 
 // TargetVerdict is one target's outcome for ONE audit direction. Status is the sole source of truth
-// for the pass/fail verdict and the gauge; the count fields are direction-specific breadcrumbs the
-// printed report shows. Illegal combinations are unrepresentable: a target has exactly one Status,
-// and Failed() derives from it — there is no way to record "drift" and "benign" at once.
+// for the pass/fail verdict and the gauge; the count fields (Checked/Missing/Extra) are the TYPED,
+// direction-specific breadcrumbs — the programmatic/test-observable view (tests assert on them), while
+// Detail is the human-readable line printAudit prints. Both are computed from the same per-probe locals
+// at each construction site (so they can't drift). Illegal combinations are unrepresentable: a target
+// has exactly one Status, and Failed() derives from it — no way to record "drift" and "benign" at once.
 type TargetVerdict struct {
 	Target string
 	// ExemptUnverifiable is the axis the Unverifiable pass/fail policy turns on (see
@@ -202,13 +204,18 @@ func probeOne(ctx context.Context, t Target, timeout time.Duration,
 	return v
 }
 
-// targetUnverifiableExempt reports whether an Unverifiable verdict for this target is EXPECTED (and so
-// exempt from failing — VerdictStatus.Failed). The axis is read-capability, not worm: the ONLY exempt
-// case is a WORM target whose sink declares !ImmutabilityReadable() — a by-design write-only copy (no
-// audit/read credential) that legitimately can't be read. A non-worm target, a WORM target WITH an
-// audit credential (ImmutabilityReadable()==true), and a sink that can't declare readability (the
-// filesystem sink — POSIX reads always work on a mounted root; a gone mount is a genuine fault) are
-// all NOT exempt, so a read failure on any of them fails the audit. Defaults to false → fail-closed.
+// targetUnverifiableExempt reports whether an Unverifiable verdict for this target is EXPECTED (a
+// by-design write-only WORM copy). Two consumers: (1) probeOne stamps it onto every verdict so
+// VerdictStatus.Failed exempts such a target's Unverifiable from failing the existence + inventory
+// directions (which PROBE every target and let a genuinely-unreadable WORM copy read-deny → Unverifiable
+// → benign); (2) the immutability direction uses it to short-circuit to NoData (that direction's
+// bucket-config read genuinely needs the dedicated audit credential — see immutabilityProbe). The ONLY
+// exempt case is a WORM target whose sink declares !ImmutabilityReadable() — no audit/read credential.
+// A non-worm target, a WORM target WITH an audit credential, and a sink that can't declare readability
+// (the filesystem sink) are all NOT exempt, so a read failure on any of them fails the audit. Defaults
+// to false → fail-closed. NOTE: for existence/inventory this exempts only a target that ACTUALLY
+// read-denied (reached Unverifiable); a read-capable worker credential on a WORM bucket reads fine and
+// gets a real Verified/Drift verdict, so the exemption never masks a verifiable target's silent loss.
 func targetUnverifiableExempt(t Target) bool {
 	if !t.Worm {
 		return false
