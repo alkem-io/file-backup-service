@@ -41,18 +41,22 @@ func (o DrillOutcome) Pass() bool { return o.Checked() > 0 && o.Failed == 0 }
 // so successive weekly drills cover different objects — sample<=0 drills every stored object) and,
 // for each, restores it to scratchDir (reusing RestoreObject, so the drill exercises the exact
 // operator restore path: hash-arbiter decode → SHA3-256 verify → durable write) and then removes
-// the restored file to bound scratch disk. It runs through the shared runBoundedPaced scaffold
-// (concurrency 1) so it inherits the sweep's cancellation propagation + the STREAMING id source
-// (sample=0 doesn't buffer the whole corpus). A per-object panic is contained as one failure; a
-// per-object failure is recorded and the drill continues, surfacing every other problem in the same
-// run. Each object is bounded by perObjectTimeout. Returns the outcome; a non-nil error is an
+// the restored file to bound scratch disk. It runs through the shared runBoundedPaced scaffold at
+// `concurrency` (floored to 1) so it inherits the sweep's cancellation propagation + the STREAMING id
+// source (sample=0 doesn't buffer the whole corpus); because each restored object is removed right after
+// verify, live scratch stays bounded to `concurrency` objects. A per-object panic is contained as one
+// failure; a per-object failure is recorded and the drill continues, surfacing every other problem in
+// the same run. Each object is bounded by perObjectTimeout. Returns the outcome; a non-nil error is an
 // enumeration failure OR a cancellation (an interrupted drill — the caller must not read it green).
-func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir string, sample int, perObjectTimeout time.Duration) (DrillOutcome, error) {
+func Drill(ctx context.Context, led Ledger, src Sink, targetName, scratchDir string, sample, concurrency int, perObjectTimeout time.Duration) (DrillOutcome, error) {
 	perObjectTimeout = NormalizePerObjectTimeout(perObjectTimeout)
+	if concurrency < 1 {
+		concurrency = 1
+	}
 	out := DrillOutcome{Target: targetName}
 	var mu sync.Mutex
 	dispatched := 0 // objects actually handed to a worker (single-threaded enumeration, read after drain)
-	err := runBoundedPaced(ctx, 1, 0,
+	err := runBoundedPaced(ctx, concurrency, 0,
 		func(yield func(string) error) error {
 			return streamSampledStored(ctx, led, targetName, sample, func(h string) error {
 				if yerr := yield(h); yerr != nil {

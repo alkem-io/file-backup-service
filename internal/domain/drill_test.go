@@ -38,7 +38,7 @@ func TestDrillAllPass(t *testing.T) {
 	sink := newMemSink("t")
 	seedDrillCorpus(t, led, sink, 5)
 	scratch := t.TempDir()
-	out, err := Drill(context.Background(), led, sink, "t", scratch, 0, time.Minute)
+	out, err := Drill(context.Background(), led, sink, "t", scratch, 0, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
@@ -52,6 +52,26 @@ func TestDrillAllPass(t *testing.T) {
 	}
 }
 
+// TestDrillConcurrentVerifiesAll (Eff#3): a drill with concurrency>1 still restore-verifies EVERY
+// sampled object and leaves scratch empty (each object removed after verify, so live disk stays bounded
+// to `concurrency`) — the parallelism is a wall-clock win, not a coverage change.
+func TestDrillConcurrentVerifiesAll(t *testing.T) {
+	led := newFakeLedger()
+	sink := newMemSink("t")
+	seedDrillCorpus(t, led, sink, 12)
+	scratch := t.TempDir()
+	out, err := Drill(context.Background(), led, sink, "t", scratch, 0, 4, time.Minute)
+	if err != nil {
+		t.Fatalf("Drill: %v", err)
+	}
+	if out.Checked() != 12 || out.Passed != 12 || !out.Pass() {
+		t.Fatalf("a concurrent drill must verify every object, got %+v", out)
+	}
+	if entries, _ := os.ReadDir(scratch); len(entries) != 0 {
+		t.Fatalf("a concurrent drill must clean up every restored file, %d left", len(entries))
+	}
+}
+
 func TestDrillDetectsCorruptObject(t *testing.T) {
 	led := newFakeLedger()
 	sink := newMemSink("t")
@@ -59,7 +79,7 @@ func TestDrillDetectsCorruptObject(t *testing.T) {
 	// Corrupt one object's stored bytes so it no longer hashes to its key — the exact silent-loss
 	// case a restore drill exists to catch (byte existence alone would pass it).
 	sink.store[hashes[1]] = []byte("tampered — does not hash to the key")
-	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 0, time.Minute)
+	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 0, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
@@ -75,7 +95,7 @@ func TestDrillDetectsCorruptObject(t *testing.T) {
 // or an empty/wrong ledger yields no rows), so it must NOT read as a pass — else a green gauge
 // masks a misconfiguration.
 func TestDrillZeroCheckedIsNotPass(t *testing.T) {
-	out, err := Drill(context.Background(), newFakeLedger(), newMemSink("t"), "t", t.TempDir(), 0, time.Minute)
+	out, err := Drill(context.Background(), newFakeLedger(), newMemSink("t"), "t", t.TempDir(), 0, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
@@ -91,7 +111,7 @@ func TestDrillHonoursSample(t *testing.T) {
 	led := newFakeLedger()
 	sink := newMemSink("t")
 	seedDrillCorpus(t, led, sink, 20)
-	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 5, time.Minute)
+	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 5, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("Drill: %v", err)
 	}
@@ -104,7 +124,7 @@ func TestDrillHonoursSample(t *testing.T) {
 // with that error (it can't prove anything without a work-list).
 func TestDrillSampleLedgerError(t *testing.T) {
 	led := errStoredLedger{newFakeLedger()}
-	if _, err := Drill(context.Background(), led, newMemSink("t"), "t", t.TempDir(), 3, time.Minute); err == nil {
+	if _, err := Drill(context.Background(), led, newMemSink("t"), "t", t.TempDir(), 3, 1, time.Minute); err == nil {
 		t.Fatal("a ledger sampling error must abort the drill")
 	}
 }
@@ -115,7 +135,7 @@ func TestDrillCancelledStops(t *testing.T) {
 	seedDrillCorpus(t, led, sink, 5)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := Drill(ctx, led, sink, "t", t.TempDir(), 0, time.Minute)
+	_, err := Drill(ctx, led, sink, "t", t.TempDir(), 0, 1, time.Minute)
 	if err == nil {
 		t.Fatal("a cancelled drill must return the ctx error, not a clean pass")
 	}
@@ -145,7 +165,7 @@ func TestDrillCancelDuringObjectIsInterruptNotFailure(t *testing.T) {
 	// Copy the seeded object into the cancel-on-fetch sink so restore reads valid bytes but the
 	// ctx is cancelled the moment the fetch begins.
 	sink := &cancelOnFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{hashes[0]: base.store[hashes[0]]}}, cancel: cancel}
-	out, err := Drill(ctx, led, sink, "t", t.TempDir(), 0, time.Minute)
+	out, err := Drill(ctx, led, sink, "t", t.TempDir(), 0, 1, time.Minute)
 	if err == nil {
 		t.Fatal("a cancel during the drilled object must abort with the ctx error")
 	}
@@ -215,7 +235,7 @@ func TestDrillContainsPoisonObject(t *testing.T) {
 	led := newFakeLedger()
 	hashes := seedDrillCorpus(t, led, newMemSink("t"), 1)
 	sink := &panicFetchSink{memSink: memSink{stubSink: stubSink{name: "t"}, store: map[string][]byte{hashes[0]: []byte("x")}}}
-	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 0, time.Minute)
+	out, err := Drill(context.Background(), led, sink, "t", t.TempDir(), 0, 1, time.Minute)
 	if err != nil {
 		t.Fatalf("a contained poison object must not abort the drill, got %v", err)
 	}

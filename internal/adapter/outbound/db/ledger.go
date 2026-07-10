@@ -19,10 +19,21 @@ import (
 // in this repo's migrations for sqlc to type against).
 type LedgerRepo struct {
 	q *queries.Queries
+	readBounded
+}
+
+// readBounded is the shared client-side read-bound state embedded by EVERY DB repo (LedgerRepo,
+// FileRepo, OutboxRepo): the ONE owner of the readTimeout field + its setter, so a future change to how
+// the bound is stored or validated is made once, not triplicated. Each repo keeps a thin typed
+// WithReadTimeout that delegates to setReadTimeout and returns its concrete type for fluent chaining.
+// boundRead reads the promoted readTimeout field.
+type readBounded struct {
 	// readTimeout is the client-side per-read bound (boundRead). 0 → defaultDBReadTimeout; production
 	// sets it to cfg.DBTimeout() (matching the pool's server statement_timeout) via WithReadTimeout.
 	readTimeout time.Duration
 }
+
+func (r *readBounded) setReadTimeout(d time.Duration) { r.readTimeout = d }
 
 // NewLedgerRepo binds a LedgerRepo to the ledger pool. It takes the PgxDB interface (satisfied
 // by *Pool and by pgxmock), which also drives sqlc's queries.New, so the ledger queries are
@@ -32,7 +43,7 @@ func NewLedgerRepo(p PgxDB) *LedgerRepo { return &LedgerRepo{q: queries.New(p)} 
 // WithReadTimeout sets the client-side per-read bound (boundRead) to match the pool's server-side
 // statement_timeout (the operator's cfg.DBTimeout()), so a client bound never fires BEFORE the server
 // would for a slow-but-alive query. Returns the repo for chaining. Unset → defaultDBReadTimeout.
-func (r *LedgerRepo) WithReadTimeout(d time.Duration) *LedgerRepo { r.readTimeout = d; return r }
+func (r *LedgerRepo) WithReadTimeout(d time.Duration) *LedgerRepo { r.setReadTimeout(d); return r }
 
 // statusRow is the per-target status shape marshaled into the jsonb array RecordBackup's
 // jsonb_to_recordset decodes — the json keys MUST match the query's t(target, state, bytes)

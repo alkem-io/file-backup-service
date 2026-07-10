@@ -307,20 +307,24 @@ func buildReadSource(cfg *config.Config, from string) (domain.Sink, string, erro
 	if err != nil {
 		return nil, "", err
 	}
-	if ct.Worm {
-		return wormReadSource{Sink: sink, name: ct.Name}, ct.Name, nil
+	// Wrap ONLY a genuinely WRITE-ONLY worm source (a worm target with NO audit/read credential) in the
+	// credential-hint wrapper: there a read failure IS the PutObject-only-credential case the hint
+	// addresses. A worm target WITH an audit credential is read-capable (readClient uses the audit
+	// cred), so a read failure is transient/real — the "supply a read-capable credential" hint would
+	// MISDIRECT the operator — so it gets the raw sink, like any readable target.
+	if ct.Worm && ct.AuditAccessKey == "" {
+		return wormReadSource{Sink: sink}, ct.Name, nil
 	}
 	return sink, ct.Name, nil
 }
 
-// wormReadSource wraps a WORM (write-only-by-design) target chosen EXPLICITLY as a restore/verify/
-// drill source (Pillar 4b): the read is ATTEMPTED (restoring from the sole surviving immutable copy
-// must not be refused up front), but a Fetch failure — typically a 403 on a PutObject-only worker
-// credential — is annotated with an actionable hint, since reading an immutable copy needs a
-// read-capable admin credential.
+// wormReadSource wraps a WRITE-ONLY worm target (no audit credential) chosen EXPLICITLY as a restore/
+// verify/drill source (Pillar 4b): the read is ATTEMPTED (restoring from the sole surviving immutable
+// copy must not be refused up front), but a read failure — typically a 403 on the PutObject-only worker
+// credential — is annotated with an actionable hint, since reading an immutable copy needs a read-capable
+// credential. It embeds domain.Sink, so the target name is the promoted Sink.Name() (no separate field).
 type wormReadSource struct {
 	domain.Sink
-	name string
 }
 
 // Fetch attempts the read and, on failure, annotates it with the WORM-source recovery hint. The
@@ -340,7 +344,7 @@ func (w wormReadSource) Fetch(ctx context.Context, hash string) (io.ReadCloser, 
 // annotate wraps a WORM-source read failure with the recovery hint (its worker credential is
 // PutObject-only by design; restore from a readable target, or supply a read-capable admin credential).
 func (w wormReadSource) annotate(err error) error {
-	return fmt.Errorf("reading WORM/write-only target %q failed (its worker credential is PutObject-only by design; restore from a readable target, or supply the immutable copy's read-capable admin credential): %w", w.name, err)
+	return fmt.Errorf("reading WORM/write-only target %q failed (its worker credential is PutObject-only by design; restore from a readable target, or supply the immutable copy's read-capable admin credential): %w", w.Name(), err)
 }
 
 // wormErrReader annotates a LATE (read-time) failure from a lazy WORM source with the same recovery hint
@@ -440,25 +444,19 @@ func runRestoreAll(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Print the per-target stored-set sizes so an operator sees cross-target disparity before trusting a
-	// single-`--from` restore (`restore all` restores only what the SOURCE holds; a smaller source misses
-	// objects a fuller target has, which reconcile/backfill would refill). Run it CONCURRENTLY with the
-	// restore rather than as a synchronous gate: it is an exact count(*) aggregate over the WHOLE ledger
-	// (every target's stored set), and blocking a time-critical DR restore on that informational scan is
-	// the wrong priority. The table prints well before the restore finishes in practice; we join it
-	// before the final summary so the output stays ordered (the counts appear "above" the summary, which
-	// restoreAllVerdict's 0-objects message references).
-	countDone := make(chan struct{})
-	go func() {
-		defer close(countDone)
-		printTargetStoredSizes(ctx, ledger, cfg.Targets, name)
-	}()
+	// Print the per-target stored-set sizes FIRST so an operator sees cross-target disparity before
+	// trusting a single-`--from` restore (`restore all` restores only what the SOURCE holds; a smaller
+	// source misses objects a fuller target has, which reconcile/backfill would refill). It is a single
+	// boundRead-bounded count(*) over the LOCAL ledger — fast in practice, capped at cfg.DBTimeout(), and
+	// best-effort (a slow/failed count warns, never blocks the restore) — so it runs synchronously here:
+	// giving the operator the disparity (esp. a 0-object source → likely wrong --from) UPFRONT is worth a
+	// bounded local query before a restore that runs for minutes/hours.
+	printTargetStoredSizes(ctx, ledger, cfg.Targets, name)
 	conc := *concurrency
 	if conc <= 0 {
 		conc = cfg.Concurrency
 	}
 	st, rerr := domain.RestoreAll(ctx, ledger, src, name, *to, conc, cfg.PerObjectTimeout())
-	<-countDone // the count is long-done in practice; join so the table prints before the summary
 	fmt.Printf("restore all (%s -> %s): restored=%d skipped=%d failed=%d cancelled=%d\n", name, *to, st.Restored, st.Skipped, st.Failed, st.Cancelled)
 	return restoreAllVerdict(st, rerr, name)
 }
@@ -896,6 +894,7 @@ func runDrill(args []string) error {
 	cfgPath := registerConfigFlag(fs)
 	from := fs.String("from", "", "source target to drill (default: the first readable target)")
 	sample := fs.Int("sample", 20, "objects to restore-verify (0 = all — a full-store drill)")
+	concurrency := fs.Int("concurrency", 0, "parallel restore-verifies (0 = the configured concurrency); live scratch stays bounded to this many objects")
 	to := fs.String("to", "", "scratch directory for the drill (default: scratchDir, else the OS temp dir)")
 	metricsFile := fs.String("metrics-file", os.Getenv("FBS_DRILL_METRICS_FILE"), "write the drill gauges to this Prometheus textfile (node-exporter textfile-collector)")
 	_ = fs.Parse(args)
@@ -934,7 +933,11 @@ func runDrill(args []string) error {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 
-	outcome, derr := domain.Drill(ctx, ledger, src, name, dir, *sample, cfg.PerObjectTimeout())
+	conc := *concurrency
+	if conc <= 0 {
+		conc = cfg.Concurrency
+	}
+	outcome, derr := domain.Drill(ctx, ledger, src, name, dir, *sample, conc, cfg.PerObjectTimeout())
 	for _, f := range outcome.Failures {
 		fmt.Printf("drill FAIL %s: %v\n", f.Hash, f.Err)
 	}

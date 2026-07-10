@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -27,9 +28,9 @@ type wormStub struct {
 	listErr          int    // non-zero HTTP status to fail the list-objects call
 	listKeys         []string
 	manifest         []byte
-	pointerName      string // if set, GET of _manifest/LATEST returns this (the pointer fast-path)
-	getFail          bool   // fail the object GET (the manifest fetch)
-	bucketGone       bool   // if set, a bucket-level HEAD (BucketExists) returns 404 (gone bucket)
+	pointerName      string      // if set, GET of _manifest/LATEST returns this (the pointer fast-path)
+	getFail          bool        // fail the object GET (the manifest fetch)
+	bucketGone       atomic.Bool // if set, a bucket-level HEAD (BucketExists) returns 404 (gone bucket); atomic so a test can flip it mid-run (a handler goroutine reads it)
 }
 
 // serveList renders the list-objects XML, honoring the bounded StartAfter (exclusive) query param.
@@ -87,7 +88,7 @@ func (s *wormStub) serveHead(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/")
 	parts := strings.SplitN(p, "/", 2)
 	if len(parts) < 2 || parts[1] == "" { // bucket-level HEAD → BucketExists
-		if s.bucketGone {
+		if s.bucketGone.Load() {
 			w.WriteHeader(http.StatusNotFound) // gone bucket → confirmBucket surfaces an error (Unverifiable)
 			return
 		}
@@ -330,6 +331,24 @@ func TestLatestManifestNoneIsNotExist(t *testing.T) {
 	}
 }
 
+// TestLatestManifestUncachedBucketCatchesVanish (Alt#1): the inventory direction must catch a vanished
+// bucket as an ERROR (→ Unverifiable) even after the existence sweep cached the bucket PRESENT — it
+// re-checks the bucket UNCACHED. With the old cached confirmBucket this masked the vanished bucket as
+// os.ErrNotExist → NoData ("no manifest, lost nothing"), diverging from the filesystem sink.
+func TestLatestManifestUncachedBucketCatchesVanish(t *testing.T) {
+	stub := &wormStub{} // bucket present initially
+	sink := newWormSink(t, stub)
+	// Prime confirmBucket's PRESENT cache, exactly as a prior existence sweep on the shared *Sink would.
+	if err := sink.confirmBucket(context.Background()); err != nil {
+		t.Fatalf("prime confirmBucket present: %v", err)
+	}
+	stub.bucketGone.Store(true) // the bucket vanishes AFTER present was cached
+	_, err := sink.LatestManifest(context.Background())
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("LatestManifest must re-check the bucket UNCACHED and surface a vanished bucket as a non-ErrNotExist error (Unverifiable), got %v", err)
+	}
+}
+
 // TestLatestManifestPointerCurrentUsed: the pointer fast-path reads _manifest/LATEST, then a BOUNDED
 // StartAfter=<pointer> list confirms NOTHING newer exists (C1 staleness check), so the pointer's
 // manifest is used (no full scan of the whole prefix).
@@ -366,7 +385,9 @@ func TestLatestManifestListErrorPropagates(t *testing.T) {
 // confirmRoot — even though the (empty) LIST would otherwise resolve name="" → NoData. A vanished
 // target must not read as benign "no manifest yet" (it has NOT lost nothing).
 func TestLatestManifestGoneBucketIsError(t *testing.T) {
-	sink := newWormSink(t, &wormStub{bucketGone: true}) // no listKeys → an empty list would be NoData
+	stub := &wormStub{} // no listKeys → an empty list would be NoData
+	stub.bucketGone.Store(true)
+	sink := newWormSink(t, stub)
 	_, err := sink.LatestManifest(context.Background())
 	if err == nil {
 		t.Fatal("LatestManifest against a gone bucket must return an error (Unverifiable), not (nil, NoData)")

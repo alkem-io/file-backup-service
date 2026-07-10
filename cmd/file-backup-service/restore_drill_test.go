@@ -117,12 +117,35 @@ func TestBuildReadSourceWormAnnotatesFetch(t *testing.T) {
 	}
 }
 
+// TestBuildReadSourceWormWithAuditCredNotWrapped (vanilla8 E1): a worm source that HAS an audit
+// credential is READ-CAPABLE (readClient uses the audit cred), so buildReadSource must NOT wrap it in
+// the write-only credential-hint wrapper — a read failure there is transient/real, and the "supply a
+// read-capable credential" hint would misdirect. Only a write-only (no-audit-cred) worm is wrapped.
+func TestBuildReadSourceWormWithAuditCredNotWrapped(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeConfig(t, dir,
+		"targets:\n  - name: offsite\n    type: s3\n    worm: true\n    insecure: true\n"+
+			"    endpoint: 127.0.0.1:9000\n    bucket: bkt\n    region: us-east-1\n"+
+			"    accessKey: AK\n    secretKey: SK\n    auditAccessKey: AAK\n    auditSecretKey: ASK\n")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	src, name, err := buildReadSource(cfg, "offsite")
+	if err != nil || name != "offsite" {
+		t.Fatalf("an s3 worm --from with an audit cred must build, got %q err=%v", name, err)
+	}
+	if _, wrapped := src.(wormReadSource); wrapped {
+		t.Fatal("a read-capable (audit-cred) worm source must NOT be wrapped in the write-only credential-hint wrapper")
+	}
+}
+
 // TestWormReadSourceAnnotatesLazyReadError (E1): the s3 sink's GetObject is LAZY — its 403 surfaces on
 // the first Read, not from Fetch — so wormReadSource must annotate a READ-TIME failure too, not only an
 // eager Fetch error. A filesystem sink can't exercise this (os.Open fails eagerly), so use a sink whose
 // Fetch succeeds but whose reader errors on Read (the real off-site WORM/s3 shape).
 func TestWormReadSourceAnnotatesLazyReadError(t *testing.T) {
-	w := wormReadSource{Sink: lazyFetchSink{}, name: "offsite"}
+	w := wormReadSource{Sink: lazyFetchSink{name: "offsite"}}
 	rc, err := w.Fetch(context.Background(), sha3hex([]byte("x")))
 	if err != nil {
 		t.Fatalf("Fetch must not error for a lazy sink (the READ does), got %v", err)
@@ -134,9 +157,14 @@ func TestWormReadSourceAnnotatesLazyReadError(t *testing.T) {
 }
 
 // lazyFetchSink models the s3 sink's lazy GetObject: Fetch returns a reader with no error; the (403)
-// failure surfaces on the first Read.
-type lazyFetchSink struct{ domain.Sink }
+// failure surfaces on the first Read. Name() is provided (wormReadSource.annotate reads the promoted
+// Sink.Name()).
+type lazyFetchSink struct {
+	domain.Sink
+	name string
+}
 
+func (s lazyFetchSink) Name() string { return s.name }
 func (lazyFetchSink) Fetch(context.Context, string) (io.ReadCloser, error) {
 	return io.NopCloser(errReader{}), nil
 }

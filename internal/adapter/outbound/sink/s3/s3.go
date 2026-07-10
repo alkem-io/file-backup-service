@@ -181,6 +181,26 @@ func isReadDenied(err error) bool {
 	return resp.StatusCode == http.StatusForbidden || resp.Code == "AccessDenied"
 }
 
+// bucketPresentUncached does a FRESH BucketExists (bypassing confirmBucket's present-cache), returning
+// an error if the bucket is gone OR unreachable. The INVENTORY direction (LatestManifest) uses this, NOT
+// the cached confirmBucket: once the existence sweep (or this call's own first check) has cached the
+// bucket PRESENT, a cached confirmBucket on a later manifest-Stat 404 would mask a bucket that vanished
+// in the list→open window as os.ErrNotExist → NoData ("no manifest, lost nothing"). A fresh probe
+// instead catches the vanished bucket as an ERROR → Unverifiable, matching the filesystem sink's
+// uncached confirmRoot. (The EXISTENCE direction deliberately keeps the cache: there a cached-present-
+// then-gone bucket reads as objects missing → Drift, which pages — the safe direction. So the two
+// directions intentionally use different bucket checks.) Reads via the audit/read credential.
+func (s *Sink) bucketPresentUncached(ctx context.Context) error {
+	ok, err := s.readClient().BucketExists(ctx, s.bucket)
+	if err != nil {
+		return fmt.Errorf("bucket %q existence check: %w", s.bucket, err)
+	}
+	if !ok {
+		return fmt.Errorf("bucket %q does not exist (deleted/renamed/misconfigured?)", s.bucket)
+	}
+	return nil
+}
+
 // confirmBucket verifies the bucket exists, so Exists never mistakes a missing bucket for a missing
 // object. It caches the DEFINITIVE verdict — present OR gone — for the sink's life: caching PRESENT is
 // what collapses a burst of absent-object probes (a silent-loss audit sample) to a SINGLE BucketExists
@@ -370,14 +390,16 @@ func (s *Sink) versioningEnabled(ctx context.Context) bool {
 // filesystem can't diverge. The open closure reads via the audit/read credential and EAGERLY confirms
 // the object (a Stat) so the outcome surfaces NOW: a vanished object → a wrapped os.ErrNotExist (the
 // resolver falls back / the domain maps it to NoData), a 404 that is really a gone/unreachable BUCKET
-// (confirmBucket) → an error (Unverifiable, not a benign "no manifest"), a read-deny → an error
+// (bucketPresentUncached) → an error (Unverifiable, not a benign "no manifest"), a read-deny → an error
 // (Unverifiable) — matching the filesystem sink (sink parity).
 func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 	// Upfront bucket confirmation, symmetric with the filesystem sink's confirmRoot: a gone/unreachable
 	// bucket surfaces as an ERROR (→ Unverifiable) even if a backend were to return an EMPTY non-erroring
 	// LIST for it — otherwise OpenLatestManifest would resolve name="" → NoData, and a vanished target
-	// would wrongly read as "no manifest yet" (lost nothing). Cached, so it's one HEAD per sink lifetime.
-	if err := s.confirmBucket(ctx); err != nil {
+	// would wrongly read as "no manifest yet" (lost nothing). UNCACHED (bucketPresentUncached, not the
+	// existence direction's cached confirmBucket): the cache — populated PRESENT by a prior existence
+	// sweep sharing this *Sink — would otherwise defeat this guard and mask a vanished bucket as NoData.
+	if err := s.bucketPresentUncached(ctx); err != nil {
 		return nil, err
 	}
 	return fsutil.OpenLatestManifest(
@@ -392,9 +414,11 @@ func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 				_ = obj.Close()
 				if isNoSuchKey(serr) {
 					// A 404 on the object HEAD can be a gone OBJECT or a gone BUCKET (NoSuchBucket is also
-					// 404). Distinguish: a confirmed-present bucket → the manifest vanished (os.ErrNotExist,
-					// the resolver tries an older one); a gone/unreachable bucket → an error (Unverifiable).
-					if berr := s.confirmBucket(ctx); berr != nil {
+					// 404). Distinguish with a FRESH (uncached) bucket probe: a present bucket → the manifest
+					// vanished (os.ErrNotExist, the resolver tries an older one); a gone/unreachable bucket →
+					// an error (Unverifiable). Uncached because a cached-present verdict (from the existence
+					// sweep) would mask a bucket that vanished in the list→open TOCTOU.
+					if berr := s.bucketPresentUncached(ctx); berr != nil {
 						return nil, berr
 					}
 					return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)

@@ -25,9 +25,7 @@ import (
 // startup, not mid-backfill).
 type FileRepo struct {
 	p PgxDB
-	// readTimeout is the client-side per-read bound (boundRead). 0 → defaultDBReadTimeout; production
-	// sets it to cfg.DBTimeout() (matching the pool's server statement_timeout) via WithReadTimeout.
-	readTimeout time.Duration
+	readBounded
 }
 
 // NewFileRepo binds a FileRepo to the alkemio pool.
@@ -35,8 +33,8 @@ func NewFileRepo(p PgxDB) *FileRepo { return &FileRepo{p: p} }
 
 // WithReadTimeout sets the client-side per-read bound (boundRead) to match the pool's server-side
 // statement_timeout (the operator's cfg.DBTimeout()). Returns the repo for chaining. Unset →
-// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout.
-func (r *FileRepo) WithReadTimeout(d time.Duration) *FileRepo { r.readTimeout = d; return r }
+// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout / the shared readBounded.
+func (r *FileRepo) WithReadTimeout(d time.Duration) *FileRepo { r.setReadTimeout(d); return r }
 
 // EachFile invokes fn for every non-temporary file (the backfill work-list), ordered by
 // id for a stable, resumable pass. It KEYSET-PAGES the `file` table (id > after ORDER BY
@@ -97,8 +95,8 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 // we conservatively over-refuse (a metadata-only edit that bumped updatedDate) rather than ever risk
 // a silent wrong-version restore. A NULL updatedDate is returned as a ZERO versionTime so the caller
 // FAILS LOUD (directs to a DB PITR + --hash). found=false when no such file row (or a NULL/empty
-// externalID — a not-yet-stored file has no backup key); versionTime is still returned so the caller
-// can distinguish "NULL updatedDate" from "row absent". The `file` table holds only the CURRENT
+// externalID — a not-yet-stored file has no backup key); on found=false versionTime is the zero value
+// (the sole caller, resolveCurrentHash, reads versionTime only on the found path). The `file` table holds only the CURRENT
 // version (no history) — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver: `file` is
 // the foreign, server-owned table; ProbeCurrentVersion covers these columns). Self-bounded (boundRead)
 // so a black-holed alkemio-DB connection can't hang the DR hash resolution.
@@ -115,7 +113,7 @@ func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID strin
 		return "", time.Time{}, false, fmt.Errorf("file by id: %w", serr)
 	}
 	if !ext.Valid || ext.String == "" {
-		return "", nullTime(vt), false, nil // a file with no content hash yet has no backup to restore
+		return "", time.Time{}, false, nil // a file with no content hash yet has no backup to restore
 	}
 	return ext.String, nullTime(vt), true, nil
 }

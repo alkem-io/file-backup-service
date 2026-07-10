@@ -22,11 +22,9 @@ type OutboxRepo struct {
 	p             PgxDB
 	maxAttempts   int // genuine-failure dead-letter threshold
 	maxDeliveries int // crash-loop dead-letter threshold (counted by the reaper)
-	// readTimeout is the client-side per-read bound (boundRead), same as LedgerRepo/FileRepo — so the
-	// outbox READS (Probe, BacklogStats) on the shared Alkemio pool self-bound at the adapter rather than
-	// relying on their callers. 0 → defaultDBReadTimeout; production wires cfg.DBTimeout() via
-	// WithReadTimeout.
-	readTimeout time.Duration
+	// readBounded self-bounds the outbox READS (Probe, BacklogStats) on the shared Alkemio pool at the
+	// adapter (via boundRead) rather than relying on their callers, same as LedgerRepo/FileRepo.
+	readBounded
 }
 
 // NewOutboxRepo binds an OutboxRepo to the alkemio pool with the dead-letter limits. It takes
@@ -37,8 +35,8 @@ func NewOutboxRepo(p PgxDB, maxAttempts, maxDeliveries int) *OutboxRepo {
 
 // WithReadTimeout sets the client-side per-read bound for the outbox READs (Probe, BacklogStats) to the
 // pool's server-side statement_timeout (cfg.DBTimeout()). Returns the repo for chaining. Unset →
-// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout.
-func (r *OutboxRepo) WithReadTimeout(d time.Duration) *OutboxRepo { r.readTimeout = d; return r }
+// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout / the shared readBounded.
+func (r *OutboxRepo) WithReadTimeout(d time.Duration) *OutboxRepo { r.setReadTimeout(d); return r }
 
 const claimSQL = `UPDATE file_backup_outbox
 SET status='in_progress', "claimedAt"=now()

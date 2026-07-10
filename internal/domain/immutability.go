@@ -9,9 +9,11 @@ import (
 
 // immutabilityChecker is an OPTIONAL sink capability (only the s3 sink implements it) for the
 // WORM drift-check (T032/FR-014): report whether the target bucket still enforces object-lock
-// and versioning. It is defined structurally over plain types so the s3 adapter satisfies it
-// WITHOUT importing domain (the sinks stay infrastructure-pure). A read-denying (PutObject-only)
-// credential errors here — that is EXPECTED and surfaces as Unverifiable, never as drift.
+// and versioning. It is defined structurally over plain types (unexported here, so a sink satisfies it
+// by shape, not by naming it) — this keeps DOMAIN from importing the sink packages, the load-bearing
+// hexagonal direction. (The s3 sink does import domain, for the shared ErrReadDenied sentinel — a
+// legitimate adapter→core dependency; the structural interfaces are what keep the reverse edge out.) A
+// read-denying (PutObject-only) credential errors here — EXPECTED, surfaces as Unverifiable, never drift.
 type immutabilityChecker interface {
 	CheckImmutability(ctx context.Context) (objectLock, versioning bool, err error)
 }
@@ -29,8 +31,9 @@ type immutabilityReadable interface {
 // inventoryReader is an OPTIONAL sink capability (s3 + filesystem) for the audit target→ledger
 // direction (T032/FR-025): return the target's most-recent manifest snapshot — its OWN declared
 // inventory — so audit can diff it against the ledger without a full physical object List (which
-// a WORM/PutObject-only target can't do). Structural (plain types) so the adapters don't import
-// domain. A read-denying target's read errors → the target is reported Unverifiable, not failed.
+// a WORM/PutObject-only target can't do). Structural (unexported plain-type interface) so DOMAIN never
+// imports the sink packages (the reverse edge is the one that matters). A read-denying target's read
+// errors → the target is reported Unverifiable, not failed.
 type inventoryReader interface {
 	LatestManifest(ctx context.Context) (io.ReadCloser, error)
 }

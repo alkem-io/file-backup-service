@@ -20,12 +20,15 @@ var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stre
 // Unverifiable — a panic is never benign, even on a WORM target.
 var ErrProbePanic = errors.New("probe panicked")
 
-// ErrReadDenied marks a DEFINITIVE read-permission denial (an S3 403/AccessDenied on a read) that a
-// Sink returns from Exists/Fetch. It is a per-CREDENTIAL property (uniform across every object), NOT a
-// transient/per-object fault — which is what lets the existence audit stop a doomed full sweep of a
-// by-design write-only WORM target early once a whole page uniformly read-denies (see auditTarget),
-// WITHOUT risking the read-capable-WORM silent-loss gap: a 403 is specifically a permission denial, so a
-// transient 5xx/timeout (or a real 404-missing) never carries it and never triggers the early-stop.
+// ErrReadDenied marks a DEFINITIVE read-permission denial (an S3 403/AccessDenied) that the s3 Sink tags
+// on Sink.EXISTS — the only path that surfaces the 403 synchronously and the only current consumer
+// (auditTally). Fetch does NOT tag it: minio's GetObject is lazy, so a Fetch 403 surfaces on the first
+// Read, where the cmd-layer wormReadSource wrapper annotates it instead. ErrReadDenied is a per-CREDENTIAL
+// property (uniform across every object), NOT a transient/per-object fault — which is what lets the
+// existence audit stop a doomed full sweep of a by-design write-only WORM target early once a whole page
+// uniformly read-denies (see auditTarget), WITHOUT risking the read-capable-WORM silent-loss gap: a 403
+// is specifically a permission denial, so a transient 5xx/timeout (or a real 404-missing) never carries
+// it and never triggers the early-stop.
 var ErrReadDenied = errors.New("read denied")
 
 // PanicErr renders a recovered panic as an error — the one owner of the "<what> panicked: <v>"

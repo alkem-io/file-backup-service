@@ -37,6 +37,14 @@ var auditProbeTimeout = 30 * time.Second
 // statement_timeout can't fire when no bytes ever return). It is a per-page bound, never a whole-sweep
 // one, so a large HEALTHY corpus (many fast pages) never false-fails. Callers wrap the error with their
 // own tag (errLedgerRead for audit/inventory, a command-specific message for drill/restore-all).
+//
+// Why auditProbeTimeout and NOT the operator's cfg.DBTimeout() (which db.boundRead uses): a DR sweep
+// bounds EVERY per-operation step at ONE uniform budget — a sink Exists/manifest read AND this ledger
+// page — so the sweep can't stall on any single op. A single index-only keyset page (KeysetPageSize
+// rows on the COLLATE "C" covering index) completing in <30s is a healthy ledger; a page exceeding it
+// is a sick one, which a DR integrity check SHOULD fault on rather than wait out. So this is
+// deliberately the sweep's per-operation bound, not the operator's whole-DB-op budget — raising
+// DBTimeout for a slow-but-alive ledger does not (and should not) loosen the audit's per-page bound.
 func storedPageBounded(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
 	pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
 	defer cancel()
