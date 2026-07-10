@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -75,6 +76,35 @@ func TestReconcileSkipsWhenNoSource(t *testing.T) {
 	}
 	if st.Skipped != 1 || st.Repaired != 0 {
 		t.Fatalf("stats: %+v", st)
+	}
+}
+
+// ctxHangSink's Fetch blocks until its ctx fires, then returns ctx.Err() — models a source read
+// interrupted by a SIGTERM (a cancelled ctx → context.Canceled). Distinct from backup_test.go's
+// ctx-IGNORING hangingSink.
+type ctxHangSink struct{ stubSink }
+
+func (ctxHangSink) Fetch(ctx context.Context, _ string) (io.ReadCloser, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestReconcileCancelledInFlightIsNotFailed (Alt#2): a SIGTERM that cancels an in-flight repair during
+// the final drain window (enumerate already finished, so runBoundedPaced returns nil) must count
+// Cancelled, NOT Failed — otherwise runReconcile exits nonzero on a resumable pass. A per-object DEADLINE
+// (a wedged source, parent still live) still counts Failed. Mirrors backfill/restore-all/drill.
+func TestReconcileCancelledInFlightIsNotFailed(t *testing.T) {
+	led := newFakeLedger()
+	targets := []Target{{Sink: ctxHangSink{stubSink{name: "a"}}, Codec: CodecNone}, {Sink: newMemSink("b"), Codec: CodecNone}}
+	rec := NewReconciler(led, targets, time.Minute, "", 0, nil, 1)
+	p := NewPipeline(nil, led, targets)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the parent SIGTERM
+	var st ReconcileStats
+	var mu sync.Mutex
+	rec.repair(ctx, p, hashOf("x"), map[string]bool{"a": true}, &st, &mu)
+	if st.Cancelled != 1 || st.Failed != 0 {
+		t.Fatalf("a SIGTERM-cancelled in-flight repair must count Cancelled, not Failed: %+v", st)
 	}
 }
 

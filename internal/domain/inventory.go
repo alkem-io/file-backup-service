@@ -33,9 +33,14 @@ var errLedgerRead = errors.New("ledger read")
 var errNonAscendingManifest = errors.New("manifest not byte-ascending (old-format / locale)")
 
 // maxSortedManifestIDs bounds the order-independent fallback's in-memory manifest buffer so a huge
-// non-ascending manifest can't OOM the pod: past it the target is reported Unverifiable rather than
-// buffered. A var (not const) so tests can lower it.
-var maxSortedManifestIDs = 5_000_000
+// non-ascending manifest can't OOM the pod: past it the target is reported Unverifiable (fail-closed)
+// rather than buffered. Sized for a MODEST DR pod: 1M ids × (64-hex + string header ≈ 80B) ≈ 80MB, and
+// append's growth-doubling peaks ~1.5× (~120MB) before the sort — comfortably safe under a ~512MB pod,
+// where the old 5M (~400MB slice, ~600MB peak) could OOM. This path is rare + transitional (only a
+// PRE-COLLATE-migration manifest is non-ascending; the next serve manifest-write rewrites it
+// byte-ascending, so an over-bound target self-heals to a normal verified diff within one manifest
+// cycle). A var (not const) so tests can lower it.
+var maxSortedManifestIDs = 1_000_000
 
 // AuditInventory runs the target→ledger direction for every target, returning one TargetVerdict
 // each: it stream-merges each target's most recent manifest (its self-declared inventory) against

@@ -96,6 +96,20 @@ func TestOnShutdownOK(t *testing.T) {
 	}
 }
 
+// TestResolveConcurrency: --concurrency 0 (or negative) falls back to the configured concurrency; a
+// positive flag wins. The ONE default shared by restore-all and drill.
+func TestResolveConcurrency(t *testing.T) {
+	if got := resolveConcurrency(0, 8); got != 8 {
+		t.Fatalf("--concurrency 0 must use the configured value (8), got %d", got)
+	}
+	if got := resolveConcurrency(-1, 8); got != 8 {
+		t.Fatalf("a negative --concurrency must use the configured value (8), got %d", got)
+	}
+	if got := resolveConcurrency(3, 8); got != 3 {
+		t.Fatalf("a positive --concurrency must win, got %d", got)
+	}
+}
+
 // ---- buildTargets ---------------------------------------------------------
 
 func TestBuildTargets(t *testing.T) {

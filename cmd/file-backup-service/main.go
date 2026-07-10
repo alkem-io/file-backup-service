@@ -406,6 +406,16 @@ func runRestore(args []string) error {
 	return runRestoreObject(args)
 }
 
+// resolveConcurrency picks a DR sweep's parallelism: the operator's --concurrency flag when positive,
+// else the configured Concurrency. The ONE owner of the "0 = the configured concurrency" default, shared
+// by restore-all and drill so they can't diverge on how --concurrency 0 resolves.
+func resolveConcurrency(flag, configured int) int {
+	if flag <= 0 {
+		return configured
+	}
+	return flag
+}
+
 // runRestoreObject restores a single object by hash from one target (`restore [object] --hash
 // --from [--to]`) — the single-object DR path.
 func runRestoreObject(args []string) error {
@@ -452,10 +462,7 @@ func runRestoreAll(args []string) error {
 	// giving the operator the disparity (esp. a 0-object source → likely wrong --from) UPFRONT is worth a
 	// bounded local query before a restore that runs for minutes/hours.
 	printTargetStoredSizes(ctx, ledger, cfg.Targets, name)
-	conc := *concurrency
-	if conc <= 0 {
-		conc = cfg.Concurrency
-	}
+	conc := resolveConcurrency(*concurrency, cfg.Concurrency)
 	st, rerr := domain.RestoreAll(ctx, ledger, src, name, *to, conc, cfg.PerObjectTimeout())
 	fmt.Printf("restore all (%s -> %s): restored=%d skipped=%d failed=%d cancelled=%d\n", name, *to, st.Restored, st.Skipped, st.Failed, st.Cancelled)
 	return restoreAllVerdict(st, rerr, name)
@@ -499,7 +506,7 @@ func restoreAllVerdict(st domain.RestoreAllStats, rerr error, source string) err
 	if st.Failed > 0 {
 		return fmt.Errorf("restore all left %d object(s) unrestored (a source read/verify failed, timed out, or panicked)", st.Failed)
 	}
-	if rerr == nil && st.Restored+st.Skipped+st.Failed+st.Cancelled == 0 {
+	if rerr == nil && st.Restored+st.Skipped+st.Cancelled == 0 { // st.Failed is 0 here (early return above)
 		return fmt.Errorf("restore all: the ledger records 0 objects stored on target %q — nothing to restore (a new/empty target, or the wrong --from among the configured targets; see the per-target stored counts above)", source)
 	}
 	return onShutdownOK(rerr)
@@ -719,7 +726,7 @@ func runReconcile(args []string) error {
 			logger.Warn("reconcile repair failed", zap.String("externalID", id), zap.Error(e))
 		})
 	st, err := rec.Run(ctx, *ratePerSec)
-	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d\n", st.Repaired, st.Skipped, st.Failed)
+	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d cancelled=%d\n", st.Repaired, st.Skipped, st.Failed, st.Cancelled)
 	if err != nil {
 		return err // sweep error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
 	}
@@ -795,7 +802,7 @@ func runBackfill(args []string) error {
 	// invisibly. backfill doesn't need the breaker handle itself (no sampler).
 	pipeline, _ := isolatedPipeline(cfg, fsClient, ledger, targets)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
-	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed)
+	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d cancelled=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed, st.Cancelled)
 	if err != nil {
 		return err // sweep/DB error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
 	}
@@ -933,10 +940,7 @@ func runDrill(args []string) error {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 
-	conc := *concurrency
-	if conc <= 0 {
-		conc = cfg.Concurrency
-	}
+	conc := resolveConcurrency(*concurrency, cfg.Concurrency)
 	outcome, derr := domain.Drill(ctx, ledger, src, name, dir, *sample, conc, cfg.PerObjectTimeout())
 	for _, f := range outcome.Failures {
 		fmt.Printf("drill FAIL %s: %v\n", f.Hash, f.Err)

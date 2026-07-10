@@ -65,13 +65,9 @@ type Sink struct {
 
 // New constructs an S3 Sink.
 func New(cfg Config) (*Sink, error) {
-	client, err := minio.New(cfg.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
-		Secure: cfg.UseSSL,
-		Region: cfg.Region, // explicit: PutObject-only creds can't auto-discover it (SigV4 signs this region)
-	})
+	client, err := newMinioClient(cfg, cfg.AccessKey, cfg.SecretKey, "s3 client")
 	if err != nil {
-		return nil, fmt.Errorf("s3 client %q: %w", cfg.Name, err)
+		return nil, err
 	}
 	// Bound the streaming (size=-1) multipart buffer once. For an unknown length
 	// minio-go defaults to a ~528 MiB part (5 TiB / 10000 parts) and does make([]byte,
@@ -87,17 +83,31 @@ func New(cfg Config) (*Sink, error) {
 	// Build the optional read/audit client (both keys required) — used ONLY for the WORM immutability
 	// drift-check; the worker's own PutObject-only credential can't read GetObjectLockConfig.
 	if cfg.AuditAccessKey != "" && cfg.AuditSecretKey != "" {
-		auditClient, aerr := minio.New(cfg.Endpoint, &minio.Options{
-			Creds:  credentials.NewStaticV4(cfg.AuditAccessKey, cfg.AuditSecretKey, ""),
-			Secure: cfg.UseSSL,
-			Region: cfg.Region,
-		})
+		auditClient, aerr := newMinioClient(cfg, cfg.AuditAccessKey, cfg.AuditSecretKey, "s3 audit client")
 		if aerr != nil {
-			return nil, fmt.Errorf("s3 audit client %q: %w", cfg.Name, aerr)
+			return nil, aerr
 		}
 		sink.auditClient = auditClient
 	}
 	return sink, nil
+}
+
+// newMinioClient builds a minio client for cfg's endpoint with the given credentials — the ONE owner of
+// the client construction (Secure/Region options, error labelling), shared by the worker and the audit
+// credential so any future transport hardening (a custom http.Transport, TLS minimum, BucketLookup)
+// applies to BOTH, never leaving the audit/read (DR-verify) path on different settings. label
+// distinguishes the two in errors. Region is explicit: PutObject-only creds can't auto-discover it
+// (SigV4 signs this region).
+func newMinioClient(cfg Config, access, secret, label string) (*minio.Client, error) {
+	c, err := minio.New(cfg.Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(access, secret, ""),
+		Secure: cfg.UseSSL,
+		Region: cfg.Region,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%s %q: %w", label, cfg.Name, err)
+	}
+	return c, nil
 }
 
 // ImmutabilityReadable reports whether this target has an audit/read credential able to read its
@@ -291,12 +301,12 @@ func (s *Sink) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 // self-healing — therefore a pointer-only write failure must NOT fail the whole PutManifest: the
 // manifest object itself is durably written, and the next successful pass rewrites the pointer.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
-	if _, err := s.putStream(ctx, s.prefixed(fsutil.ManifestKey(name)), r); err != nil {
-		return err
-	}
-	// Best-effort pointer update: swallow a failure (the scan fallback covers correctness).
-	_, _ = s.putStream(ctx, s.prefixed(fsutil.ManifestLatestKey()), strings.NewReader(name))
-	return nil
+	return fsutil.WriteManifestWithPointer(name,
+		func() error { _, err := s.putStream(ctx, s.prefixed(fsutil.ManifestKey(name)), r); return err },
+		func(body io.Reader) error {
+			_, err := s.putStream(ctx, s.prefixed(fsutil.ManifestLatestKey()), body)
+			return err
+		})
 }
 
 // CheckImmutability reports whether the bucket still enforces object-lock AND versioning — the

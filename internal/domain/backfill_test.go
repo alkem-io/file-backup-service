@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -31,6 +32,24 @@ func TestBackfillPerObjectTimeout(t *testing.T) {
 	}
 	if st.Failed != 2 || st.Backed != 0 {
 		t.Fatalf("stats: %+v (want both objects failed via per-object timeout)", st)
+	}
+}
+
+// TestBackfillCancelledInFlightIsNotFailed (Alt#1): a SIGTERM that cancels an in-flight object during
+// the final drain window (enumerate already finished, so runBoundedPaced returns nil) must count
+// Cancelled, NOT Failed — otherwise runBackfill exits nonzero on a fully-successful, resumable pass. A
+// per-object DEADLINE (a wedged source, TestBackfillPerObjectTimeout) still counts Failed, since
+// cancelledInFlight requires the error itself to be context.Canceled.
+func TestBackfillCancelledInFlightIsNotFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the parent (a SIGTERM); hangingSource then returns the per-object ctx's Canceled
+	p := NewPipeline(hangingSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
+	b := NewBackfiller(fakeCorpus{}, p, time.Minute, 1)
+	var st BackfillStats
+	var mu sync.Mutex
+	b.backupOne(ctx, BackupItem{ExternalID: hashOf("x")}, &st, &mu)
+	if st.Cancelled != 1 || st.Failed != 0 {
+		t.Fatalf("a SIGTERM-cancelled in-flight object must count Cancelled, not Failed: %+v", st)
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
@@ -121,13 +120,13 @@ func (s *Sink) Fetch(_ context.Context, hash string) (io.ReadCloser, error) {
 // write failure must NOT fail the whole PutManifest: the manifest object itself is durably written.
 func (s *Sink) PutManifest(ctx context.Context, name string, r io.Reader) error {
 	dest := s.osPath(fsutil.ManifestKey(name))
-	if _, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r); err != nil {
-		return err
-	}
 	ptr := s.osPath(fsutil.ManifestLatestKey())
-	// Best-effort pointer update: swallow a failure (the scan fallback covers correctness).
-	_, _ = writeAtomic(ctx, filepath.Dir(ptr), filepath.Base(ptr), strings.NewReader(name))
-	return nil
+	return fsutil.WriteManifestWithPointer(name,
+		func() error { _, err := writeAtomic(ctx, filepath.Dir(dest), filepath.Base(dest), r); return err },
+		func(body io.Reader) error {
+			_, err := writeAtomic(ctx, filepath.Dir(ptr), filepath.Base(ptr), body)
+			return err
+		})
 }
 
 // LatestManifest opens the newest ledger-snapshot manifest under _manifest/ — the filesystem sink's

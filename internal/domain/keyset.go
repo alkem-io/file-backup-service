@@ -8,8 +8,12 @@ const KeysetPageSize = 1000
 
 // KeysetLoop drives a keyset-paginated sweep: fetch pages via pageFn(after, pageSize) until
 // a SHORT page (the last), invoking fn per item; cursorOf extracts the next `after` from the
-// last item of a full page. It is the ONE owner of the after-cursor + short-page-stops loop,
-// so a hand-rolled copy can't mis-handle a short page and silently stop a sweep early.
+// last item of a full page. It (with its PULL twin keysetPull) owns the after-cursor +
+// short-page-stops loop for every LINEAR sweep, so a linear consumer can't hand-roll a copy that
+// mis-handles a short page and silently stops early. (The SAMPLED audit/drill sweep, keysetSample,
+// necessarily has its own loop — it layers a shrinking per-page sample budget and a single wrap-around
+// on top — but follows the SAME short-page/after-cursor contract; it can't reuse this one because the
+// wrap and variable page limit don't fit the fixed-pageSize linear form.)
 //
 // It lives in domain (a pure generic, no infrastructure deps) so BOTH the db adapters
 // (backfill EachFile, reconcile TargetGaps — keyed on uuid/string) AND the domain manifest

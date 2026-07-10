@@ -110,10 +110,11 @@ type CorpusEnumerator interface {
 
 // BackfillStats summarizes a backfill pass.
 type BackfillStats struct {
-	Backed   int // fully stored on every target after this pass (incl. already-present)
-	Skipped  int // source object gone (deleted before backfill) — benign terminal, not a failure
-	Deferred int // stored on every REACHABLE target; only gap is a circuit-open target (T017a) — not a failure
-	Failed   int // a target genuinely failed, or the pass was cancelled
+	Backed    int // fully stored on every target after this pass (incl. already-present)
+	Skipped   int // source object gone (deleted before backfill) — benign terminal, not a failure
+	Deferred  int // stored on every REACHABLE target; only gap is a circuit-open target (T017a) — not a failure
+	Failed    int // a target GENUINELY failed (not a shutdown) — the pass didn't fully back up this object
+	Cancelled int // in-flight when a SIGTERM landed (a resumable interruption, NOT a failure) — see backupOne
 }
 
 // Backfiller backs up the pre-existing corpus (US2/T022): it enumerates every file and
@@ -196,6 +197,15 @@ func (b *Backfiller) backupOne(ctx context.Context, e BackupItem, st *BackfillSt
 		// consumer's Skip so a corpus with routine deletions doesn't fail the pass (and
 		// doesn't bury genuine target failures in an undifferentiated Failed count).
 		st.Skipped++
+	case cancelledInFlight(ctx, err):
+		// A SIGTERM cancelled THIS object mid-flight. runBoundedPaced's enumerate finishes when the
+		// corpus is exhausted while the last ~concurrency workers are still draining, so a clean
+		// shutdown during that drain window would otherwise land here as a "failure" and — because
+		// enumerate already returned nil — make runBackfill exit NONZERO on a fully-successful,
+		// resumable pass. Count it Cancelled (benign, the re-run backs it up), exactly like restore-all
+		// / drill. A genuine failure that merely COINCIDES with a SIGTERM stays Failed (cancelledInFlight
+		// requires the error itself to be context.Canceled, so a hash-mismatch/DeadlineExceeded doesn't).
+		st.Cancelled++
 	default:
 		st.Failed++
 	}

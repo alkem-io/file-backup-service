@@ -71,8 +71,11 @@ func ShardKey(hash string) string {
 	return hash
 }
 
-// CreateTemp opens a unique "<prefix>.*.partial" temp under dir. The .partial
-// suffix is the marker any orphan sweep / reconcile keys on.
+// CreateTemp opens a unique "<prefix>.*.partial" temp under dir. The .partial suffix marks an
+// IN-PROGRESS write — CommitWrite (and ProbeWritable) remove their own on commit or failure — and keeps
+// a crash-leaked temp distinguishable from a committed content-addressed blob. (There is no cross-run
+// orphan sweep yet; and reconcile's decoded-plaintext staging temp uses a separate ".plain" suffix, so
+// the two temp conventions are deliberately independent, not one shared marker.)
 func CreateTemp(dir, prefix string) (*os.File, string, error) {
 	f, err := os.CreateTemp(dir, prefix+".*.partial")
 	if err != nil {
@@ -83,9 +86,9 @@ func CreateTemp(dir, prefix string) (*os.File, string, error) {
 
 // ProbeWritable verifies dir is writable by creating then removing a throwaway ".partial"
 // temp — the write-probe shared by the filesystem sink's Preflight and the reconcile
-// scratch-dir check, so both use ONE policy and the same sweepable temp naming (a probe that
-// leaks after a crash is caught by the same orphan sweep as any other .partial). dir="" uses
-// the OS temp dir.
+// scratch-dir check, so both use ONE policy and the same temp naming (a probe that leaks after a
+// crash carries the same .partial suffix as any other in-progress write, keeping it identifiable).
+// dir="" uses the OS temp dir.
 func ProbeWritable(dir string) error {
 	f, name, err := CreateTemp(dir, preflightPrefix)
 	if err != nil {
@@ -202,6 +205,22 @@ func FormatManifestName(t time.Time) string {
 func ParseManifestPointer(b []byte) (string, bool) {
 	name := strings.TrimSpace(string(b))
 	return name, name != ""
+}
+
+// WriteManifestWithPointer writes the manifest object (fail-HARD) then BEST-EFFORT updates the
+// `_manifest/LATEST` pointer to `name` — the shared WRITE half of the pointer contract whose READ half
+// is OpenLatestManifest + ParseManifestPointer. Each sink supplies its storage-specific write primitive;
+// the pointer ENCODING (the body is exactly the bare manifest name) and the fail-hard-manifest /
+// swallow-pointer POLICY live here, so the s3 and filesystem sinks can't diverge. A pointer-write
+// failure is deliberately swallowed: OpenLatestManifest's scan fallback resolves the newest manifest
+// without the pointer, so a stale/missing pointer is a self-healing perf hint, NOT a durability gap —
+// which is why it must never fail the durable manifest write.
+func WriteManifestWithPointer(name string, writeManifest func() error, writePointer func(body io.Reader) error) error {
+	if err := writeManifest(); err != nil {
+		return err
+	}
+	_ = writePointer(strings.NewReader(name)) // best-effort; the scan fallback covers correctness
+	return nil
 }
 
 // OpenLatestManifest opens the newest manifest that STILL EXISTS — the SINGLE owner of manifest
