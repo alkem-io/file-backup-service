@@ -23,15 +23,10 @@ func (s immCmdSink) CheckImmutability(context.Context) (bool, bool, error) {
 	return s.lock, s.versioning, s.err
 }
 
-// reduce runs a direction's report through the cmd printAudit reducer and returns the appended
+// reduce runs a direction's report through the cmd printAudit reducer and returns the returned
 // verdict error — the ONE cmd-side reduction every audit direction shares.
 func reduce(rep domain.VerdictReport) error {
-	var verdicts []error
-	printAudit("test", rep, &verdicts)
-	if len(verdicts) != 1 {
-		return nil
-	}
-	return verdicts[0]
+	return printAudit("test", rep)
 }
 
 func TestPrintAuditImmutabilityBranches(t *testing.T) {

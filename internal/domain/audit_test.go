@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 )
@@ -130,6 +132,83 @@ func TestAuditReadableWORMIsProbed(t *testing.T) {
 		t.Fatalf("a read-capable WORM with a LOST object must be Drift+fail (silent loss detected): %+v", v)
 	}
 }
+
+// readDeniedCountingSink models a strictly write-only WORM worker credential: every Exists returns a
+// domain.ErrReadDenied-tagged 403, and it counts the probes so a test can assert the audit STOPPED early
+// instead of doing a doomed HEAD per object across the whole (multi-page) ledger.
+type readDeniedCountingSink struct {
+	stubSink
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *readDeniedCountingSink) Exists(context.Context, string) (bool, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return false, fmt.Errorf("stat: %w (AccessDenied)", ErrReadDenied)
+}
+func (*readDeniedCountingSink) ImmutabilityReadable() bool { return false }
+
+// seedStored records n stored objects on target, returning their ids in the ledger's (byte-sorted)
+// page order so a test can pin which id lands on the LAST page.
+func seedStored(led *fakeLedger, target string, n int, label string) []string {
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		ids[i] = hashOf(fmt.Sprintf("%s-%06d", label, i))
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: ids[i]},
+			[]TargetStatus{{Target: target, State: StateStored}})
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// TestAuditWriteOnlyWORMEarlyStops (Eff1): a by-design write-only WORM target whose worker credential
+// uniformly read-denies (403) is Unverifiable-exempt (benign), and the audit STOPS after the first
+// all-read-denied page — NOT one doomed HEAD per object across the whole multi-page ledger.
+func TestAuditWriteOnlyWORMEarlyStops(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	seedStored(led, "w", KeysetPageSize+500, "wo") // > one page → a full sweep would probe every object
+	sink := &readDeniedCountingSink{stubSink: stubSink{name: "w"}}
+
+	v := Audit(ctx, led, []Target{{Sink: sink, Worm: true}}, 0).Targets[0]
+	if v.Status != StatusUnverifiable || v.Failed() {
+		t.Fatalf("a write-only WORM target must be Unverifiable but EXEMPT (benign): %+v", v)
+	}
+	if sink.calls == 0 {
+		t.Fatal("audit must probe at least one page before concluding write-only")
+	}
+	if sink.calls > KeysetPageSize {
+		t.Fatalf("audit must STOP after the first all-read-denied page (~%d probes), did %d (no early-stop)", KeysetPageSize, sink.calls)
+	}
+}
+
+// TestAuditReadCapableWORMNotEarlyStopped (Eff1 must not regress B): the read-deny early-stop must fire
+// ONLY on a uniform read-denial — a READ-CAPABLE WORM (worker cred reads) with a silently-lost object on
+// the LAST page is still fully swept and caught as Drift, because a successful read makes readDenied !=
+// checked and disables the early-stop.
+func TestAuditReadCapableWORMNotEarlyStopped(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	ids := seedStored(led, "w", KeysetPageSize+5, "rc")
+	lost := ids[len(ids)-1] // sorts LAST → only a complete multi-page sweep reaches it
+
+	v := Audit(ctx, led, []Target{{Sink: presentExceptSink{stubSink{name: "w"}, lost}, Worm: true}}, 0).Targets[0]
+	if v.Status != StatusDrift || v.Missing != 1 || !v.Failed() {
+		t.Fatalf("a read-capable WORM's silent loss on the LAST page must be Drift+fail (no early-stop): %+v", v)
+	}
+}
+
+// presentExceptSink reports every object present except `lost` (which reads as a clean absence). Models
+// a read-capable WORM worker credential with one silently-lost object.
+type presentExceptSink struct {
+	stubSink
+	lost string
+}
+
+func (s presentExceptSink) Exists(_ context.Context, h string) (bool, error) { return h != s.lost, nil }
+func (presentExceptSink) ImmutabilityReadable() bool                         { return false }
 
 // TestAuditCancelledIsBenignAtDomain: a cancelled parent yields a benign NoData verdict at the domain
 // level (FailErr nil) — the top-level ctx.Err() fold in runAudit surfaces the abort, so the domain

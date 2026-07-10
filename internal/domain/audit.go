@@ -14,6 +14,11 @@ import (
 // network RTT — e.g. an S3 StatObject HEAD — so a serial sweep is RTT-bound).
 const auditConcurrency = 16
 
+// errAuditReadDenied is auditTarget's INTERNAL early-stop signal (never surfaced): a by-design
+// write-only WORM copy whose whole probed set uniformly read-denied (ErrReadDenied) — the sweep stops
+// and classifies the tally normally (→ Unverifiable, exempt→benign). Not a fault.
+var errAuditReadDenied = errors.New("audit: target uniformly read-denied (write-only WORM early-stop)")
+
 // auditProbeTimeout bounds one per-target operation — a single Exists probe, one immutability config
 // read, a manifest fetch, or a single manifest-read / ledger-page in the inventory diff — so a
 // black-holing backend can't stall the integrity check (the DR ops run under a deadline-less signal
@@ -108,11 +113,11 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 	// short-circuiting it to NoData silently disabled its DR verification. So: probe every target. A
 	// genuinely write-only WORM copy (PutObject-only creds) instead read-denies on each StatObject →
 	// errored++ → Unverifiable, which targetUnverifiableExempt (worm && no audit cred) then makes benign.
-	// The cost is a doomed HEAD per object on a full audit of a strictly-write-only target — the honest
-	// price of not silently skipping a verifiable one (correctness over the doomed-read optimization).
-	var checked, missing, errored int
-	var panicErr error
+	// A doomed HEAD per object on a full audit of a strictly-write-only target is avoided by the
+	// read-deny early-stop (auditTally.allReadDenied — not by skipping the target a-priori, the old bug).
+	var tally auditTally
 	name := t.Sink.Name()
+	exempt := targetUnverifiableExempt(t)
 	err := keysetSample(ctx, samplePerTarget, startAfter,
 		func(after string, limit int) ([]string, error) {
 			page, perr := storedPageBounded(ctx, led, name, after, limit)
@@ -128,34 +133,74 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
 			}
-			for _, e := range results {
-				checked++
-				switch {
-				case e.err != nil:
-					errored++
-					if errors.Is(e.err, ErrProbePanic) { // a driver panic is a code bug, not a benign read error
-						panicErr = e.err
-					}
-				case !e.present:
-					missing++
-				}
+			tally.add(results)
+			// Early-stop the doomed full sweep of a by-design write-only WORM copy: once EVERY probe so
+			// far uniformly read-denied, the credential demonstrably can't read ANY object, so the
+			// remaining objects are guaranteed to 403 to the SAME Unverifiable-exempt (benign) verdict.
+			// allReadDenied turns permanently false the instant any probe returns present / a clean
+			// 404-missing / a transient (non-403) error / a panic, so a READ-CAPABLE WORM (the silent-loss
+			// case the round-6 fix restored) is NEVER short-circuited — it full-sweeps and still catches
+			// missing objects. Gated on `exempt` so a non-worm target (whose Unverifiable FAILS) is fully swept.
+			if exempt && tally.allReadDenied() {
+				return errAuditReadDenied
 			}
 			return nil
 		})
-	if err != nil {
+	stoppedEarly := errors.Is(err, errAuditReadDenied)
+	if err != nil && !stoppedEarly {
 		return classifyAuditErr(ctx, name, err)
 	}
-	if panicErr != nil { // a recovered probe panic → Fault (fail-loud), not swallowed to Unverifiable
-		return TargetVerdict{Status: StatusFault, Checked: checked, Err: fmt.Errorf("audit probe %s: %w", name, panicErr), Detail: "probe panicked"}
+	return tally.verdict(name, stoppedEarly)
+}
+
+// auditTally accumulates one target's existence-probe outcomes across the swept pages, then classifies
+// them into a verdict — extracted from auditTarget so the loop + verdict switch don't inflate its
+// cyclomatic complexity, and so the early-stop signal (allReadDenied) has one clear owner.
+type auditTally struct {
+	checked, missing, errored, readDenied int
+	panicErr                              error
+}
+
+func (a *auditTally) add(results []existsResult) {
+	for _, e := range results {
+		a.checked++
+		switch {
+		case e.err != nil:
+			a.errored++
+			if errors.Is(e.err, ErrReadDenied) { // a definitive 403 (write-only credential)
+				a.readDenied++
+			}
+			if errors.Is(e.err, ErrProbePanic) { // a driver panic is a code bug, not a benign read error
+				a.panicErr = e.err
+			}
+		case !e.present:
+			a.missing++
+		}
 	}
-	detail := fmt.Sprintf("checked=%d missing=%d errors=%d", checked, missing, errored)
+}
+
+// allReadDenied reports whether EVERY probe so far uniformly read-denied (a definitively write-only
+// credential) — the write-only-WORM early-stop signal.
+func (a *auditTally) allReadDenied() bool { return a.checked > 0 && a.readDenied == a.checked }
+
+// verdict classifies the accumulated tally: a recovered panic → Fault (fail-loud on a code bug); a
+// missing object → Drift (silent loss); any other errored probe → Unverifiable (a WORM read-deny or a
+// broken read path); else Verified. stoppedEarly annotates the detail (a partial sweep of a write-only WORM).
+func (a *auditTally) verdict(name string, stoppedEarly bool) TargetVerdict {
+	if a.panicErr != nil {
+		return TargetVerdict{Status: StatusFault, Checked: a.checked, Err: fmt.Errorf("audit probe %s: %w", name, a.panicErr), Detail: "probe panicked"}
+	}
+	detail := fmt.Sprintf("checked=%d missing=%d errors=%d", a.checked, a.missing, a.errored)
+	if stoppedEarly {
+		detail += " (write-only WORM: stopped after a uniform read-deny page)"
+	}
 	switch {
-	case missing > 0: // ledger-stored but absent on the sink — silent loss
-		return TargetVerdict{Status: StatusDrift, Checked: checked, Missing: missing, Detail: detail}
-	case errored > 0: // couldn't determine presence for part/all of the sample — a WORM read-deny, or a broken read path
-		return TargetVerdict{Status: StatusUnverifiable, Checked: checked, Detail: detail}
+	case a.missing > 0: // ledger-stored but absent on the sink — silent loss
+		return TargetVerdict{Status: StatusDrift, Checked: a.checked, Missing: a.missing, Detail: detail}
+	case a.errored > 0: // couldn't determine presence for part/all of the sample — a WORM read-deny, or a broken read path
+		return TargetVerdict{Status: StatusUnverifiable, Checked: a.checked, Detail: detail}
 	default: // every probed object present (or nothing recorded stored) — clean
-		return TargetVerdict{Status: StatusVerified, Checked: checked, Detail: detail}
+		return TargetVerdict{Status: StatusVerified, Checked: a.checked, Detail: detail}
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 
+	"github.com/alkem-io/file-backup-service/internal/domain"
 	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
@@ -149,14 +150,35 @@ func (s *Sink) Exists(ctx context.Context, hash string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	resp := minio.ToErrorResponse(err)
-	if resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+	if isNoSuchKey(err) {
 		if berr := s.confirmBucket(ctx); berr != nil {
 			return false, berr // the "object" 404 is really a gone/unreachable bucket
 		}
 		return false, nil // bucket present → the object is genuinely absent
 	}
+	if isReadDenied(err) {
+		// A DEFINITIVE read-permission denial (a PutObject-only WORM credential). Tag it so the audit
+		// can early-stop a doomed full sweep of a write-only WORM target once a whole page uniformly
+		// read-denies — see domain.ErrReadDenied.
+		return false, fmt.Errorf("stat %s: %w: %w", s.key(hash), domain.ErrReadDenied, err)
+	}
 	return false, fmt.Errorf("stat %s: %w", s.key(hash), err)
+}
+
+// isNoSuchKey reports whether err is a missing-OBJECT answer (HTTP 404 / NoSuchKey) — the ONE owner of
+// that test, shared by Exists and the LatestManifest open closure so the two never disagree on "gone
+// object vs gone bucket" (each pairs it with a confirmBucket to make that distinction). A bare 404 can
+// also be a gone/renamed BUCKET, so callers confirm the bucket before treating it as a genuine absence.
+func isNoSuchKey(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey"
+}
+
+// isReadDenied reports whether err is a DEFINITIVE 403/AccessDenied read denial (a PutObject-only
+// credential), as opposed to a 404, a transient 5xx/timeout, or a network fault.
+func isReadDenied(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.StatusCode == http.StatusForbidden || resp.Code == "AccessDenied"
 }
 
 // confirmBucket verifies the bucket exists, so Exists never mistakes a missing bucket for a missing
@@ -368,7 +390,7 @@ func (s *Sink) LatestManifest(ctx context.Context) (io.ReadCloser, error) {
 			}
 			if _, serr := obj.Stat(); serr != nil {
 				_ = obj.Close()
-				if resp := minio.ToErrorResponse(serr); resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey" {
+				if isNoSuchKey(serr) {
 					// A 404 on the object HEAD can be a gone OBJECT or a gone BUCKET (NoSuchBucket is also
 					// 404). Distinguish: a confirmed-present bucket → the manifest vanished (os.ErrNotExist,
 					// the resolver tries an older one); a gone/unreachable bucket → an error (Unverifiable).
@@ -397,8 +419,7 @@ func (s *Sink) readManifestPointer(ctx context.Context) (string, bool) {
 	if err != nil {
 		return "", false // includes a lazy 404/403 surfacing here → fall back to the scan
 	}
-	name := strings.TrimSpace(string(b))
-	return name, name != ""
+	return fsutil.ParseManifestPointer(b) // shared encoding — the s3 + filesystem sinks can't diverge
 }
 
 // listManifestNamesAfter lists the _manifest/ prefix for object base names STRICTLY AFTER `after`

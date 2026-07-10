@@ -457,7 +457,7 @@ func TestRunRestoreMissingFlags(t *testing.T) {
 }
 
 // ---- config-validation error paths of the DB subcommands ------------------
-// Each of these fails on Validate/ValidateDR BEFORE any pool is opened (verified by reading
+// Each of these fails on Validate/ValidateDRLimits BEFORE any pool is opened (verified by reading
 // main.go's order-of-operations), so no DB is contacted.
 
 // invalidCfg writes a valid-YAML but incomplete config (no fileServiceBase, no DB host).

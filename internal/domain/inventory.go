@@ -59,6 +59,22 @@ func AuditInventory(ctx context.Context, led Ledger, targets []Target) VerdictRe
 	})}
 }
 
+// openManifestReader opens the target's latest manifest via readClient(), bounding the fetch at
+// auditProbeTimeout and wrapping the result in a stallReader — the ONE owner of the fd-race-safe
+// abandon/close prelude shared by the streaming and sorted-fallback diffs (so a change to the fetch
+// timeout, the abandon/close contract, or the fetch-error classification can't drift between them).
+// The stallReader OWNS closing rc: on an abandoned (wedged) read it closes rc only AFTER the read
+// goroutine finishes, so the caller's deferred Close can't race an in-flight Read. On a fetch error it
+// returns a classified verdict (sr==nil); the caller returns *verdict directly.
+func openManifestReader(ctx context.Context, ir inventoryReader, name string) (*stallReader, *TargetVerdict) {
+	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
+	if err != nil {
+		v := classifyInventoryErr(ctx, name, err)
+		return nil, &v
+	}
+	return &stallReader{ctx: ctx, rc: rc, timeout: auditProbeTimeout}, nil
+}
+
 // inventoryProbe is one target's target→ledger closure. It runs on the parent probe ctx (probeTargets
 // imposes no whole-probe deadline for this direction) and bounds each blocking sub-operation itself.
 func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
@@ -73,13 +89,10 @@ func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
 	// copy instead read-denies → Unverifiable, which targetUnverifiableExempt (worm && no audit cred)
 	// makes benign — same policy as the existence direction.
 	name := t.Sink.Name()
-	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
-	if err != nil {
-		return classifyInventoryErr(ctx, name, err)
+	sr, verr := openManifestReader(ctx, ir, name)
+	if verr != nil {
+		return *verr
 	}
-	// The stallReader OWNS closing rc: on an abandoned (wedged) read it closes rc only AFTER the read
-	// goroutine finishes, so a deferred Close here can't race an in-flight Read (an fd race).
-	sr := &stallReader{ctx: ctx, rc: rc, timeout: auditProbeTimeout}
 	defer func() { _ = sr.Close() }()
 
 	extra, missing, msize, merr := mergeInventory(manifestIterator(sr), ledgerStoredPull(ctx, led, name))
@@ -121,11 +134,10 @@ func mergeToVerdict(ctx context.Context, name string, extra, missing, msize int,
 // only on the rare fallback path (new manifests are ascending and never reach here). A manifest too
 // large to buffer safely → Unverifiable (can't diff it order-independently without risking an OOM).
 func inventorySortedDiff(ctx context.Context, ir inventoryReader, led Ledger, name string) TargetVerdict {
-	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
-	if err != nil {
-		return classifyInventoryErr(ctx, name, err)
+	sr, verr := openManifestReader(ctx, ir, name)
+	if verr != nil {
+		return *verr
 	}
-	sr := &stallReader{ctx: ctx, rc: rc, timeout: auditProbeTimeout}
 	defer func() { _ = sr.Close() }()
 
 	ids, cerr := collectManifestIDs(sr, maxSortedManifestIDs)
@@ -260,8 +272,8 @@ func manifestIterator(r io.Reader) func() (string, bool, error) { return manifes
 func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	prev := ""
-	first := true
+	prev := "" // "" iff no id yet yielded — every yielded id is non-empty (guarded below), so this
+	// doubles as the "first line" flag: strict monotonicity is only enforced once prev is set.
 	return func() (string, bool, error) {
 		for sc.Scan() {
 			line := sc.Bytes()
@@ -281,12 +293,12 @@ func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 			if ml.ExternalID == "" {
 				continue
 			}
-			if strict && !first && ml.ExternalID <= prev {
+			if strict && prev != "" && ml.ExternalID <= prev {
 				// NOT corruption: an old-format / locale-collated manifest can be non-ascending in byte
 				// order → signal the caller to retry with an order-independent (sorted) diff.
 				return "", false, fmt.Errorf("%w (%q after %q)", errNonAscendingManifest, ml.ExternalID, prev)
 			}
-			prev, first = ml.ExternalID, false
+			prev = ml.ExternalID
 			return ml.ExternalID, true, nil
 		}
 		if serr := sc.Err(); serr != nil {

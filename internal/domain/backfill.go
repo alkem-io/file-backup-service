@@ -138,12 +138,13 @@ func NewBackfiller(corpus CorpusEnumerator, p *Pipeline, perObjectTimeout time.D
 	return &Backfiller{corpus: corpus, p: p, perObjectT: NormalizePerObjectTimeout(perObjectTimeout), concurrency: concurrency}
 }
 
-// defaultPerObjectTimeout is the fallback the sweep constructors floor a non-positive
-// perObjectTimeout to — matches config's applyDefaults default, so a direct (test/future)
-// caller that skips config validation still gets a sane bound instead of an all-fail pass.
-const defaultPerObjectTimeout = 30 * time.Minute
+// DefaultPerObjectTimeout is the fallback the sweep constructors floor a non-positive perObjectTimeout
+// to, so a caller that skips config validation still gets a sane bound instead of an all-fail pass. It
+// is the ONE source of the 30-min default: config's applyDefaults DERIVES its PerObjectTimeoutSec
+// default from it (config imports domain), so the serve-path default and this DR-path floor can't drift.
+const DefaultPerObjectTimeout = 30 * time.Minute
 
-// NormalizePerObjectTimeout floors a non-positive per-object timeout to defaultPerObjectTimeout so
+// NormalizePerObjectTimeout floors a non-positive per-object timeout to DefaultPerObjectTimeout so
 // context.WithTimeout never yields an already-expired (or, via a config overflow that degraded to 0,
 // near-instant) deadline that would fail every object. The ONE owner of that floor, shared by the
 // batch sweeps (NewBackfiller / NewReconciler), the DR sweeps (Drill / RestoreAll), and the CLI's
@@ -151,7 +152,7 @@ const defaultPerObjectTimeout = 30 * time.Minute
 // bound.
 func NormalizePerObjectTimeout(d time.Duration) time.Duration {
 	if d <= 0 {
-		return defaultPerObjectTimeout
+		return DefaultPerObjectTimeout
 	}
 	return d
 }

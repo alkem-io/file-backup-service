@@ -20,6 +20,14 @@ var errAbortedBeforeEOF = errors.New("sink closed before consuming the full stre
 // Unverifiable — a panic is never benign, even on a WORM target.
 var ErrProbePanic = errors.New("probe panicked")
 
+// ErrReadDenied marks a DEFINITIVE read-permission denial (an S3 403/AccessDenied on a read) that a
+// Sink returns from Exists/Fetch. It is a per-CREDENTIAL property (uniform across every object), NOT a
+// transient/per-object fault — which is what lets the existence audit stop a doomed full sweep of a
+// by-design write-only WORM target early once a whole page uniformly read-denies (see auditTarget),
+// WITHOUT risking the read-capable-WORM silent-loss gap: a 403 is specifically a permission denial, so a
+// transient 5xx/timeout (or a real 404-missing) never carries it and never triggers the early-stop.
+var ErrReadDenied = errors.New("read denied")
+
 // PanicErr renders a recovered panic as an error — the one owner of the "<what> panicked: <v>"
 // convention, shared by the pipeline's per-target recover guards (each on a different goroutine, so
 // they can't share a defer) and the CLI's startup-check guard. It wraps ErrProbePanic so the audit

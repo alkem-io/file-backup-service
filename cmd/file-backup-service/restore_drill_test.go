@@ -117,6 +117,34 @@ func TestBuildReadSourceWormAnnotatesFetch(t *testing.T) {
 	}
 }
 
+// TestWormReadSourceAnnotatesLazyReadError (E1): the s3 sink's GetObject is LAZY — its 403 surfaces on
+// the first Read, not from Fetch — so wormReadSource must annotate a READ-TIME failure too, not only an
+// eager Fetch error. A filesystem sink can't exercise this (os.Open fails eagerly), so use a sink whose
+// Fetch succeeds but whose reader errors on Read (the real off-site WORM/s3 shape).
+func TestWormReadSourceAnnotatesLazyReadError(t *testing.T) {
+	w := wormReadSource{Sink: lazyFetchSink{}, name: "offsite"}
+	rc, err := w.Fetch(context.Background(), sha3hex([]byte("x")))
+	if err != nil {
+		t.Fatalf("Fetch must not error for a lazy sink (the READ does), got %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	if _, rerr := io.ReadAll(rc); rerr == nil || !strings.Contains(rerr.Error(), "WORM/write-only") {
+		t.Fatalf("a lazy (read-time) WORM read failure must carry the recovery hint, got %v", rerr)
+	}
+}
+
+// lazyFetchSink models the s3 sink's lazy GetObject: Fetch returns a reader with no error; the (403)
+// failure surfaces on the first Read.
+type lazyFetchSink struct{ domain.Sink }
+
+func (lazyFetchSink) Fetch(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(errReader{}), nil
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("AccessDenied") }
+
 // ---- restore sub-verb dispatch (no DB) ------------------------------------
 
 // TestRunRestoreObjectSubverb: `restore object --hash …` routes to the single-object path (the
@@ -241,7 +269,7 @@ func TestRunRestoreVersionHashDefaultsToFirstTarget(t *testing.T) {
 }
 
 // ---- config-error paths of the ledger-backed restore/drill subcommands ----
-// Each fails on ValidateDR (fsConfig has no ledgerDB) BEFORE opening a pool.
+// Each fails on ValidateDRLimits (fsConfig has no ledgerDB) BEFORE opening a pool.
 
 // TestDrillReportInterruptedPreservesTextfile (re-review item 4): an INTERRUPTED drill (derr is a
 // ctx cancellation) must write NO gauges — it must not clobber the prior textfile's pass=1 with a red
@@ -301,7 +329,7 @@ func TestRunRestoreUnknownSubcommand(t *testing.T) {
 }
 
 func TestRunRestoreAllInvalidConfig(t *testing.T) {
-	// fsConfig has a target but no ledgerDB → ledgerJob's ValidateDR fails before any pool opens.
+	// fsConfig has a target but no ledgerDB → ledgerJob's ValidateDRLimits fails before any pool opens.
 	if err := runRestoreAll([]string{"--config", fsConfig(t, t.TempDir())}); err == nil ||
 		!strings.Contains(err.Error(), "invalid config") {
 		t.Fatalf("restore all without a ledgerDB must fail with an invalid-config error, got %v", err)

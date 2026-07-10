@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/alkem-io/file-backup-service/internal/fsutil"
 )
 
 // manifestLine is one JSONL record of a target's ledger snapshot (FR-015) — enough to
@@ -25,9 +27,10 @@ type manifestLine struct {
 // overlapping a manual drill, or two serve instances) get DISTINCT keys and DR tooling picks
 // the newest. An immutable/WORM target rejects a PutObject that would overwrite a retained
 // object, so a colliding key would fail the second run's write; two independent time.Now()
-// reads never share a nanosecond.
+// reads never share a nanosecond. The fixed-width layout+suffix are owned by fsutil (shared
+// with the IsTimestampedManifest parser), so the write and read sides can't drift.
 func ManifestName(t time.Time) string {
-	return t.UTC().Format("2006-01-02T150405.000000000Z") + ".jsonl"
+	return fsutil.FormatManifestName(t)
 }
 
 // WriteManifests writes each target's OWN inventory as a JSONL snapshot to its

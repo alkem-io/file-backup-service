@@ -184,6 +184,26 @@ func IsTimestampedManifest(base string) bool {
 	return err == nil
 }
 
+// FormatManifestName is the object BASE name for a snapshot taken at t: <UTC-nanosecond-timestamp>.jsonl.
+// It is the WRITE side of the manifest naming contract whose READ side is IsTimestampedManifest — both
+// live here so the fixed-width layout + suffix have ONE owner and can't drift. (A format change here not
+// mirrored in the parser would make IsTimestampedManifest silently reject EVERY newly-written manifest →
+// OpenLatestManifest drops them all → the inventory drift-check goes blind on green health.)
+// domain.ManifestName delegates here.
+func FormatManifestName(t time.Time) string {
+	return t.UTC().Format(manifestTimeLayout) + manifestSuffix
+}
+
+// ParseManifestPointer parses the raw bytes of the `_manifest/LATEST` pointer into a manifest base name,
+// returning ok=false when the pointer is empty/whitespace-only. The ONE owner of the pointer's on-disk/
+// on-object encoding, shared by the s3 and filesystem sinks' readManifestPointer (only the byte READ —
+// GetObject vs os.ReadFile — is storage-specific), so the two sinks can't diverge on which pointer
+// values are valid. The returned name is VALIDATED (as a timestamped manifest) by OpenLatestManifest.
+func ParseManifestPointer(b []byte) (string, bool) {
+	name := strings.TrimSpace(string(b))
+	return name, name != ""
+}
+
 // OpenLatestManifest opens the newest manifest that STILL EXISTS — the SINGLE owner of manifest
 // selection, so the s3 and filesystem sinks provide only primitive reads (readPointer/listFrom/open)
 // and can't diverge on which object is "newest". readPointer returns the `_manifest/LATEST` hint

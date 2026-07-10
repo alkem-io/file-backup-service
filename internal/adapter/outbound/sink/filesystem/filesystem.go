@@ -147,17 +147,26 @@ func (s *Sink) LatestManifest(_ context.Context) (io.ReadCloser, error) {
 	if err := s.confirmRoot(); err != nil {
 		return nil, err
 	}
-	return fsutil.OpenLatestManifest(s.readManifestPointer, s.listManifestNamesAfter,
-		func(name string) (io.ReadCloser, error) {
-			f, err := os.Open(s.osPath(fsutil.ManifestKey(name))) //nolint:gosec // name is a manifest base name under the configured root, not caller-supplied
-			if err != nil {
-				if os.IsNotExist(err) { // named by the pointer/scan but vanished — the resolver tries an older one
-					return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)
-				}
-				return nil, fmt.Errorf("open manifest %s: %w", name, err)
+	return fsutil.OpenLatestManifest(s.readManifestPointer, s.listManifestNamesAfter, s.openManifestFile)
+}
+
+// openManifestFile opens one resolved manifest by base name. On ENOENT it distinguishes a vanished
+// MANIFEST (the resolver tries an older one → benign os.ErrNotExist) from a vanished ROOT — a mount that
+// detached AFTER listManifestNamesAfter returned but before this open (a TOCTOU). Mirrors the s3 sink's
+// confirmBucket-on-404: a gone root → an ERROR (Unverifiable), never a benign "no manifest yet" that
+// would mask a silent-loss on a vanished target.
+func (s *Sink) openManifestFile(name string) (io.ReadCloser, error) {
+	f, err := os.Open(s.osPath(fsutil.ManifestKey(name))) //nolint:gosec // name is a manifest base name under the configured root, not caller-supplied
+	if err != nil {
+		if os.IsNotExist(err) {
+			if rerr := s.confirmRoot(); rerr != nil {
+				return nil, rerr
 			}
-			return f, nil
-		})
+			return nil, fmt.Errorf("manifest %s vanished: %w", name, os.ErrNotExist)
+		}
+		return nil, fmt.Errorf("open manifest %s: %w", name, err)
+	}
+	return f, nil
 }
 
 // confirmRoot verifies the sink root still exists and is a directory — the filesystem analogue of
@@ -186,8 +195,7 @@ func (s *Sink) readManifestPointer() (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	name := strings.TrimSpace(string(b))
-	return name, name != ""
+	return fsutil.ParseManifestPointer(b) // shared encoding — the s3 + filesystem sinks can't diverge
 }
 
 // listManifestNamesAfter returns every non-dir base name under _manifest/ STRICTLY AFTER `after` (so

@@ -343,8 +343,10 @@ func (c *Config) applyDefaults() {
 	// per-field branch so this stays a flat list (one edit to add a knob, no cyclo creep).
 	c.Concurrency = orDefault(c.Concurrency, 8)
 	c.MetricsPort = orDefault(c.MetricsPort, 4004)
-	c.PerObjectTimeoutSec = orDefault(c.PerObjectTimeoutSec, 1800) // 30 min — must exceed the slowest legit backup
-	c.StaleTTLSec = orDefault(c.StaleTTLSec, 3600)                 // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
+	// Derive the default from the domain floor (DefaultPerObjectTimeout) so the serve-path default and
+	// the DR-path floor share ONE source and can't drift — 30 min, must exceed the slowest legit backup.
+	c.PerObjectTimeoutSec = orDefault(c.PerObjectTimeoutSec, int(domain.DefaultPerObjectTimeout/time.Second))
+	c.StaleTTLSec = orDefault(c.StaleTTLSec, 3600) // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
 	c.PollEverySec = orDefault(c.PollEverySec, 10)
 	c.MaxAttempts = orDefault(c.MaxAttempts, 10)
 	c.MaxDeliveries = orDefault(c.MaxDeliveries, 50)
@@ -454,7 +456,7 @@ func (c *Config) ValidateTargets() error {
 }
 
 // PoolSize returns a pgx pool max-conns of Concurrency + headroom, CLAMPED to a sane
-// range. Both serve (Validate) and the DR subcommands (ValidateDR) run validateLimits,
+// range. Both serve (Validate) and the DR subcommands (ValidateDRLimits) run validateLimits,
 // which rejects Concurrency>1024 — so this clamp is a belt-and-suspenders guard that makes
 // the int32 conversion provably non-overflowing at the call site regardless of validation.
 func (c *Config) PoolSize(headroom int) int32 {

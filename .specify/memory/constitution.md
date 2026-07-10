@@ -61,8 +61,10 @@ Database interactions MUST use **sqlc** for query generation and **pgx**.
 - Tests MUST defend real invariants (idempotency, hash-verify, no-loss under
   fault) — no coverage-padding tests. Fault-injection and restore-drill tests
   are first-class.
-- **Statement test coverage MUST exceed 95%** (measured by `go test
-  -coverprofile` over `./...`). This bar and the no-padding rule above are
+- **Statement test coverage MUST exceed 95%** (measured over `./...` by
+  `make cover-check`, which merges per-binary `GOCOVERDIR` streams with `go tool
+  covdata` — NOT a single `-coverprofile`, which double-counts under `-coverpkg`
+  across many test binaries and under-reports). This bar and the no-padding rule above are
   **complementary, not in tension**: the 95% MUST be reached with real
   invariant, fault-injection, and integration tests — never with superficial
   or assertion-free tests. The pgx DB adapters (outbox, ledger, corpus) MUST be

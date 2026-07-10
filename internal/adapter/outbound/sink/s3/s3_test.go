@@ -2,11 +2,14 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 // s3Stub is a minimal S3-over-HTTP stub speaking just enough for minio-go's path-style
@@ -17,6 +20,7 @@ import (
 type s3Stub struct {
 	bucketStatus atomic.Int32 // 200 = bucket present, 404 = gone (atomic so a test can flip it mid-sweep)
 	bucketChecks atomic.Int32 // how many BucketExists HEADs arrived
+	objStatus    atomic.Int32 // StatObject HEAD status (0 → default 404 absent; 403 → read-denied)
 }
 
 func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -27,8 +31,12 @@ func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodHead && bucketLevel:
 		s.bucketChecks.Add(1)
 		w.WriteHeader(int(s.bucketStatus.Load()))
-	case r.Method == http.MethodHead: // StatObject → object always absent (404)
-		w.WriteHeader(http.StatusNotFound)
+	case r.Method == http.MethodHead: // StatObject
+		if st := s.objStatus.Load(); st != 0 {
+			w.WriteHeader(int(st))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // default: object absent (404)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -66,6 +74,24 @@ func TestExistsGoneBucketIsError(t *testing.T) {
 	}
 	if present {
 		t.Fatal("Exists must not report present for a gone bucket")
+	}
+}
+
+// TestExistsReadDeniedTagged: a StatObject 403/AccessDenied (a PutObject-only WORM credential) must
+// surface an error tagged with domain.ErrReadDenied — the signal the audit's write-only-WORM early-stop
+// keys on — and must NOT take the confirm-bucket "absent" path (a 403 is not a 404).
+func TestExistsReadDeniedTagged(t *testing.T) {
+	sink, stub := newStubSink(t, http.StatusOK) // bucket present (irrelevant — a 403 never reaches confirmBucket)
+	stub.objStatus.Store(http.StatusForbidden)
+	present, err := sink.Exists(context.Background(), strings.Repeat("a", 64))
+	if present {
+		t.Fatal("a 403 must not report present")
+	}
+	if !errors.Is(err, domain.ErrReadDenied) {
+		t.Fatalf("a 403 StatObject must return an error tagged domain.ErrReadDenied, got %v", err)
+	}
+	if n := stub.bucketChecks.Load(); n != 0 {
+		t.Fatalf("a 403 must NOT trigger a confirm-bucket check (that is the 404 path), ran %d", n)
 	}
 }
 

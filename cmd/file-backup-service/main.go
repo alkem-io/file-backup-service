@@ -323,14 +323,44 @@ type wormReadSource struct {
 	name string
 }
 
-// Fetch attempts the read and, on failure, annotates it with the WORM-source recovery hint.
+// Fetch attempts the read and, on failure, annotates it with the WORM-source recovery hint. The
+// annotation must cover BOTH failure timings: a filesystem sink's os.Open fails EAGERLY here, but the
+// s3 sink's GetObject is LAZY — its 403 surfaces on the first Read (inside the decode path), not from
+// Fetch — so on the s3 sink (the real off-site WORM case) an un-wrapped rc would reach the decoder as a
+// bare "peek magic: …AccessDenied", stripping the actionable hint at the exact moment DR needs it. So
+// wrap the returned reader too (wormErrReader) to annotate a read-time failure identically.
 func (w wormReadSource) Fetch(ctx context.Context, hash string) (io.ReadCloser, error) {
 	rc, err := w.Sink.Fetch(ctx, hash)
 	if err != nil {
-		return nil, fmt.Errorf("reading WORM/write-only target %q failed (its worker credential is PutObject-only by design; restore from a readable target, or supply the immutable copy's read-capable admin credential): %w", w.name, err)
+		return nil, w.annotate(err)
 	}
-	return rc, nil
+	return &wormErrReader{rc: rc, annotate: w.annotate}, nil
 }
+
+// annotate wraps a WORM-source read failure with the recovery hint (its worker credential is
+// PutObject-only by design; restore from a readable target, or supply a read-capable admin credential).
+func (w wormReadSource) annotate(err error) error {
+	return fmt.Errorf("reading WORM/write-only target %q failed (its worker credential is PutObject-only by design; restore from a readable target, or supply the immutable copy's read-capable admin credential): %w", w.name, err)
+}
+
+// wormErrReader annotates a LATE (read-time) failure from a lazy WORM source with the same recovery hint
+// wormReadSource.Fetch applies to an eager one — so a deferred s3 403 surfaces to the operator with
+// guidance, not as a bare decode error. Bytes and io.EOF pass through untouched; only a non-EOF read
+// error is wrapped.
+type wormErrReader struct {
+	rc       io.ReadCloser
+	annotate func(error) error
+}
+
+func (r *wormErrReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, r.annotate(err)
+	}
+	return n, err
+}
+
+func (r *wormErrReader) Close() error { return r.rc.Close() }
 
 // boundedRestoreCtx caps one DR object op with perObjectTimeout — like every other path
 // (serve/backfill/reconcile all bound one object): a black-holing sink that accepts the
@@ -410,15 +440,25 @@ func runRestoreAll(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Print the per-target stored-set sizes FIRST so an operator sees cross-target disparity before
-	// trusting a single-`--from` restore: `restore all` restores only what the SOURCE holds, so a
-	// smaller source misses objects a fuller target has (which reconcile/backfill would refill).
-	printTargetStoredSizes(ctx, ledger, cfg.Targets, name)
+	// Print the per-target stored-set sizes so an operator sees cross-target disparity before trusting a
+	// single-`--from` restore (`restore all` restores only what the SOURCE holds; a smaller source misses
+	// objects a fuller target has, which reconcile/backfill would refill). Run it CONCURRENTLY with the
+	// restore rather than as a synchronous gate: it is an exact count(*) aggregate over the WHOLE ledger
+	// (every target's stored set), and blocking a time-critical DR restore on that informational scan is
+	// the wrong priority. The table prints well before the restore finishes in practice; we join it
+	// before the final summary so the output stays ordered (the counts appear "above" the summary, which
+	// restoreAllVerdict's 0-objects message references).
+	countDone := make(chan struct{})
+	go func() {
+		defer close(countDone)
+		printTargetStoredSizes(ctx, ledger, cfg.Targets, name)
+	}()
 	conc := *concurrency
 	if conc <= 0 {
 		conc = cfg.Concurrency
 	}
 	st, rerr := domain.RestoreAll(ctx, ledger, src, name, *to, conc, cfg.PerObjectTimeout())
+	<-countDone // the count is long-done in practice; join so the table prints before the summary
 	fmt.Printf("restore all (%s -> %s): restored=%d skipped=%d failed=%d cancelled=%d\n", name, *to, st.Restored, st.Skipped, st.Failed, st.Cancelled)
 	return restoreAllVerdict(st, rerr, name)
 }
@@ -817,10 +857,11 @@ func runAudit(args []string) error {
 	// + reduced to its ONE shared FailErr; they are errors.Join'd — NO early-return — so a
 	// corrupt-manifest fault or drift on ONE target/direction can't MASK a finding on another.
 	verdicts := make([]error, 0, 4) // 3 directions + the top-level ctx.Err() fold
-	printAudit("audit", domain.Audit(ctx, ledger, targets, *sample), &verdicts)
-	printAudit("immutability", domain.CheckImmutability(ctx, targets), &verdicts)
+	verdicts = append(verdicts,
+		printAudit("audit", domain.Audit(ctx, ledger, targets, *sample)),
+		printAudit("immutability", domain.CheckImmutability(ctx, targets)))
 	if *inventory {
-		printAudit("inventory", domain.AuditInventory(ctx, ledger, targets), &verdicts)
+		verdicts = append(verdicts, printAudit("inventory", domain.AuditInventory(ctx, ledger, targets)))
 	}
 	// A SIGTERM mid-audit must exit NONZERO (audit is deliberately NOT shutdown-wrapped — an aborted
 	// integrity check proved nothing): the per-direction probes map a parent cancellation to a benign
@@ -829,14 +870,14 @@ func runAudit(args []string) error {
 	return errors.Join(verdicts...)
 }
 
-// printAudit prints one direction's per-target verdicts (label prefixes each line) and appends the
-// direction's ONE shared FailErr to verdicts. Every direction shares this — the printed shape and
-// the pass/fail reduction can't diverge between them.
-func printAudit(label string, rep domain.VerdictReport, verdicts *[]error) {
+// printAudit prints one direction's per-target verdicts (label prefixes each line) and returns the
+// direction's ONE shared FailErr for the caller to join. Every direction shares this — the printed
+// shape and the pass/fail reduction can't diverge between them.
+func printAudit(label string, rep domain.VerdictReport) error {
 	for _, v := range rep.Targets {
 		fmt.Printf("%s %s: %s — %s\n", label, v.Target, v.Status, v.Detail)
 	}
-	*verdicts = append(*verdicts, rep.FailErr())
+	return rep.FailErr()
 }
 
 // runDrill runs a restore drill (T033/FR-024/SC-009): it samples random objects the ledger
