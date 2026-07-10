@@ -47,6 +47,9 @@ type inventoryReader interface {
 //   - a read-denying credential / transient error / timeout → Unverifiable (the target SHOULD be
 //     readable but wasn't this pass — the gauge drops stale-green and raises a distinct signal);
 //   - object-lock AND versioning both enabled → Verified; either disabled → Drift.
+//
+// Cancellation contract: a parent-ctx SIGTERM yields NoData (benign), not an error — the caller MUST
+// fold ctx.Err() to fail an interrupted run (see Audit's CANCELLATION CONTRACT + runAudit).
 func CheckImmutability(ctx context.Context, targets []Target) VerdictReport {
 	worm := make([]Target, 0, len(targets))
 	for _, t := range targets {
@@ -79,10 +82,21 @@ func immutabilityProbe(pctx context.Context, t Target) TargetVerdict {
 	}
 	lock, versioning, err := ic.CheckImmutability(pctx)
 	if err != nil {
-		// A read-denying WORM credential (403), or any inability to READ the config, is Unverifiable
-		// by design — NOT drift: the immutable off-site copy's write-only credential legitimately
-		// can't read its own config, and a normally-readable target that suddenly can't be read is a
-		// broken read path, not a lock that was removed.
+		// A parent SIGTERM propagates through pctx as context.Canceled (the per-target auditProbeTimeout
+		// fires as DeadlineExceeded instead), so a prompt Canceled return here is a benign SHUTDOWN →
+		// NoData — matching the existence + inventory directions (classifyAuditErr / classifyInventoryErr
+		// both lead with cancelledInFlight). Without this, a graceful-shutdown SIGTERM landing mid-pass
+		// would return Unverifiable and make serve's ImmutabilitySampler raise the ALERTABLE
+		// filebackup_immutability_unverifiable series for a HEALTHY WORM target on every deploy. (The
+		// probeTargets abandon path already demotes a parent-cancel to NoData; this handles the prompt
+		// return that returns before abandonment.)
+		if cancelledInFlight(pctx, err) {
+			return shutdownVerdict(err)
+		}
+		// A read-denying WORM credential (403), a per-target DEADLINE (a wedged config read), or any other
+		// inability to READ the config, is Unverifiable by design — NOT drift: the immutable off-site
+		// copy's write-only credential legitimately can't read its own config, and a normally-readable
+		// target that suddenly can't be read is a broken read path, not a lock that was removed.
 		return TargetVerdict{Status: StatusUnverifiable, Detail: fmt.Sprintf("unverifiable (read-denying credential or transient error): %v", err)}
 	}
 	if lock && versioning {

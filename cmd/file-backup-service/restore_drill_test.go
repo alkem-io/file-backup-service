@@ -55,6 +55,46 @@ func TestRestoreAllVerdict(t *testing.T) {
 	}
 }
 
+// TestBackfillVerdict (Alt#2): a GENUINE failure that coincides with a mid-corpus SIGTERM must return a
+// NON-Canceled error so the dispatch's onShutdownOK CANNOT rescue it to exit 0 — the false-NEGATIVE twin
+// of the round-9 drain-window false-positive. A pure cancel (no failures) returns Canceled for
+// onShutdownOK to map to exit 0 (resumable); a benign tail-drain cancel is in Cancelled, not Failed.
+func TestBackfillVerdict(t *testing.T) {
+	// genuine failure + a coincident mid-corpus SIGTERM → must NOT be Canceled (else onShutdownOK masks it).
+	if err := backfillVerdict(domain.BackfillStats{Failed: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a genuine failure coinciding with a SIGTERM must return a non-Canceled error (onShutdownOK must not mask it), got %v", err)
+	}
+	// pure cancel (no failures, benign tail-drain in Cancelled) → Canceled passes through for onShutdownOK.
+	if err := backfillVerdict(domain.BackfillStats{Backed: 5, Cancelled: 3}, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a pure cancel must pass Canceled through for onShutdownOK → exit 0, got %v", err)
+	}
+	// a real sweep/DB error (not a cancel) → surfaced.
+	if err := backfillVerdict(domain.BackfillStats{}, errors.New("corpus enum failed")); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a real sweep error must surface, got %v", err)
+	}
+	// clean pass → nil.
+	if err := backfillVerdict(domain.BackfillStats{Backed: 5}, nil); err != nil {
+		t.Fatalf("a clean pass must be nil, got %v", err)
+	}
+}
+
+// TestReconcileVerdict (Alt#2): same policy — a genuine failure OR a Skipped (on NO target) coinciding
+// with a SIGTERM must not be masked to exit 0; a pure cancel passes Canceled through.
+func TestReconcileVerdict(t *testing.T) {
+	if err := reconcileVerdict(domain.ReconcileStats{Failed: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a genuine reconcile failure coinciding with a SIGTERM must not be masked, got %v", err)
+	}
+	if err := reconcileVerdict(domain.ReconcileStats{Skipped: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a Skipped (object on NO target) coinciding with a SIGTERM must not be masked, got %v", err)
+	}
+	if err := reconcileVerdict(domain.ReconcileStats{Repaired: 5, Cancelled: 2}, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a pure cancel must pass Canceled through, got %v", err)
+	}
+	if err := reconcileVerdict(domain.ReconcileStats{Repaired: 5}, nil); err != nil {
+		t.Fatalf("a clean pass must be nil, got %v", err)
+	}
+}
+
 // TestSelectReadTarget (Pillar 4b): the default source SKIPS WORM (write-only) targets; an EXPLICIT
 // WORM --from is now ALLOWED (restoring from the sole surviving immutable copy must not be refused);
 // an all-WORM config has no default readable source; an unknown --from is not-found.

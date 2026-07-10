@@ -94,6 +94,15 @@ func sampledStart(sample int) string {
 // prefix every run, a permanent blind spot). A sampled sweep that reaches the end of the keyspace
 // with budget remaining WRAPS ONCE to "" so it still checks min(sample, total) objects. A full audit
 // (samplePerTarget<=0) starts at "" and never wraps.
+//
+// CANCELLATION CONTRACT (shared by CheckImmutability + AuditInventory): a parent-ctx cancellation
+// (SIGTERM) yields a benign NoData verdict for every target NOT YET completed (a target that finished a
+// real Drift/Verified before the cancel keeps it), NOT an error — an aborted sweep proved nothing about
+// the remaining targets, but their verdicts must not be spurious FAILURES. So VerdictReport.FailErr()
+// alone CANNOT tell a cancelled (INCOMPLETE) audit from a clean pass — the incomplete targets read
+// benign. The caller MUST fold ctx.Err() into its exit verdict to fail an interrupted run — see
+// runAudit's `verdicts = append(verdicts, ctx.Err())`. A future caller reducing via FailErr() alone
+// would read a cancelled, unverified audit as green.
 func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int) VerdictReport {
 	return auditWithStart(ctx, led, targets, samplePerTarget, sampledStart(samplePerTarget))
 }
@@ -213,20 +222,19 @@ func (a *auditTally) verdict(name string, stoppedEarly bool) TargetVerdict {
 }
 
 // classifyAuditErr folds a ledger→target sweep error into a verdict: a PARENT cancel (SIGTERM) →
-// NoData (benign; the top-level ctx.Err() fold surfaces the abort); a ledger read error → Fault —
-// this INCLUDES a per-page auditProbeTimeout DeadlineExceeded, which auditTarget wraps as
-// errLedgerRead, because a stalled/unreadable OWN ledger is our-side infra: page loudly, never
-// worm-exempt. The `default` is a defensive catch-all for a sweep error that is NOT a ledger read (a
-// wedged existence probe surfacing ctx.Err() other than a parent cancel) → Unverifiable.
+// NoData (benign; the top-level ctx.Err() fold surfaces the abort); ANY other error → Fault — this
+// INCLUDES a per-page auditProbeTimeout DeadlineExceeded, which auditTarget wraps as errLedgerRead,
+// because a stalled/unreadable OWN ledger is our-side infra: page loudly, never worm-exempt. The
+// existence direction runs with NO per-target deadline (probeTargets timeout=0), so err here can ONLY be
+// a parent Canceled or an errLedgerRead-wrapped page error — the final Fault is a fail-LOUD catch-all for
+// any error class a future change could introduce: an unexpected classification here must PAGE, never
+// silently become an exempt-benign Unverifiable on a WORM target (the fail-open direction).
 func classifyAuditErr(parentCtx context.Context, name string, err error) TargetVerdict {
-	switch {
-	case cancelledInFlight(parentCtx, err):
+	if cancelledInFlight(parentCtx, err) {
 		return shutdownVerdict(err)
-	case errors.Is(err, errLedgerRead):
-		return TargetVerdict{Status: StatusFault, Err: fmt.Errorf("audit target %s: %w", name, err), Detail: "ledger read error"}
-	default:
-		return TargetVerdict{Status: StatusUnverifiable, Detail: fmt.Sprintf("sweep unverifiable (wedged/deadline): %v", err)}
 	}
+	// errLedgerRead (the only other reachable class today) AND any unexpected future class → Fault.
+	return TargetVerdict{Status: StatusFault, Err: fmt.Errorf("audit target %s: %w", name, err), Detail: "ledger/sweep read error"}
 }
 
 // keysetSample drives a random-band, single-wrap keyset sweep of up to `sample` ids (sample<=0 =

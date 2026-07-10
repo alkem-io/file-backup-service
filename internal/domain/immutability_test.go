@@ -84,6 +84,30 @@ func TestCheckImmutabilityReadCapableErrorFails(t *testing.T) {
 	}
 }
 
+// ctxErrImmSink is a READ-CAPABLE WORM sink whose CheckImmutability returns the ctx's error — models a
+// config read interrupted by a parent SIGTERM (a prompt context.Canceled return, before probeTargets'
+// abandon path fires).
+type ctxErrImmSink struct{ stubSink }
+
+func (ctxErrImmSink) CheckImmutability(ctx context.Context) (bool, bool, error) {
+	return false, false, ctx.Err()
+}
+func (ctxErrImmSink) ImmutabilityReadable() bool { return true }
+
+// TestImmutabilityProbeCancelIsNoData (Alt#1): a parent SIGTERM that surfaces as a prompt context.Canceled
+// from CheckImmutability must be benign NoData — matching the existence + inventory directions — NOT a
+// spurious Unverifiable that serve's ImmutabilitySampler would raise the alertable
+// filebackup_immutability_unverifiable series for on a HEALTHY WORM target during graceful shutdown. (A
+// genuine 403/transient error with the parent LIVE stays Unverifiable — TestCheckImmutabilityReadCapableErrorFails.)
+func TestImmutabilityProbeCancelIsNoData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the parent SIGTERM; CheckImmutability returns ctx.Err() = Canceled
+	v := immutabilityProbe(ctx, wormTarget(ctxErrImmSink{stubSink{name: "w"}}))
+	if v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("a parent-cancel during the immutability check must be benign NoData, not a spurious Unverifiable: %+v", v)
+	}
+}
+
 func TestCheckImmutabilityNoCapabilityIsNoData(t *testing.T) {
 	// A Worm target whose sink can't report object-lock AT ALL (a filesystem target — stubSink
 	// implements no immutabilityChecker) is NoData (structural: it can never carry a signal).

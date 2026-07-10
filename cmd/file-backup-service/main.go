@@ -512,6 +512,32 @@ func restoreAllVerdict(st domain.RestoreAllStats, rerr error, source string) err
 	return onShutdownOK(rerr)
 }
 
+// backfillVerdict maps a backfill outcome to an exit error — extracted so the SIGTERM policy is
+// unit-testable (like restoreAllVerdict). A GENUINE per-object failure (st.Failed) is checked FIRST, so
+// a mid-corpus SIGTERM (which cancels EachFile → sweepErr=Canceled) can't mask a real failure as a clean
+// exit 0: the returned failure error is NOT context.Canceled, so the dispatch's onShutdownOK wrapper
+// won't rescue it to exit 0. A benign tail-drain cancel lands in st.Cancelled (NOT st.Failed), so it
+// falls through; a pure cancellation returns sweepErr (Canceled) for dispatch's onShutdownOK to map to
+// exit 0 (the pass is resumable); a real sweep/DB error returns nonzero. Skipped/Deferred are benign.
+func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
+	if st.Failed > 0 {
+		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
+	}
+	return sweepErr
+}
+
+// reconcileVerdict maps a reconcile outcome to an exit error — same SIGTERM policy as backfillVerdict.
+// st.Failed (a target was down, retryable) OR st.Skipped (the object is on NO current target — near-total
+// loss, needs a primary-store backfill) is a genuine could-not-fully-protect outcome, checked BEFORE the
+// cancellation escape so a mid-corpus SIGTERM can't mask it; a benign tail-drain cancel is in st.Cancelled.
+func reconcileVerdict(st domain.ReconcileStats, sweepErr error) error {
+	if st.Failed > 0 || st.Skipped > 0 {
+		return fmt.Errorf("reconcile could not fully protect %d object(s): %d unrepaired (target down), %d on NO target (need a primary-store backfill)",
+			st.Failed+st.Skipped, st.Failed, st.Skipped)
+	}
+	return sweepErr
+}
+
 // runRestoreCurrent restores a file's CURRENT backed-up version, GUARDED by --at (`restore current
 // --file-id --at`). The live `file` table holds only the current version — there is NO version
 // history — so this deliberately does NOT promise "restore the historical version at --at". Instead
@@ -727,19 +753,7 @@ func runReconcile(args []string) error {
 		})
 	st, err := rec.Run(ctx, *ratePerSec)
 	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d cancelled=%d\n", st.Repaired, st.Skipped, st.Failed, st.Cancelled)
-	if err != nil {
-		return err // sweep error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
-	}
-	// A COMPLETED pass that could NOT fully protect every object must exit nonzero so a cron/CI
-	// backstop alerts. Both buckets count: Failed = a target was down (retryable next pass);
-	// Skipped = the object lives on NO current target at all (near-total loss — only a
-	// primary-store backfill can restore it), which is MORE severe, not less, so it must not
-	// slip through as a clean exit 0.
-	if st.Failed > 0 || st.Skipped > 0 {
-		return fmt.Errorf("reconcile could not fully protect %d object(s): %d unrepaired (target down), %d on NO target (need a primary-store backfill)",
-			st.Failed+st.Skipped, st.Failed, st.Skipped)
-	}
-	return nil
+	return reconcileVerdict(st, err)
 }
 
 // runBackfill backs up the pre-existing corpus (US2/T022): it enumerates the
@@ -803,18 +817,7 @@ func runBackfill(args []string) error {
 	pipeline, _ := isolatedPipeline(cfg, fsClient, ledger, targets)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d cancelled=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed, st.Cancelled)
-	if err != nil {
-		return err // sweep/DB error, or ctx cancellation (onShutdownOK maps Canceled → clean exit 0)
-	}
-	// A COMPLETED pass with GENUINE failures exits nonzero so an operator scripting
-	// `backfill && next-step` doesn't proceed as if the corpus were fully protected. Skipped
-	// (source deleted before backfill) and Deferred (stored on every reachable target; only a
-	// circuit-open target's gap remains, which reconcile refills — T017a) are both benign and
-	// do NOT fail the pass.
-	if st.Failed > 0 {
-		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
-	}
-	return nil
+	return backfillVerdict(st, err)
 }
 
 // preflightScratch fails loud at reconcile startup if the scratch dir can't be written —

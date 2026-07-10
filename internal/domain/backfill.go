@@ -58,8 +58,9 @@ func bump(mu *sync.Mutex, counter *int) {
 // COINCIDES with a SIGTERM as "cancelled", so `restore all` / `drill` would exit 0 on real
 // corruption. A per-object TIMEOUT while the parent is live (a slow/wedged source) is
 // DeadlineExceeded, not Canceled, so it correctly stays a genuine failure. The ONE owner of the
-// cancel-vs-genuine distinction shared by the restore-all + drill sweeps and the audit-direction
-// error classifiers.
+// cancel-vs-genuine distinction, shared by the batch sweeps (backfill/reconcile), the DR sweeps
+// (restore-all/drill), and ALL THREE audit-direction classifiers (existence classifyAuditErr, inventory
+// classifyInventoryErr, and the immutability probe) — so a shutdown reads uniformly benign everywhere.
 func cancelledInFlight(parentCtx context.Context, objErr error) bool {
 	return errors.Is(objErr, context.Canceled) && parentCtx.Err() != nil
 }
@@ -175,9 +176,9 @@ func (b *Backfiller) Run(ctx context.Context, ratePerSec int) (BackfillStats, er
 // doesn't serialize the fetch/store.
 func (b *Backfiller) backupOne(ctx context.Context, e BackupItem, st *BackfillStats, mu *sync.Mutex) {
 	defer recoverFailed(mu, &st.Failed)
-	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
+	octx, cancel := context.WithTimeout(ctx, b.perObjectT) // per-object bound; parent `ctx` stays for the cancel check
 	defer cancel()
-	done, deferred, err := b.p.BackupOne(ctx, e)
+	done, deferred, err := b.p.BackupOne(octx, e)
 	mu.Lock()
 	defer mu.Unlock()
 	switch {

@@ -443,12 +443,14 @@ func (c *Config) ValidateDRLimits() error {
 // collisions (two names mapping to one FBS_TARGET_<TOKEN>_* would silently share
 // secrets). Used by restore/verify (which need only a single sink built).
 func (c *Config) ValidateTargets() error {
-	if len(c.Targets) == 0 {
-		return errors.New("at least one target is required")
+	// The set-wide guard (non-empty + no env-namespace collision) has ONE owner — CheckTargetCollisions,
+	// which the single-source DR read path also runs — so the serve path and the DR path can't diverge on
+	// what a valid target SET is; here we additionally validate every target's fields.
+	if err := c.CheckTargetCollisions(); err != nil {
+		return err
 	}
-	seen := make(map[string]string, len(c.Targets))
-	for i, t := range c.Targets {
-		if err := validateTarget(i, t, seen); err != nil {
+	for _, t := range c.Targets {
+		if err := ValidateTargetFields(t); err != nil {
 			return err
 		}
 	}
@@ -549,13 +551,6 @@ func (c *Config) validateLimits() error {
 	return nil
 }
 
-func validateTarget(i int, t Target, seen map[string]string) error {
-	if err := validateTargetName(i, t, seen); err != nil {
-		return err
-	}
-	return ValidateTargetFields(t)
-}
-
 // validateTargetName checks a target's NAME + the set-wide env-token collision guard (seen
 // accumulates the tokens seen so far). Split from the field validation so a single-source DR op can
 // run the collision guard over the whole set (a sibling must not have injected the chosen target's
@@ -642,7 +637,7 @@ func SelectReadTarget(targets []Target, from string) (Target, error) {
 	return Target{}, errors.New("no readable (non-WORM) target configured by default — restore/drill needs a target it can read; name a WORM/immutable copy explicitly via --from to attempt an admin-credential read")
 }
 
-// validateS3Target checks the s3-specific required fields (split out of validateTarget to
+// validateS3Target checks the s3-specific required fields (split out of ValidateTargetFields to
 // keep its cyclomatic complexity in budget).
 func validateS3Target(t Target) error {
 	if t.Endpoint == "" || t.Bucket == "" || t.Region == "" {

@@ -58,6 +58,9 @@ var maxSortedManifestIDs = 1_000_000
 // bounded per-OPERATION (the manifest fetch, each manifest read, each ledger page) rather than by a
 // single whole-diff deadline, so a healthy LARGE corpus never false-fails while a wedged target is
 // still bounded.
+//
+// Cancellation contract: a parent-ctx SIGTERM yields NoData (benign), not an error — the caller MUST
+// fold ctx.Err() to fail an interrupted run (see Audit's CANCELLATION CONTRACT + runAudit).
 func AuditInventory(ctx context.Context, led Ledger, targets []Target) VerdictReport {
 	return VerdictReport{Targets: probeTargets(ctx, targets, 0, func(pctx context.Context, t Target) TargetVerdict {
 		return inventoryProbe(pctx, led, t)

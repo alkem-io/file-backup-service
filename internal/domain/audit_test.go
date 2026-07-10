@@ -283,17 +283,19 @@ func TestVerdictStatusString(t *testing.T) {
 	}
 }
 
-// TestClassifyAuditErr pins the ledger→target error classifier: a parent SIGTERM → benign NoData; a
-// ledger read fault → a failing Fault; a per-page deadline (parent live) → Unverifiable (a non-worm
-// target then fails).
+// TestClassifyAuditErr pins the ledger→target error classifier: a parent SIGTERM → benign NoData; every
+// OTHER error → a failing Fault (page). The existence direction runs with no per-target deadline, so the
+// only reachable non-cancel error is an errLedgerRead-wrapped page error; an unexpected class is a
+// fail-LOUD Fault, NOT an exempt-benign Unverifiable that could silently pass a WORM target.
 func TestClassifyAuditErr(t *testing.T) {
-	timeout := classifyAuditErr(context.Background(), "t", context.DeadlineExceeded)
-	if timeout.Status != StatusUnverifiable || !timeout.Failed() {
-		t.Fatalf("a per-page deadline must be Unverifiable + failing (non-worm), got %+v", timeout)
-	}
 	fault := classifyAuditErr(context.Background(), "t", fmt.Errorf("%w: boom", errLedgerRead))
 	if fault.Status != StatusFault || fault.Err == nil || !fault.Failed() {
 		t.Fatalf("a ledger read error must be a failing Fault carrying the cause, got %+v", fault)
+	}
+	// An unexpected error class (not cancel, not errLedgerRead) FAULTS loud — never a benign Unverifiable.
+	unexpected := classifyAuditErr(context.Background(), "t", context.DeadlineExceeded)
+	if unexpected.Status != StatusFault || !unexpected.Failed() {
+		t.Fatalf("an unexpected error class must fail loud as Fault (not exempt-benign Unverifiable), got %+v", unexpected)
 	}
 	pctx, cancel := context.WithCancel(context.Background())
 	cancel()
