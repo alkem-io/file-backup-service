@@ -70,12 +70,24 @@ type Target struct {
 	// Worm marks a write-once (object-lock/immutable) target. It is the target's IMMUTABILITY
 	// declaration, NOT a claim that the target is unreadable: whether a WORM target can be VERIFIED
 	// depends on whether an audit/read credential is set (AuditAccessKey/AuditSecretKey), not on this
-	// flag. A WORM target WITH an audit credential is fully verified (existence + immutability +
-	// inventory all run via the read credential); a WORM target WITHOUT one is legitimately N/A →
-	// NoData (silent, no false alert AND no false pass), its immutability asserted by object-lock + the
-	// audit + never_verified. The pass/fail axis is read-capability, not this flag (see
-	// domain.targetUnverifiableExempt): only a WORM target that CANNOT be read is exempt from an
-	// Unverifiable failing the audit. Configure the audit credential to enable the drift-check.
+	// flag. WITH an audit credential a WORM target is fully verified — existence, immutability, and
+	// inventory all read through it.
+	//
+	// WITHOUT one, the three audit directions differ (they are NOT uniformly NoData):
+	//   - immutability drift-check → NoData (silent). Its GetObjectLockConfig/GetBucketVersioning are
+	//     BUCKET-config reads that a PutObject-only credential cannot do at all, so the check is
+	//     genuinely N/A. It must be NoData, not Unverifiable, because the serve sampler treats an
+	//     Unverifiable here as ALERTABLE — a by-design write-only copy would otherwise false-page.
+	//   - existence + inventory → the target IS probed (object reads work on an object-lock bucket:
+	//     object-lock restricts delete/overwrite, not GET). A genuinely write-only credential then
+	//     read-denies → Unverifiable, which targetUnverifiableExempt makes BENIGN. They are deliberately
+	//     NOT short-circuited: doing so silently skipped a READ-CAPABLE WORM target (zero verification,
+	//     exit 0) — a real silent-loss gap. A read-capable WORM gets a true Verified/Drift verdict.
+	//
+	// So the pass/fail axis is read-capability, not this flag (see domain.targetUnverifiableExempt):
+	// only a WORM target that CANNOT be read is exempt from an Unverifiable failing the audit. Its
+	// immutability is then asserted by object-lock + the audit + never_verified. Configure the audit
+	// credential to enable the drift-check.
 	Worm bool `yaml:"worm,omitempty"`
 }
 
