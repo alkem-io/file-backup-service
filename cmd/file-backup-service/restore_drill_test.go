@@ -382,6 +382,36 @@ func TestDrillReportPassWritesGauges(t *testing.T) {
 	}
 }
 
+// TestDrillReportZeroSampledWritesRedButKeepsLastSuccess pins the 0-sampled policy (CodeRabbit PR#4
+// raised moving the 0-sampled guard BEFORE the metrics write — that would be a FAIL-OPEN regression):
+// a drill that sampled 0 objects PROVED NOTHING (renamed/misconfigured target, or an empty/wrong
+// ledger), so it MUST write pass=0 and exit nonzero — leaving the textfile untouched would keep the
+// PRIOR pass=1 and show a STALE GREEN gauge while the drill is actually broken. It must NOT, however,
+// clobber `last_success`: SetPass only stamps last_success on a PASS, and WriteTextfile carries the
+// prior file's value forward on a non-pass — so the "when did a drill last actually succeed" signal
+// survives a red run.
+func TestDrillReportZeroSampledWritesRedButKeepsLastSuccess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	// A prior HEALTHY drill writes pass=1 + a real last_success.
+	prior := metrics.NewDrillMetrics()
+	prior.SetPass(true, time.Unix(1_700_000_000, 0))
+	if err := prior.WriteTextfile(path, true); err != nil {
+		t.Fatalf("seed the passing textfile: %v", err)
+	}
+	// Now a 0-sampled drill (nothing to drill) — a distinct FAILURE.
+	err := drillReport(domain.DrillOutcome{Target: "t"}, nil, path, "t")
+	if err == nil || !strings.Contains(err.Error(), "sampled 0 objects") {
+		t.Fatalf("a 0-sampled drill must fail loud (it proved nothing), got %v", err)
+	}
+	b, _ := os.ReadFile(path) //nolint:gosec // test temp path
+	if !strings.Contains(string(b), "filebackup_restore_drill_pass 0") {
+		t.Fatalf("a 0-sampled drill must write pass=0 — NOT leave a stale green gauge:\n%s", b)
+	}
+	if !strings.Contains(string(b), "filebackup_drill_last_success_timestamp_seconds 1.7e+09") {
+		t.Fatalf("a red run must CARRY FORWARD the prior last_success, never clobber it to 0:\n%s", b)
+	}
+}
+
 // TestRunRestoreUnknownSubcommand: a non-flag first arg that isn't a known verb (e.g. the pre-release
 // `version`, or a typo) errors loud as an unknown subcommand — rather than silently falling through to
 // the bare-hash alias and doing a surprising object restore. A bare `--hash` (a flag) still falls
