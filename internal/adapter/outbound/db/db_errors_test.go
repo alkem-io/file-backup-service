@@ -92,6 +92,16 @@ func TestLedgerStoredTargetsError(t *testing.T) {
 	}
 }
 
+// TestLedgerStoredCountByTargetError: a query fault on the restore-all pre-count must propagate, so a
+// count error surfaces rather than a phantom empty/partial per-target snapshot.
+func TestLedgerStoredCountByTargetError(t *testing.T) {
+	r, mock := newMockLedger(t)
+	mock.ExpectQuery("file_backup_target_status").WithArgs([]string{"t1", "t2"}).WillReturnError(errors.New("boom"))
+	if _, err := r.StoredCountByTarget(context.Background(), []string{"t1", "t2"}); err == nil {
+		t.Fatal("a stored-count-by-target query error must propagate")
+	}
+}
+
 // TestLedgerTargetGapsPageError: a query fault on the reconcile work-list's first page must
 // abort the sweep (an errored page must not read as "no gaps").
 func TestLedgerTargetGapsPageError(t *testing.T) {

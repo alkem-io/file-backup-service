@@ -8,10 +8,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -68,8 +71,11 @@ func ShardKey(hash string) string {
 	return hash
 }
 
-// CreateTemp opens a unique "<prefix>.*.partial" temp under dir. The .partial
-// suffix is the marker any orphan sweep / reconcile keys on.
+// CreateTemp opens a unique "<prefix>.*.partial" temp under dir. The .partial suffix marks an
+// IN-PROGRESS write — CommitWrite (and ProbeWritable) remove their own on commit or failure — and keeps
+// a crash-leaked temp distinguishable from a committed content-addressed blob. (There is no cross-run
+// orphan sweep yet; and reconcile's decoded-plaintext staging temp uses a separate ".plain" suffix, so
+// the two temp conventions are deliberately independent, not one shared marker.)
 func CreateTemp(dir, prefix string) (*os.File, string, error) {
 	f, err := os.CreateTemp(dir, prefix+".*.partial")
 	if err != nil {
@@ -80,9 +86,9 @@ func CreateTemp(dir, prefix string) (*os.File, string, error) {
 
 // ProbeWritable verifies dir is writable by creating then removing a throwaway ".partial"
 // temp — the write-probe shared by the filesystem sink's Preflight and the reconcile
-// scratch-dir check, so both use ONE policy and the same sweepable temp naming (a probe that
-// leaks after a crash is caught by the same orphan sweep as any other .partial). dir="" uses
-// the OS temp dir.
+// scratch-dir check, so both use ONE policy and the same temp naming (a probe that leaks after a
+// crash carries the same .partial suffix as any other in-progress write, keeping it identifiable).
+// dir="" uses the OS temp dir.
 func ProbeWritable(dir string) error {
 	f, name, err := CreateTemp(dir, preflightPrefix)
 	if err != nil {
@@ -181,38 +187,124 @@ func IsTimestampedManifest(base string) bool {
 	return err == nil
 }
 
-// SelectLatestManifest resolves the newest manifest's base name from a pointer read + a
-// bounded-after lister, owning the policy in ONE place so the s3 and filesystem sinks provide only
-// primitive reads and can't diverge on selection. readPointer returns the `_manifest/LATEST` contents
-// (ok=false when absent/unreadable/empty). The pointer is only a HINT (its write is best-effort, so
-// it can be STALE — name an OLDER manifest): SelectLatestManifest VALIDATES it by listing only the
-// manifests strictly AFTER it (a bounded `StartAfter=<pointer>` list — cheap, since the pointer is
-// updated each write) and, if any newer timestamped manifest exists, uses that newer one instead of
-// the stale pointer (so the diff can't miss an orphan added after a stale pointer). An invalid/absent
-// pointer lists from "" (a full scan). Returns "" (nil error) when none exist — the caller maps that
-// to os.ErrNotExist / NoData — and propagates a listFrom error (a read-deny / gone container → the
-// caller reports the target Unverifiable, not "no manifest").
-func SelectLatestManifest(readPointer func() (string, bool), listFrom func(after string) ([]string, error)) (string, error) {
-	pointer, ok := readPointer()
-	valid := ok && IsTimestampedManifest(pointer)
-	after := ""
-	if valid { // list only what is NEWER than the pointer — a bounded staleness check
-		after = pointer
+// FormatManifestName is the object BASE name for a snapshot taken at t: <UTC-nanosecond-timestamp>.jsonl.
+// It is the WRITE side of the manifest naming contract whose READ side is IsTimestampedManifest — both
+// live here so the fixed-width layout + suffix have ONE owner and can't drift. (A format change here not
+// mirrored in the parser would make IsTimestampedManifest silently reject EVERY newly-written manifest →
+// OpenLatestManifest drops them all → the inventory drift-check goes blind on green health.)
+// domain.ManifestName delegates here.
+func FormatManifestName(t time.Time) string {
+	return t.UTC().Format(manifestTimeLayout) + manifestSuffix
+}
+
+// ManifestPointerMax bounds the `_manifest/LATEST` pointer READ on BOTH sinks (s3 io.LimitReader, fs
+// io.LimitReader) — the pointer body is a single manifest base name (~40 bytes), so 4 KiB is generous,
+// and the cap stops a corrupted/oversized pointer object from OOMing the DR pod before ParseManifestPointer
+// rejects it. One owner so the two sinks can't diverge on the guard.
+const ManifestPointerMax = 4096
+
+// ParseManifestPointer parses the raw bytes of the `_manifest/LATEST` pointer into a manifest base name,
+// returning ok=false when the pointer is empty/whitespace-only. The ONE owner of the pointer's on-disk/
+// on-object encoding, shared by the s3 and filesystem sinks' readManifestPointer (only the byte READ —
+// GetObject vs os.ReadFile — is storage-specific), so the two sinks can't diverge on which pointer
+// values are valid. The returned name is VALIDATED (as a timestamped manifest) by OpenLatestManifest.
+func ParseManifestPointer(b []byte) (string, bool) {
+	name := strings.TrimSpace(string(b))
+	return name, name != ""
+}
+
+// WriteManifestWithPointer writes the manifest object (fail-HARD) then BEST-EFFORT updates the
+// `_manifest/LATEST` pointer to `name` — the shared WRITE half of the pointer contract whose READ half
+// is OpenLatestManifest + ParseManifestPointer. Each sink supplies its storage-specific write primitive;
+// the pointer ENCODING (the body is exactly the bare manifest name) and the fail-hard-manifest /
+// swallow-pointer POLICY live here, so the s3 and filesystem sinks can't diverge. A pointer-write
+// failure is deliberately swallowed: OpenLatestManifest's scan fallback resolves the newest manifest
+// without the pointer, so a stale/missing pointer is a self-healing perf hint, NOT a durability gap —
+// which is why it must never fail the durable manifest write.
+func WriteManifestWithPointer(name string, writeManifest func() error, writePointer func(body io.Reader) error) error {
+	if err := writeManifest(); err != nil {
+		return err
 	}
-	names, err := listFrom(after)
+	_ = writePointer(strings.NewReader(name)) // best-effort; the scan fallback covers correctness
+	return nil
+}
+
+// OpenLatestManifest opens the newest manifest that STILL EXISTS — the SINGLE owner of manifest
+// selection, so the s3 and filesystem sinks provide only primitive reads (readPointer/listFrom/open)
+// and can't diverge on which object is "newest". readPointer returns the `_manifest/LATEST` hint
+// (ok=false when absent/unreadable/empty); listFrom lists manifest base names strictly AFTER its arg
+// (""=full scan); open opens a manifest by base name, signalling a since-DELETED manifest as a wrapped
+// os.ErrNotExist (any OTHER error — a read-deny, a gone container — is surfaced so the caller reports
+// the target Unverifiable, not "no manifest"). It returns the opened newest surviving manifest; a
+// wrapped os.ErrNotExist when NONE exist (the caller maps that to NoData); or a non-ErrNotExist
+// open/list error.
+//
+// The healthy case is ONE bounded list + ONE open. Only when the selected newest is GONE (a
+// deleted/expired pointer target, or a since-deleted tip) does it pay a full scan for the newest
+// SURVIVING manifest — so a vanished tip can't hide an orphan an OLDER surviving manifest would still
+// reveal (returning the gone tip would make the caller misread NoData).
+func OpenLatestManifest(
+	readPointer func() (string, bool),
+	listFrom func(after string) ([]string, error),
+	open func(name string) (io.ReadCloser, error),
+) (io.ReadCloser, error) {
+	// Fast path: a VALID pointer is a HINT (its write is best-effort, so it can be STALE — name an
+	// OLDER manifest). Bound the staleness check to manifests strictly NEWER than it (a cheap
+	// `StartAfter=<pointer>` list, since the pointer is rewritten each snapshot); a newer listed
+	// manifest overrides the stale pointer, so the diff can't miss an orphan added after it. On the
+	// selected tip being GONE, fall through to the single full scan below (the fast path did only the
+	// bounded list, so an invalid/absent pointer skips straight to that one full scan — never two).
+	if pointer, ok := readPointer(); ok && IsTimestampedManifest(pointer) {
+		names, err := listFrom(pointer)
+		if err != nil {
+			return nil, err
+		}
+		newest := pointer // the pointer is a candidate; a newer listed name overrides it below
+		for _, n := range names {
+			if IsTimestampedManifest(n) && n > newest {
+				newest = n
+			}
+		}
+		rc, err := open(newest)
+		if err == nil {
+			return rc, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err // read-deny / gone container → Unverifiable, not a benign "no manifest"
+		}
+		// the fast-path tip is GONE → fall through to a single full scan for the newest surviving.
+	}
+	// No valid pointer, OR the fast-path tip is gone → ONE full scan, newest-surviving first, so a
+	// deleted tip can't hide an orphan an OLDER manifest still reveals. latestFirst tries newest-down.
+	names, err := listFrom("")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	latest := ""
-	if valid { // the pointer is a candidate; a newer listed manifest below overrides a stale pointer
-		latest = pointer
-	}
-	for _, n := range names {
-		if IsTimestampedManifest(n) && n > latest {
-			latest = n
+	for _, n := range latestFirst(names) {
+		rc, err := open(n)
+		if err == nil {
+			return rc, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
 		}
 	}
-	return latest, nil
+	return nil, fmt.Errorf("no manifest: %w", os.ErrNotExist)
+}
+
+// latestFirst returns the VALID timestamped manifest base names in descending (newest-first) order,
+// dropping any non-timestamped stray so it can never be picked as "newest". The fixed-width UTC
+// ManifestName layout makes lexical order == chronological order, so a reverse string sort is
+// newest-first.
+func latestFirst(names []string) []string {
+	valid := make([]string, 0, len(names))
+	for _, n := range names {
+		if IsTimestampedManifest(n) {
+			valid = append(valid, n)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(valid)))
+	return valid
 }
 
 // syncDir fsyncs a directory so a create/rename within it is durable

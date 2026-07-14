@@ -29,9 +29,13 @@ func newPacer(ratePerSec int) (wait func(context.Context) error, stop func()) {
 	}, t.Stop
 }
 
-// recoverFailed converts a panic in a per-item sweep step (reconcile repair / backfill
-// backup) into a counted failure, so one poison object can't crash the whole pass. mu guards
-// the counter because the sweeps run items concurrently (runBoundedPaced).
+// recoverFailed converts a panic in a per-item sweep step (reconcile repair / backfill backup /
+// restore-all / drill) into a counted failure, so one poison object can't crash the whole pass — the
+// UNIFORM per-worker guard at every runBoundedPaced site. It is kept even where the direct panic path
+// is already contained behind callWithCtx (the sink ops turn a driver panic into an error): a bare
+// panic in a background WORKER goroutine would otherwise take down the process, and the uniform guard
+// also catches a future change that introduces a panic path. mu guards the counter because the sweeps
+// run items concurrently (runBoundedPaced).
 func recoverFailed(mu *sync.Mutex, failed *int) {
 	if r := recover(); r != nil { //nolint:revive // recover works here — recoverFailed is invoked directly via `defer recoverFailed(...)`
 		bump(mu, failed)
@@ -54,8 +58,9 @@ func bump(mu *sync.Mutex, counter *int) {
 // COINCIDES with a SIGTERM as "cancelled", so `restore all` / `drill` would exit 0 on real
 // corruption. A per-object TIMEOUT while the parent is live (a slow/wedged source) is
 // DeadlineExceeded, not Canceled, so it correctly stays a genuine failure. The ONE owner of the
-// cancel-vs-genuine distinction shared by the restore-all + drill sweeps and the audit-direction
-// error classifiers.
+// cancel-vs-genuine distinction, shared by the batch sweeps (backfill/reconcile), the DR sweeps
+// (restore-all/drill), and ALL THREE audit-direction classifiers (existence classifyAuditErr, inventory
+// classifyInventoryErr, and the immutability probe) — so a shutdown reads uniformly benign everywhere.
 func cancelledInFlight(parentCtx context.Context, objErr error) bool {
 	return errors.Is(objErr, context.Canceled) && parentCtx.Err() != nil
 }
@@ -63,17 +68,27 @@ func cancelledInFlight(parentCtx context.Context, objErr error) bool {
 // runBoundedPaced dispatches each item `enumerate` yields to `work`, at up to `concurrency`
 // in flight and paced at ratePerSec DISPATCHES/sec (0 = unlimited). The pacer AND a semaphore
 // gate dispatch; each item runs in a worker goroutine; ALL in-flight workers are drained before
-// returning. This overlaps the per-object I/O latency of the batch/DR sweeps (backfill,
-// reconcile) — which the Concurrency knob sizes just like serve's worker pool — and, for
-// reconcile, removes the head-of-line stall where one slow object blocked the whole pass.
-// enumerate is the sweep source (backfill's EachFile / reconcile's TargetGaps); a yield/enumerate
-// error stops the sweep. The one owner of the bounded-paced worker-pool scaffold.
+// returning. This overlaps the per-object I/O latency of the batch/DR sweeps (backfill EachFile,
+// reconcile TargetGaps, restore-all, drill) — which the Concurrency knob sizes just like serve's
+// worker pool — and, for reconcile, removes the head-of-line stall where one slow object blocked the
+// whole pass. enumerate is the sweep source; a yield/enumerate error stops the sweep. The one owner of
+// the bounded-paced worker-pool scaffold, used by ALL FOUR sweeps (backupOne / repair / restoreAllOne /
+// drillOne).
+//
+// PANIC SAFETY: each work closure is REQUIRED to recover its own panic (recoverFailed /
+// recoverDrillFailure record it as a per-object failure so the sweep continues). This primitive adds a
+// BACKSTOP recover per worker so a panic a closure let ESCAPE its own guard (a forgotten defer, a future
+// caller) can NEVER crash the whole DR process via a fatal bare-goroutine panic — it is caught and
+// surfaced as a loud sweep error (the sweep fails nonzero, never silently swallows the poison object).
+// The per-site recover runs first (inside work), so this backstop never fires in normal operation.
 func runBoundedPaced[T any](ctx context.Context, concurrency, ratePerSec int, enumerate func(yield func(T) error) error, work func(T)) error {
 	concurrency = max(concurrency, 1)
 	wait, stop := newPacer(ratePerSec)
 	defer stop()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	var panicMu sync.Mutex
+	var escapedPanic error // the FIRST panic a work closure let escape its own recover (a bug backstop)
 	err := enumerate(func(item T) error {
 		if err := wait(ctx); err != nil { // pacer gates DISPATCH (nil = go, else stop the sweep)
 			return err
@@ -87,11 +102,23 @@ func runBoundedPaced[T any](ctx context.Context, concurrency, ratePerSec int, en
 		go func(item T) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() { // backstop: a panic work's own recover missed must not crash the process
+				if r := recover(); r != nil {
+					panicMu.Lock()
+					if escapedPanic == nil {
+						escapedPanic = PanicErr("bounded-paced worker", r)
+					}
+					panicMu.Unlock()
+				}
+			}()
 			work(item)
 		}(item)
 		return ctx.Err()
 	})
 	wg.Wait() // drain in-flight workers before the caller reads the stats
+	if err == nil {
+		err = escapedPanic // an escaped work-closure panic fails the sweep loud, never a silent green
+	}
 	return err
 }
 
@@ -106,10 +133,11 @@ type CorpusEnumerator interface {
 
 // BackfillStats summarizes a backfill pass.
 type BackfillStats struct {
-	Backed   int // fully stored on every target after this pass (incl. already-present)
-	Skipped  int // source object gone (deleted before backfill) — benign terminal, not a failure
-	Deferred int // stored on every REACHABLE target; only gap is a circuit-open target (T017a) — not a failure
-	Failed   int // a target genuinely failed, or the pass was cancelled
+	Backed    int // fully stored on every target after this pass (incl. already-present)
+	Skipped   int // source object gone (deleted before backfill) — benign terminal, not a failure
+	Deferred  int // stored on every REACHABLE target; only gap is a circuit-open target (T017a) — not a failure
+	Failed    int // a target GENUINELY failed (not a shutdown) — the pass didn't fully back up this object
+	Cancelled int // in-flight when a SIGTERM landed (a resumable interruption, NOT a failure) — see backupOne
 }
 
 // Backfiller backs up the pre-existing corpus (US2/T022): it enumerates every file and
@@ -134,12 +162,13 @@ func NewBackfiller(corpus CorpusEnumerator, p *Pipeline, perObjectTimeout time.D
 	return &Backfiller{corpus: corpus, p: p, perObjectT: NormalizePerObjectTimeout(perObjectTimeout), concurrency: concurrency}
 }
 
-// defaultPerObjectTimeout is the fallback the sweep constructors floor a non-positive
-// perObjectTimeout to — matches config's applyDefaults default, so a direct (test/future)
-// caller that skips config validation still gets a sane bound instead of an all-fail pass.
-const defaultPerObjectTimeout = 30 * time.Minute
+// DefaultPerObjectTimeout is the fallback the sweep constructors floor a non-positive perObjectTimeout
+// to, so a caller that skips config validation still gets a sane bound instead of an all-fail pass. It
+// is the ONE source of the 30-min default: config's applyDefaults DERIVES its PerObjectTimeoutSec
+// default from it (config imports domain), so the serve-path default and this DR-path floor can't drift.
+const DefaultPerObjectTimeout = 30 * time.Minute
 
-// NormalizePerObjectTimeout floors a non-positive per-object timeout to defaultPerObjectTimeout so
+// NormalizePerObjectTimeout floors a non-positive per-object timeout to DefaultPerObjectTimeout so
 // context.WithTimeout never yields an already-expired (or, via a config overflow that degraded to 0,
 // near-instant) deadline that would fail every object. The ONE owner of that floor, shared by the
 // batch sweeps (NewBackfiller / NewReconciler), the DR sweeps (Drill / RestoreAll), and the CLI's
@@ -147,7 +176,7 @@ const defaultPerObjectTimeout = 30 * time.Minute
 // bound.
 func NormalizePerObjectTimeout(d time.Duration) time.Duration {
 	if d <= 0 {
-		return defaultPerObjectTimeout
+		return DefaultPerObjectTimeout
 	}
 	return d
 }
@@ -169,9 +198,9 @@ func (b *Backfiller) Run(ctx context.Context, ratePerSec int) (BackfillStats, er
 // doesn't serialize the fetch/store.
 func (b *Backfiller) backupOne(ctx context.Context, e BackupItem, st *BackfillStats, mu *sync.Mutex) {
 	defer recoverFailed(mu, &st.Failed)
-	ctx, cancel := context.WithTimeout(ctx, b.perObjectT) // a hung fetch/sink fails this object, not the pass
+	octx, cancel := context.WithTimeout(ctx, b.perObjectT) // per-object bound; parent `ctx` stays for the cancel check
 	defer cancel()
-	done, deferred, err := b.p.BackupOne(ctx, e)
+	done, deferred, err := b.p.BackupOne(octx, e)
 	mu.Lock()
 	defer mu.Unlock()
 	switch {
@@ -191,6 +220,15 @@ func (b *Backfiller) backupOne(ctx context.Context, e BackupItem, st *BackfillSt
 		// consumer's Skip so a corpus with routine deletions doesn't fail the pass (and
 		// doesn't bury genuine target failures in an undifferentiated Failed count).
 		st.Skipped++
+	case cancelledInFlight(ctx, err):
+		// A SIGTERM cancelled THIS object mid-flight. runBoundedPaced's enumerate finishes when the
+		// corpus is exhausted while the last ~concurrency workers are still draining, so a clean
+		// shutdown during that drain window would otherwise land here as a "failure" and — because
+		// enumerate already returned nil — make runBackfill exit NONZERO on a fully-successful,
+		// resumable pass. Count it Cancelled (benign, the re-run backs it up), exactly like restore-all
+		// / drill. A genuine failure that merely COINCIDES with a SIGTERM stays Failed (cancelledInFlight
+		// requires the error itself to be context.Canceled, so a hash-mismatch/DeadlineExceeded doesn't).
+		st.Cancelled++
 	default:
 		st.Failed++
 	}

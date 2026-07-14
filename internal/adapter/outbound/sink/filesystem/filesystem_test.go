@@ -135,6 +135,41 @@ func TestLatestManifestGoneRootIsError(t *testing.T) {
 	}
 }
 
+// TestOpenManifestFileGoneRootIsError (Alt2): the manifest open closure must draw the SAME
+// vanished-manifest-vs-vanished-ROOT distinction the top-level confirmRoot does — a mount that detaches
+// AFTER the listing but before the open (a TOCTOU) must surface a NON-os.ErrNotExist error, not the
+// benign os.ErrNotExist that would mask a silent-loss on a vanished target. (Mirrors the s3 sink's
+// confirmBucket-on-404 in ITS open closure.)
+func TestOpenManifestFileGoneRootIsError(t *testing.T) {
+	// A present manifest opens cleanly.
+	root := t.TempDir()
+	s := New("fs", root)
+	name := "2026-01-02T030405.000000000Z.jsonl"
+	if err := os.MkdirAll(filepath.Join(root, "_manifest"), 0o755); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "_manifest", name), []byte("{}\n"), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write manifest: %v", err)
+	}
+	rc, err := s.openManifestFile(name)
+	if err != nil {
+		t.Fatalf("a present manifest must open, got %v", err)
+	}
+	_ = rc.Close()
+
+	// A vanished MANIFEST (root intact) → benign os.ErrNotExist (the resolver tries an older one).
+	if _, err := s.openManifestFile("2020-01-01T000000.000000000Z.jsonl"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a vanished manifest (root intact) must be benign os.ErrNotExist, got %v", err)
+	}
+
+	// A vanished ROOT → NON-os.ErrNotExist (Unverifiable), even though os.Open reports ENOENT.
+	gone := New("fs", filepath.Join(t.TempDir(), "detached"))
+	_, err = gone.openManifestFile(name)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a manifest open under a GONE root must surface a non-os.ErrNotExist error, got %v", err)
+	}
+}
+
 // TestLatestManifestReadDirError: a _manifest path that is a FILE (not a dir) makes ReadDir fail
 // with a non-ErrNotExist error, which must propagate (not be masked as "no manifest").
 func TestLatestManifestReadDirError(t *testing.T) {

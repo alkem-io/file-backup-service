@@ -96,6 +96,20 @@ func TestOnShutdownOK(t *testing.T) {
 	}
 }
 
+// TestResolveConcurrency: --concurrency 0 (or negative) falls back to the configured concurrency; a
+// positive flag wins. The ONE default shared by restore-all and drill.
+func TestResolveConcurrency(t *testing.T) {
+	if got := resolveConcurrency(0, 8); got != 8 {
+		t.Fatalf("--concurrency 0 must use the configured value (8), got %d", got)
+	}
+	if got := resolveConcurrency(-1, 8); got != 8 {
+		t.Fatalf("a negative --concurrency must use the configured value (8), got %d", got)
+	}
+	if got := resolveConcurrency(3, 8); got != 3 {
+		t.Fatalf("a positive --concurrency must win, got %d", got)
+	}
+}
+
 // ---- buildTargets ---------------------------------------------------------
 
 func TestBuildTargets(t *testing.T) {
@@ -345,33 +359,44 @@ func TestNewLogger(t *testing.T) {
 	syncLog() // must not panic
 }
 
-// ---- sourceSink -----------------------------------------------------------
+// ---- buildReadSource (the DR read-source resolver sourceOp inlines) --------
 
-func TestSourceSinkOK(t *testing.T) {
-	cfgPath := fsConfig(t, t.TempDir())
-	sink, name, cfg, err := sourceSink(cfgPath, "local")
+// loadSource is the config.Load + buildReadSource pair the DR read commands use — the shape sourceOp
+// inlines. A test helper so the buildReadSource cases below read like the command call sites.
+func loadSource(t *testing.T, cfgPath, from string) (domain.Sink, string, error) {
+	t.Helper()
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		t.Fatalf("sourceSink(local): %v", err)
+		return nil, "", err
 	}
-	if sink == nil || cfg == nil {
-		t.Fatal("sourceSink must return a sink and cfg")
+	return buildReadSource(cfg, from)
+}
+
+func TestBuildReadSourceOK(t *testing.T) {
+	cfgPath := fsConfig(t, t.TempDir())
+	sink, name, err := loadSource(t, cfgPath, "local")
+	if err != nil {
+		t.Fatalf("buildReadSource(local): %v", err)
+	}
+	if sink == nil {
+		t.Fatal("buildReadSource must return a sink")
 	}
 	if sink.Name() != "local" || name != "local" {
 		t.Fatalf("wrong sink resolved: %q / %q", sink.Name(), name)
 	}
 }
 
-func TestSourceSinkMissingTarget(t *testing.T) {
+func TestBuildReadSourceMissingTarget(t *testing.T) {
 	cfgPath := fsConfig(t, t.TempDir())
-	_, _, _, err := sourceSink(cfgPath, "does-not-exist")
+	_, _, err := loadSource(t, cfgPath, "does-not-exist")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("an unknown target must yield a not-found error, got %v", err)
 	}
 }
 
-func TestSourceSinkNoTargets(t *testing.T) {
+func TestBuildReadSourceNoTargets(t *testing.T) {
 	cfgPath := writeConfig(t, t.TempDir(), "fileServiceBase: http://x\n")
-	if _, _, _, err := sourceSink(cfgPath, "local"); err == nil {
+	if _, _, err := loadSource(t, cfgPath, "local"); err == nil {
 		t.Fatal("a config with no targets must error")
 	}
 }
@@ -381,9 +406,9 @@ func TestSourceSinkNoTargets(t *testing.T) {
 // storeObject puts content into the "local" filesystem target via its sink and returns the hash.
 func storeObject(t *testing.T, cfgPath string, content []byte) string {
 	t.Helper()
-	sink, _, _, err := sourceSink(cfgPath, "local")
+	sink, _, err := loadSource(t, cfgPath, "local")
 	if err != nil {
-		t.Fatalf("sourceSink: %v", err)
+		t.Fatalf("build read source: %v", err)
 	}
 	h := sha3hex(content)
 	n, err := sink.Store(context.Background(), h, bytes.NewReader(content))
@@ -446,7 +471,7 @@ func TestRunRestoreMissingFlags(t *testing.T) {
 }
 
 // ---- config-validation error paths of the DB subcommands ------------------
-// Each of these fails on Validate/ValidateDR BEFORE any pool is opened (verified by reading
+// Each of these fails on Validate/ValidateDRLimits BEFORE any pool is opened (verified by reading
 // main.go's order-of-operations), so no DB is contacted.
 
 // invalidCfg writes a valid-YAML but incomplete config (no fileServiceBase, no DB host).

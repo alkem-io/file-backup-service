@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 )
@@ -73,9 +75,28 @@ func (existsErrSink) Exists(context.Context, string) (bool, error) {
 	return false, errors.New("AccessDenied")
 }
 
-// TestAuditWORMTargetUnverifiable: a target whose Exists always errors is Unverifiable, and that
-// FAILS the audit for a NON-worm target (a broken read path) but NOT for a worm target (read-denying
-// by design).
+// ImmutabilityReadable()==false models a by-design write-only WORM copy (a PutObject-only credential
+// that 403s Exists), so its Unverifiable is EXEMPT — the exemption axis is read-capability, not the
+// worm flag. A non-worm existsErrSink is not exempt regardless (targetUnverifiableExempt short-circuits
+// on !Worm), so the non-worm case in TestAuditWORMTargetUnverifiable still FAILS.
+func (existsErrSink) ImmutabilityReadable() bool { return false }
+
+// readableWormSink models a WORM (object-lock) target whose WORKER credential IS read-capable but which
+// has NO separate audit credential (ImmutabilityReadable()==false): object-lock restricts delete/
+// overwrite, not GET, so Exists reads fine. This is the config B (removed-behavior) flagged as silently
+// skipped by the old short-circuit — it must now be PROBED and get a real Verified/Drift verdict.
+type readableWormSink struct {
+	stubSink
+	present bool // Exists result (models present vs a silently-lost object)
+}
+
+func (s readableWormSink) Exists(context.Context, string) (bool, error) { return s.present, nil }
+func (readableWormSink) ImmutabilityReadable() bool                     { return false }
+
+// TestAuditWORMTargetUnverifiable: a NON-worm target whose Exists always errors is Unverifiable and
+// FAILS (a broken read path); a by-design WRITE-ONLY WORM target (worker cred 403s Exists, no audit
+// cred) is PROBED and reaches Unverifiable, which targetUnverifiableExempt makes benign (never a
+// short-circuit-to-NoData — a read-capable WORM must not be skipped).
 func TestAuditWORMTargetUnverifiable(t *testing.T) {
 	ctx := context.Background()
 	led := newFakeLedger()
@@ -89,9 +110,105 @@ func TestAuditWORMTargetUnverifiable(t *testing.T) {
 
 	repWorm := Audit(ctx, led, []Target{{Sink: existsErrSink{stubSink{name: "worm"}}, Worm: true}}, 0)
 	if v := repWorm.Targets[0]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("a worm all-errored target must be Unverifiable but NOT fail: %+v", v)
+		t.Fatalf("a write-only WORM target is probed → Unverifiable but EXEMPT (benign), got %+v", v)
 	}
 }
+
+// TestAuditReadableWORMIsProbed (regression for B): a WORM target whose worker credential can READ (no
+// separate audit cred) must be existence-probed, NOT skipped. A present object → Verified; a silently
+// lost object → Drift (missing>0, failing). The old short-circuit reported NoData (exit 0), silently
+// hiding silent loss on an 'immutable' target.
+func TestAuditReadableWORMIsProbed(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	_ = led.RecordBackup(ctx, ObjectMeta{ExternalID: "hashA"}, []TargetStatus{{Target: "w", State: StateStored}})
+
+	present := Audit(ctx, led, []Target{{Sink: readableWormSink{stubSink{name: "w"}, true}, Worm: true}}, 0)
+	if v := present.Targets[0]; v.Status != StatusVerified || v.Failed() {
+		t.Fatalf("a read-capable WORM with a present object must be Verified (probed, not skipped): %+v", v)
+	}
+	lost := Audit(ctx, led, []Target{{Sink: readableWormSink{stubSink{name: "w"}, false}, Worm: true}}, 0)
+	if v := lost.Targets[0]; v.Status != StatusDrift || v.Missing != 1 || !v.Failed() {
+		t.Fatalf("a read-capable WORM with a LOST object must be Drift+fail (silent loss detected): %+v", v)
+	}
+}
+
+// readDeniedCountingSink models a strictly write-only WORM worker credential: every Exists returns a
+// domain.ErrReadDenied-tagged 403, and it counts the probes so a test can assert the audit STOPPED early
+// instead of doing a doomed HEAD per object across the whole (multi-page) ledger.
+type readDeniedCountingSink struct {
+	stubSink
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *readDeniedCountingSink) Exists(context.Context, string) (bool, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return false, fmt.Errorf("stat: %w (AccessDenied)", ErrReadDenied)
+}
+func (*readDeniedCountingSink) ImmutabilityReadable() bool { return false }
+
+// seedStored records n stored objects on target, returning their ids in the ledger's (byte-sorted)
+// page order so a test can pin which id lands on the LAST page.
+func seedStored(led *fakeLedger, target string, n int, label string) []string {
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		ids[i] = hashOf(fmt.Sprintf("%s-%06d", label, i))
+		_ = led.RecordBackup(context.Background(), ObjectMeta{ExternalID: ids[i]},
+			[]TargetStatus{{Target: target, State: StateStored}})
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// TestAuditWriteOnlyWORMEarlyStops (Eff1): a by-design write-only WORM target whose worker credential
+// uniformly read-denies (403) is Unverifiable-exempt (benign), and the audit STOPS after the first
+// all-read-denied page — NOT one doomed HEAD per object across the whole multi-page ledger.
+func TestAuditWriteOnlyWORMEarlyStops(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	seedStored(led, "w", KeysetPageSize+500, "wo") // > one page → a full sweep would probe every object
+	sink := &readDeniedCountingSink{stubSink: stubSink{name: "w"}}
+
+	v := Audit(ctx, led, []Target{{Sink: sink, Worm: true}}, 0).Targets[0]
+	if v.Status != StatusUnverifiable || v.Failed() {
+		t.Fatalf("a write-only WORM target must be Unverifiable but EXEMPT (benign): %+v", v)
+	}
+	if sink.calls == 0 {
+		t.Fatal("audit must probe at least one page before concluding write-only")
+	}
+	if sink.calls > KeysetPageSize {
+		t.Fatalf("audit must STOP after the first all-read-denied page (~%d probes), did %d (no early-stop)", KeysetPageSize, sink.calls)
+	}
+}
+
+// TestAuditReadCapableWORMNotEarlyStopped (Eff1 must not regress B): the read-deny early-stop must fire
+// ONLY on a uniform read-denial — a READ-CAPABLE WORM (worker cred reads) with a silently-lost object on
+// the LAST page is still fully swept and caught as Drift, because a successful read makes readDenied !=
+// checked and disables the early-stop.
+func TestAuditReadCapableWORMNotEarlyStopped(t *testing.T) {
+	ctx := context.Background()
+	led := newFakeLedger()
+	ids := seedStored(led, "w", KeysetPageSize+5, "rc")
+	lost := ids[len(ids)-1] // sorts LAST → only a complete multi-page sweep reaches it
+
+	v := Audit(ctx, led, []Target{{Sink: presentExceptSink{stubSink{name: "w"}, lost}, Worm: true}}, 0).Targets[0]
+	if v.Status != StatusDrift || v.Missing != 1 || !v.Failed() {
+		t.Fatalf("a read-capable WORM's silent loss on the LAST page must be Drift+fail (no early-stop): %+v", v)
+	}
+}
+
+// presentExceptSink reports every object present except `lost` (which reads as a clean absence). Models
+// a read-capable WORM worker credential with one silently-lost object.
+type presentExceptSink struct {
+	stubSink
+	lost string
+}
+
+func (s presentExceptSink) Exists(_ context.Context, h string) (bool, error) { return h != s.lost, nil }
+func (presentExceptSink) ImmutabilityReadable() bool                         { return false }
 
 // TestAuditCancelledIsBenignAtDomain: a cancelled parent yields a benign NoData verdict at the domain
 // level (FailErr nil) — the top-level ctx.Err() fold in runAudit surfaces the abort, so the domain
@@ -166,17 +283,19 @@ func TestVerdictStatusString(t *testing.T) {
 	}
 }
 
-// TestClassifyAuditErr pins the ledger→target error classifier: a parent SIGTERM → benign NoData; a
-// ledger read fault → a failing Fault; a per-page deadline (parent live) → Unverifiable (a non-worm
-// target then fails).
+// TestClassifyAuditErr pins the ledger→target error classifier: a parent SIGTERM → benign NoData; every
+// OTHER error → a failing Fault (page). The existence direction runs with no per-target deadline, so the
+// only reachable non-cancel error is an errLedgerRead-wrapped page error; an unexpected class is a
+// fail-LOUD Fault, NOT an exempt-benign Unverifiable that could silently pass a WORM target.
 func TestClassifyAuditErr(t *testing.T) {
-	timeout := classifyAuditErr(context.Background(), "t", context.DeadlineExceeded)
-	if timeout.Status != StatusUnverifiable || !timeout.Failed() {
-		t.Fatalf("a per-page deadline must be Unverifiable + failing (non-worm), got %+v", timeout)
-	}
 	fault := classifyAuditErr(context.Background(), "t", fmt.Errorf("%w: boom", errLedgerRead))
 	if fault.Status != StatusFault || fault.Err == nil || !fault.Failed() {
 		t.Fatalf("a ledger read error must be a failing Fault carrying the cause, got %+v", fault)
+	}
+	// An unexpected error class (not cancel, not errLedgerRead) FAULTS loud — never a benign Unverifiable.
+	unexpected := classifyAuditErr(context.Background(), "t", context.DeadlineExceeded)
+	if unexpected.Status != StatusFault || !unexpected.Failed() {
+		t.Fatalf("an unexpected error class must fail loud as Fault (not exempt-benign Unverifiable), got %+v", unexpected)
 	}
 	pctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -186,17 +305,21 @@ func TestClassifyAuditErr(t *testing.T) {
 	}
 }
 
-// TestAuditVerdictPolicy pins the shared pass/fail policy for the ledger→target direction on the
-// TargetVerdict: a non-worm partial-unverifiable fails; the same on a worm target passes; a clean
-// (Verified) sweep passes.
+// TestAuditVerdictPolicy pins the shared pass/fail policy on the TargetVerdict: the exemption axis is
+// READ-CAPABILITY, not worm. A read-capable partial-unverifiable fails; a NOT-read-capable (by-design
+// write-only WORM copy) unverifiable passes; a clean (Verified) sweep passes. A read-capable WORM
+// target (one WITH an audit credential) therefore FAILS an Unverifiable too — which is what aligns the
+// `audit` CLI with the serve immutability sampler (see targetReadCapable).
 func TestAuditVerdictPolicy(t *testing.T) {
+	// Not exempt (a read-capable target, the fail-closed default) → an Unverifiable fails.
 	partial := VerdictReport{Targets: []TargetVerdict{{Target: "t", Status: StatusUnverifiable, Checked: 10}}}
 	if err := partial.FailErr(); err == nil {
-		t.Fatal("a non-worm unverifiable target must fail the audit")
+		t.Fatal("a read-capable unverifiable target must fail the audit")
 	}
-	worm := VerdictReport{Targets: []TargetVerdict{{Target: "w", Worm: true, Status: StatusUnverifiable, Checked: 10}}}
-	if err := worm.FailErr(); err != nil {
-		t.Fatalf("a worm target's read-denied probes must not fail the audit: %v", err)
+	// Exempt (a by-design write-only WORM copy) → an Unverifiable passes.
+	writeOnly := VerdictReport{Targets: []TargetVerdict{{Target: "w", ExemptUnverifiable: true, Status: StatusUnverifiable, Checked: 10}}}
+	if err := writeOnly.FailErr(); err != nil {
+		t.Fatalf("a by-design write-only WORM target's read-denied probes must not fail the audit: %v", err)
 	}
 	clean := VerdictReport{Targets: []TargetVerdict{{Target: "t", Status: StatusVerified, Checked: 10}}}
 	if err := clean.FailErr(); err != nil {

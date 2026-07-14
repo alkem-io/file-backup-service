@@ -2,11 +2,14 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 // s3Stub is a minimal S3-over-HTTP stub speaking just enough for minio-go's path-style
@@ -17,6 +20,7 @@ import (
 type s3Stub struct {
 	bucketStatus atomic.Int32 // 200 = bucket present, 404 = gone (atomic so a test can flip it mid-sweep)
 	bucketChecks atomic.Int32 // how many BucketExists HEADs arrived
+	objStatus    atomic.Int32 // StatObject HEAD status (0 → default 404 absent; 403 → read-denied)
 }
 
 func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -27,8 +31,12 @@ func (s *s3Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodHead && bucketLevel:
 		s.bucketChecks.Add(1)
 		w.WriteHeader(int(s.bucketStatus.Load()))
-	case r.Method == http.MethodHead: // StatObject → object always absent (404)
-		w.WriteHeader(http.StatusNotFound)
+	case r.Method == http.MethodHead: // StatObject
+		if st := s.objStatus.Load(); st != 0 {
+			w.WriteHeader(int(st))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // default: object absent (404)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -69,12 +77,31 @@ func TestExistsGoneBucketIsError(t *testing.T) {
 	}
 }
 
-// TestExistsPresentBucketNotCached (re-review C5): a 404 with the bucket PRESENT is a genuinely
-// absent object → (false, nil); the PRESENT verdict is NOT cached — it is re-checked on each
-// absent-object probe so a bucket that vanishes MID-SWEEP is caught (later 404s → error, not false
-// silent-loss), matching the filesystem sink's per-call confirmRoot. (Only the terminal GONE verdict
-// is cached — see TestExistsGoneBucketCached.)
-func TestExistsPresentBucketNotCached(t *testing.T) {
+// TestExistsReadDeniedTagged: a StatObject 403/AccessDenied (a PutObject-only WORM credential) must
+// surface an error tagged with domain.ErrReadDenied — the signal the audit's write-only-WORM early-stop
+// keys on — and must NOT take the confirm-bucket "absent" path (a 403 is not a 404).
+func TestExistsReadDeniedTagged(t *testing.T) {
+	sink, stub := newStubSink(t, http.StatusOK) // bucket present (irrelevant — a 403 never reaches confirmBucket)
+	stub.objStatus.Store(http.StatusForbidden)
+	present, err := sink.Exists(context.Background(), strings.Repeat("a", 64))
+	if present {
+		t.Fatal("a 403 must not report present")
+	}
+	if !errors.Is(err, domain.ErrReadDenied) {
+		t.Fatalf("a 403 StatObject must return an error tagged domain.ErrReadDenied, got %v", err)
+	}
+	if n := stub.bucketChecks.Load(); n != 0 {
+		t.Fatalf("a 403 must NOT trigger a confirm-bucket check (that is the 404 path), ran %d", n)
+	}
+}
+
+// TestExistsPresentBucketCached (root cause B): a 404 with the bucket PRESENT is a genuinely absent
+// object → (false, nil); the PRESENT verdict is CACHED, so a burst of absent-object probes (a
+// silent-loss audit sample) collapses to a SINGLE BucketExists instead of one HEAD each. Caching
+// present is what removes the bucketMu lock-contention that previously flipped a genuinely-MISSING
+// object to `errored` — which masked real silent loss as Unverifiable (a benign pass on a WORM
+// target). (The terminal GONE verdict is likewise cached — see TestExistsGoneBucketCached.)
+func TestExistsPresentBucketCached(t *testing.T) {
 	sink, stub := newStubSink(t, http.StatusOK) // bucket present
 	for i := 0; i < 3; i++ {
 		present, err := sink.Exists(context.Background(), strings.Repeat("a", 64))
@@ -82,21 +109,27 @@ func TestExistsPresentBucketNotCached(t *testing.T) {
 			t.Fatalf("probe %d: bucket present + object absent must be (false, nil), got present=%v err=%v", i, present, err)
 		}
 	}
-	if n := stub.bucketChecks.Load(); n != 3 {
-		t.Fatalf("BucketExists ran %d times, want 3 (a PRESENT bucket must NOT be cached, so a mid-sweep vanish is caught)", n)
+	if n := stub.bucketChecks.Load(); n != 1 {
+		t.Fatalf("BucketExists ran %d times, want 1 (a PRESENT bucket is cached, collapsing the per-probe HEAD storm)", n)
 	}
 }
 
-// TestExistsMidSweepBucketVanishCaught (re-review C5): a bucket present on the first probe but GONE on
-// the next must surface the vanish as an ERROR (Unverifiable), not a cached "present" that reads the
-// missing object as false silent-loss.
-func TestExistsMidSweepBucketVanishCaught(t *testing.T) {
+// TestExistsPresentCachedThenVanishReadsAbsent (root cause B): once the bucket is confirmed present
+// (and cached), a later mid-sweep vanish is NOT re-detected — the absent object reads as (false, nil).
+// This is the SAFE direction: the audit layer counts it `missing` → Drift, which PAGES; the old
+// no-cache behavior's lock-contention could instead flip missing→errored→Unverifiable (a SILENT WORM
+// pass). A gone bucket also fails the write path loudly, and a worker restart re-checks.
+func TestExistsPresentCachedThenVanishReadsAbsent(t *testing.T) {
 	sink, stub := newStubSink(t, http.StatusOK)
 	if _, err := sink.Exists(context.Background(), strings.Repeat("a", 64)); err != nil {
 		t.Fatalf("first probe (bucket present) must be clean, got %v", err)
 	}
-	stub.bucketStatus.Store(http.StatusNotFound) // the bucket vanishes mid-sweep
-	if _, err := sink.Exists(context.Background(), strings.Repeat("a", 64)); err == nil {
-		t.Fatal("a bucket that vanishes mid-sweep must surface as an error, not a cached present")
+	stub.bucketStatus.Store(http.StatusNotFound) // the bucket vanishes AFTER the present verdict is cached
+	present, err := sink.Exists(context.Background(), strings.Repeat("a", 64))
+	if err != nil || present {
+		t.Fatalf("a cached-present bucket reads a later absent object as (false, nil) — the safe direction (→ Drift/missing, pages); got present=%v err=%v", present, err)
+	}
+	if n := stub.bucketChecks.Load(); n != 1 {
+		t.Fatalf("BucketExists ran %d times, want 1 (present cached — no re-check)", n)
 	}
 }

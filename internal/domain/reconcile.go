@@ -67,9 +67,10 @@ func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration,
 
 // ReconcileStats reports one reconcile pass.
 type ReconcileStats struct {
-	Repaired int // objects brought to full replication this pass
-	Skipped  int // no target holds the object — needs a backfill from the primary store
-	Failed   int // a repair errored or left the object still under-replicated
+	Repaired  int // objects brought to full replication this pass
+	Skipped   int // no target holds the object — needs a backfill from the primary store
+	Failed    int // a repair GENUINELY errored or left the object still under-replicated (not a shutdown)
+	Cancelled int // in-flight when a SIGTERM landed (a resumable interruption, NOT a failure) — see repair
 }
 
 // Run repairs every under-replicated object at most ratePerSec repairs/sec (0 =
@@ -107,7 +108,7 @@ type reconcileGap struct {
 // in one repair is contained (counted failed) so a poison object can't crash the pass.
 func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string, stored map[string]bool, st *ReconcileStats, mu *sync.Mutex) {
 	defer recoverFailed(mu, &st.Failed)
-	ctx, cancel := context.WithTimeout(ctx, rc.perObjectT) // a hung source/sink fails this object, not the pass
+	octx, cancel := context.WithTimeout(ctx, rc.perObjectT) // per-object bound; parent `ctx` stays for the cancel check
 	defer cancel()
 	entry := BackupItem{ExternalID: externalID} // FileID unused: decodingSource keys on ExternalID
 	tried := false
@@ -120,7 +121,7 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 		tried = true
 		// Pass the stored set TargetGaps already computed so backupFrom doesn't re-query the
 		// ledger per gap object (the set uses the same current-target predicate pendingTargets does).
-		done, _, err := p.backupFrom(ctx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry, stored)
+		done, _, err := p.backupFrom(octx, decodingSource{src: src.Sink, scratchDir: rc.scratchDir}, entry, stored)
 		if err == nil {
 			// The source fetched + verified cleanly. Either fully repaired (done), or a
 			// DESTINATION target failed (!done) — and rotating to another source can't fix
@@ -136,8 +137,18 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 			return
 		}
 		lastErr = err
-		if ctx.Err() != nil {
-			bump(mu, &st.Failed) // shutdown mid-repair
+		// A parent SIGTERM cancelled THIS repair mid-flight. As in backfill (see backupOne), enumerate
+		// finishes while the last ~concurrency repairs drain, so a clean shutdown during that window would
+		// otherwise be counted Failed and make runReconcile exit NONZERO on a resumable pass. Count it
+		// Cancelled (benign), matching restore-all/drill (cancelledInFlight keys on the parent ctx).
+		if cancelledInFlight(ctx, err) {
+			bump(mu, &st.Cancelled)
+			return
+		}
+		// A per-object DEADLINE (a wedged source) with the parent still live IS a genuine failure —
+		// rotating to another source can't beat an already-expired per-object ctx, so stop re-fetching.
+		if octx.Err() != nil {
+			bump(mu, &st.Failed)
 			return
 		}
 		// this source was gone/corrupt — try the next source

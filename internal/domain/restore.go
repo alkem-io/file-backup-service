@@ -114,7 +114,9 @@ func RestoreAll(ctx context.Context, led Ledger, src Sink, targetName, destDir s
 		func(yield func(string) error) error {
 			return KeysetLoop("", KeysetPageSize,
 				func(after string, limit int) ([]string, error) {
-					return led.StoredExternalIDsPage(ctx, targetName, after, limit)
+					// Bounded per-page (like audit/inventory): a wedged ledger must abort the (resumable)
+					// restore, not hang it forever — a re-run resumes from the last committed object.
+					return storedPageBounded(ctx, led, targetName, after, limit)
 				},
 				func(id string) string { return id },
 				yield)

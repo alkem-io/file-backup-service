@@ -31,6 +31,12 @@ import (
 
 const envPrefix = "FBS_"
 
+// defaultDBTimeoutSec is the default single-DB-operation bound (pool statement_timeout + client
+// deadline) — the ONE owner, used both by the applyDefaults floor and by DBTimeout's degrade-to-default
+// overflow guard, so a non-positive/absurd DBTimeoutSec on the unvalidated DR path can't yield a
+// negative Duration (an unbounded pool).
+const defaultDBTimeoutSec = 30
+
 // Target type vocabulary — one owner, so config validation and the sink builder can't
 // disagree on a type string (as compression is owned by domain.ParseCodec).
 const (
@@ -61,9 +67,27 @@ type Target struct {
 	UseSSL         bool   `yaml:"useSSL,omitempty"`
 	SSE            bool   `yaml:"sse,omitempty"`      // server-side encryption at rest (MUST — constitution §V)
 	Insecure       bool   `yaml:"insecure,omitempty"` // conscious opt-out of TLS+SSE (local dev only)
-	// Worm marks a write-once target whose credential can't read (PutObject-only, e.g. the
-	// immutable off-site copy): audit EXPECTS its Exists to always deny, so it isn't an
-	// alert — whereas a normally-readable target that suddenly can't be verified IS.
+	// Worm marks a write-once (object-lock/immutable) target. It is the target's IMMUTABILITY
+	// declaration, NOT a claim that the target is unreadable: whether a WORM target can be VERIFIED
+	// depends on whether an audit/read credential is set (AuditAccessKey/AuditSecretKey), not on this
+	// flag. WITH an audit credential a WORM target is fully verified — existence, immutability, and
+	// inventory all read through it.
+	//
+	// WITHOUT one, the three audit directions differ (they are NOT uniformly NoData):
+	//   - immutability drift-check → NoData (silent). Its GetObjectLockConfig/GetBucketVersioning are
+	//     BUCKET-config reads that a PutObject-only credential cannot do at all, so the check is
+	//     genuinely N/A. It must be NoData, not Unverifiable, because the serve sampler treats an
+	//     Unverifiable here as ALERTABLE — a by-design write-only copy would otherwise false-page.
+	//   - existence + inventory → the target IS probed (object reads work on an object-lock bucket:
+	//     object-lock restricts delete/overwrite, not GET). A genuinely write-only credential then
+	//     read-denies → Unverifiable, which targetUnverifiableExempt makes BENIGN. They are deliberately
+	//     NOT short-circuited: doing so silently skipped a READ-CAPABLE WORM target (zero verification,
+	//     exit 0) — a real silent-loss gap. A read-capable WORM gets a true Verified/Drift verdict.
+	//
+	// So the pass/fail axis is read-capability, not this flag (see domain.targetUnverifiableExempt):
+	// only a WORM target that CANNOT be read is exempt from an Unverifiable failing the audit. Its
+	// immutability is then asserted by object-lock + the audit + never_verified. Configure the audit
+	// credential to enable the drift-check.
 	Worm bool `yaml:"worm,omitempty"`
 }
 
@@ -140,17 +164,23 @@ type Config struct {
 	ScratchDir string `yaml:"scratchDir"`
 }
 
-// PerObjectTimeout is the per-object backup deadline. It returns 0 for a non-positive value OR one
-// so large that PerObjectTimeoutSec*time.Second would OVERFLOW int64 nanoseconds and wrap to a
-// positive near-instant (or negative) deadline — the single-object DR read paths (cmd's sourceOp /
-// restore current) do NOT run validateLimits, so a hostile/absurd perObjectTimeoutSec must degrade to
-// "use the default" (via domain.NormalizePerObjectTimeout downstream), never to an instant-expiry
-// deadline that fails every restore. A 0 return signals the caller to floor to the default.
-func (c *Config) PerObjectTimeout() time.Duration {
-	if c.PerObjectTimeoutSec <= 0 || int64(c.PerObjectTimeoutSec) > math.MaxInt64/int64(time.Second) {
-		return 0
+// secondsToDuration converts a whole-seconds config value to a Duration, degrading a non-positive OR
+// int64-nanosecond-OVERFLOWING value to fallback rather than to a negative/instant-expiry Duration — the
+// ONE owner of that overflow guard, shared by the DR-path duration knobs (PerObjectTimeout, DBTimeout)
+// which are read on paths that do NOT run validateLimits, so a hostile/absurd seconds value must degrade
+// safely, never to a deadline that fails every op or (via NewPool's `>0` gate) unbounds the pool.
+func secondsToDuration(sec int, fallback time.Duration) time.Duration {
+	if sec <= 0 || int64(sec) > math.MaxInt64/int64(time.Second) {
+		return fallback
 	}
-	return time.Duration(c.PerObjectTimeoutSec) * time.Second
+	return time.Duration(sec) * time.Second
+}
+
+// PerObjectTimeout is the per-object backup deadline. It returns 0 for a non-positive/overflowing value
+// (the single-object DR read paths — cmd's sourceOp / restore current — do NOT run validateLimits); a 0
+// return signals the caller to floor to the default via domain.NormalizePerObjectTimeout.
+func (c *Config) PerObjectTimeout() time.Duration {
+	return secondsToDuration(c.PerObjectTimeoutSec, 0)
 }
 
 // StaleTTL is how long a claim may stay in_progress before the reaper requeues it.
@@ -182,8 +212,14 @@ func (c *Config) FanoutStall() time.Duration {
 
 // DBTimeout bounds a single DB operation — the pool's server-side statement_timeout AND the
 // client-side deadline on the otherwise-unbounded claim/reap queries — so a slow or wedged
-// Alkemio/ledger DB fails the op (retried) instead of parking a worker forever.
-func (c *Config) DBTimeout() time.Duration { return time.Duration(c.DBTimeoutSec) * time.Second }
+// Alkemio/ledger DB fails the op (retried) instead of parking a worker forever. It degrades a
+// non-positive/overflowing DBTimeoutSec to the default (defaultDBTimeoutSec) rather than a NEGATIVE
+// Duration, which would make NewPool's `statementTimeout > 0` gate skip statement_timeout ENTIRELY —
+// silently opening an UNBOUNDED pool on the unvalidated DR path (restore current → openPool). Same
+// overflow guard as PerObjectTimeout (secondsToDuration).
+func (c *Config) DBTimeout() time.Duration {
+	return secondsToDuration(c.DBTimeoutSec, defaultDBTimeoutSec*time.Second)
+}
 
 // Load reads YAML from path (if present — env-only is also valid), overlays env
 // (FBS_* scalars/DB, FBS_TARGET_<NAME>_* per target), then applies defaults.
@@ -319,16 +355,18 @@ func (c *Config) applyDefaults() {
 	// per-field branch so this stays a flat list (one edit to add a knob, no cyclo creep).
 	c.Concurrency = orDefault(c.Concurrency, 8)
 	c.MetricsPort = orDefault(c.MetricsPort, 4004)
-	c.PerObjectTimeoutSec = orDefault(c.PerObjectTimeoutSec, 1800) // 30 min — must exceed the slowest legit backup
-	c.StaleTTLSec = orDefault(c.StaleTTLSec, 3600)                 // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
+	// Derive the default from the domain floor (DefaultPerObjectTimeout) so the serve-path default and
+	// the DR-path floor share ONE source and can't drift — 30 min, must exceed the slowest legit backup.
+	c.PerObjectTimeoutSec = orDefault(c.PerObjectTimeoutSec, int(domain.DefaultPerObjectTimeout/time.Second))
+	c.StaleTTLSec = orDefault(c.StaleTTLSec, 3600) // 1 h — must exceed PerObjectTimeout so a running object isn't reaped
 	c.PollEverySec = orDefault(c.PollEverySec, 10)
 	c.MaxAttempts = orDefault(c.MaxAttempts, 10)
 	c.MaxDeliveries = orDefault(c.MaxDeliveries, 50)
-	c.ManifestEverySec = orDefault(c.ManifestEverySec, 24*60*60) // daily
-	c.CircuitThreshold = orDefault(c.CircuitThreshold, 5)        // trip a target's circuit at 5 failures within its last 10 outcomes
-	c.CircuitCooldownSec = orDefault(c.CircuitCooldownSec, 60)   // re-probe a down target once a minute
-	c.FanoutStallSec = orDefault(c.FanoutStallSec, 60)           // a target not draining a 1 MiB chunk in 60s is hung, not slow
-	c.DBTimeoutSec = orDefault(c.DBTimeoutSec, 30)               // generous vs any healthy indexed/paged query; bounds a wedged DB
+	c.ManifestEverySec = orDefault(c.ManifestEverySec, 24*60*60)    // daily
+	c.CircuitThreshold = orDefault(c.CircuitThreshold, 5)           // trip a target's circuit at 5 failures within its last 10 outcomes
+	c.CircuitCooldownSec = orDefault(c.CircuitCooldownSec, 60)      // re-probe a down target once a minute
+	c.FanoutStallSec = orDefault(c.FanoutStallSec, 60)              // a target not draining a 1 MiB chunk in 60s is hung, not slow
+	c.DBTimeoutSec = orDefault(c.DBTimeoutSec, defaultDBTimeoutSec) // generous vs any healthy indexed/paged query; bounds a wedged DB
 	for _, d := range []*DBConfig{&c.AlkemioDB, &c.LedgerDB} {
 		if d.Port == 0 {
 			d.Port = 5432
@@ -413,25 +451,18 @@ func (c *Config) ValidateDRLimits() error {
 	return c.LedgerDB.Validate("ledgerDB")
 }
 
-// ValidateDR is ValidateDRLimits PLUS the full target set — for the DR ops that touch EVERY target
-// (audit probes all, reconcile repairs across all).
-func (c *Config) ValidateDR() error {
-	if err := c.ValidateDRLimits(); err != nil {
-		return err
-	}
-	return c.ValidateTargets()
-}
-
 // ValidateTargets validates the target set — each target's fields plus no env-token
 // collisions (two names mapping to one FBS_TARGET_<TOKEN>_* would silently share
 // secrets). Used by restore/verify (which need only a single sink built).
 func (c *Config) ValidateTargets() error {
-	if len(c.Targets) == 0 {
-		return errors.New("at least one target is required")
+	// The set-wide guard (non-empty + no env-namespace collision) has ONE owner — CheckTargetCollisions,
+	// which the single-source DR read path also runs — so the serve path and the DR path can't diverge on
+	// what a valid target SET is; here we additionally validate every target's fields.
+	if err := c.CheckTargetCollisions(); err != nil {
+		return err
 	}
-	seen := make(map[string]string, len(c.Targets))
-	for i, t := range c.Targets {
-		if err := validateTarget(i, t, seen); err != nil {
+	for _, t := range c.Targets {
+		if err := ValidateTargetFields(t); err != nil {
 			return err
 		}
 	}
@@ -439,7 +470,7 @@ func (c *Config) ValidateTargets() error {
 }
 
 // PoolSize returns a pgx pool max-conns of Concurrency + headroom, CLAMPED to a sane
-// range. Both serve (Validate) and the DR subcommands (ValidateDR) run validateLimits,
+// range. Both serve (Validate) and the DR subcommands (ValidateDRLimits) run validateLimits,
 // which rejects Concurrency>1024 — so this clamp is a belt-and-suspenders guard that makes
 // the int32 conversion provably non-overflowing at the call site regardless of validation.
 func (c *Config) PoolSize(headroom int) int32 {
@@ -532,13 +563,6 @@ func (c *Config) validateLimits() error {
 	return nil
 }
 
-func validateTarget(i int, t Target, seen map[string]string) error {
-	if err := validateTargetName(i, t, seen); err != nil {
-		return err
-	}
-	return ValidateTargetFields(t)
-}
-
 // validateTargetName checks a target's NAME + the set-wide env-token collision guard (seen
 // accumulates the tokens seen so far). Split from the field validation so a single-source DR op can
 // run the collision guard over the whole set (a sibling must not have injected the chosen target's
@@ -625,7 +649,7 @@ func SelectReadTarget(targets []Target, from string) (Target, error) {
 	return Target{}, errors.New("no readable (non-WORM) target configured by default — restore/drill needs a target it can read; name a WORM/immutable copy explicitly via --from to attempt an admin-credential read")
 }
 
-// validateS3Target checks the s3-specific required fields (split out of validateTarget to
+// validateS3Target checks the s3-specific required fields (split out of ValidateTargetFields to
 // keep its cyclomatic complexity in budget).
 func validateS3Target(t Target) error {
 	if t.Endpoint == "" || t.Bucket == "" || t.Region == "" {

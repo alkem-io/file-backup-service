@@ -169,7 +169,6 @@ type DrillMetrics struct {
 	reg         *prometheus.Registry
 	pass        prometheus.Gauge
 	lastSuccess prometheus.Gauge
-	passed      bool // whether the recorded run passed — drives the last-success carry-forward
 }
 
 // drillLastSuccessMetric is the last-success gauge name — shared by NewDrillMetrics and the
@@ -198,7 +197,6 @@ func NewDrillMetrics() *DrillMetrics {
 // prior textfile's last-success so a failing run never CLOBBERS the true last-success to 0 (each
 // drill is a separate short-lived process overwriting the same file).
 func (d *DrillMetrics) SetPass(pass bool, at time.Time) {
-	d.passed = pass
 	d.pass.Set(b2f(pass))
 	if pass {
 		d.lastSuccess.Set(float64(at.Unix()))
@@ -207,14 +205,16 @@ func (d *DrillMetrics) SetPass(pass bool, at time.Time) {
 
 // WriteTextfile durably writes the drill registry to path in Prometheus text-exposition format via
 // fsutil.CommitWrite (temp → fsync → rename → parent-dir fsync, so a crash can't leave a torn or
-// non-durable file). On a NON-pass run it first carries forward the PRIOR textfile's last-success
-// timestamp, so a failing/0-checked drill overwriting the file never resets last-success to 0 — the
-// file always carries the true last-success. A "" path is a no-op (the exit code carries the signal).
-func (d *DrillMetrics) WriteTextfile(path string) error {
+// non-durable file). On a NON-pass run (`passed` false) it first carries forward the PRIOR textfile's
+// last-success timestamp, so a failing/0-checked drill overwriting the file never resets last-success to
+// 0 — the file always carries the true last-success. `passed` is a PARAMETER (not stashed state) so
+// there is no SetPass-before-WriteTextfile temporal coupling. A "" path is a no-op (the exit code
+// carries the signal).
+func (d *DrillMetrics) WriteTextfile(path string, passed bool) error {
 	if path == "" {
 		return nil
 	}
-	if !d.passed {
+	if !passed {
 		if prior := readPriorLastSuccess(path); prior > 0 {
 			d.lastSuccess.Set(prior)
 		}

@@ -23,10 +23,18 @@ import (
 // ledger migrations that sqlc's schema points at — so sqlc has no schema to type it. The
 // column-covering Probe is the compensating control (a server-side schema drift fails at
 // startup, not mid-backfill).
-type FileRepo struct{ p PgxDB }
+type FileRepo struct {
+	p PgxDB
+	readBounded
+}
 
 // NewFileRepo binds a FileRepo to the alkemio pool.
 func NewFileRepo(p PgxDB) *FileRepo { return &FileRepo{p: p} }
+
+// WithReadTimeout sets the client-side per-read bound (boundRead) to match the pool's server-side
+// statement_timeout (the operator's cfg.DBTimeout()). Returns the repo for chaining. Unset →
+// defaultDBReadTimeout. See LedgerRepo.WithReadTimeout / the shared readBounded.
+func (r *FileRepo) WithReadTimeout(d time.Duration) *FileRepo { r.setReadTimeout(d); return r }
 
 // EachFile invokes fn for every non-temporary file (the backfill work-list), ordered by
 // id for a stable, resumable pass. It KEYSET-PAGES the `file` table (id > after ORDER BY
@@ -59,6 +67,10 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 	const q = `SELECT id, "externalID", "createdBy", "createdDate", COALESCE(size,0)
 	FROM file WHERE "temporaryLocation" IS NOT TRUE AND "externalID" IS NOT NULL AND "externalID" <> ''
 	  AND id > $1 ORDER BY id LIMIT $2`
+	// Client-side per-read bound (boundRead): a black-holed Alkemio-DB connection can't hang backfill's
+	// enumeration — the same self-bounding every adapter read does.
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
 	rows, err := r.p.Query(ctx, q, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("files page: %w", err)
@@ -83,11 +95,14 @@ func (r *FileRepo) filesPage(ctx context.Context, after uuid.UUID, limit int) ([
 // we conservatively over-refuse (a metadata-only edit that bumped updatedDate) rather than ever risk
 // a silent wrong-version restore. A NULL updatedDate is returned as a ZERO versionTime so the caller
 // FAILS LOUD (directs to a DB PITR + --hash). found=false when no such file row (or a NULL/empty
-// externalID — a not-yet-stored file has no backup key); versionTime is still returned so the caller
-// can distinguish "NULL updatedDate" from "row absent". The `file` table holds only the CURRENT
+// externalID — a not-yet-stored file has no backup key); on found=false versionTime is the zero value
+// (the sole caller, resolveCurrentHash, reads versionTime only on the found path). The `file` table holds only the CURRENT
 // version (no history) — see contracts/restore-and-ops.md. Hand-written pgx (§IV waiver: `file` is
-// the foreign, server-owned table; Probe covers the columns).
+// the foreign, server-owned table; ProbeCurrentVersion covers these columns). Self-bounded (boundRead)
+// so a black-holed alkemio-DB connection can't hang the DR hash resolution.
 func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID string, versionTime time.Time, found bool, err error) {
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
 	const q = `SELECT "externalID", "updatedDate" FROM file WHERE id = $1`
 	var ext pgtype.Text
 	var vt pgtype.Timestamptz
@@ -98,21 +113,43 @@ func (r *FileRepo) FileByID(ctx context.Context, id uuid.UUID) (externalID strin
 		return "", time.Time{}, false, fmt.Errorf("file by id: %w", serr)
 	}
 	if !ext.Valid || ext.String == "" {
-		return "", nullTime(vt), false, nil // a file with no content hash yet has no backup to restore
+		return "", time.Time{}, false, nil // a file with no content hash yet has no backup to restore
 	}
 	return ext.String, nullTime(vt), true, nil
 }
 
-// Probe verifies the `file` table is readable via the scoped role AND has every column the repo
-// reads — EachFile's id/externalID/createdBy/createdDate/size/temporaryLocation AND FileByID's
-// "updatedDate" (the `restore current --at` guard) — so a missing SELECT grant OR a server-side
-// schema/column drift fails LOUD up front, not mid-pass/mid-DR when a Scan hits a renamed column
-// (mirrors OutboxRepo.Probe).
+// Probe verifies the `file` corpus is readable via the scoped role AND has every column BACKFILL reads
+// (EachFile's id/externalID/createdBy/createdDate/size/temporaryLocation) — so a missing SELECT grant
+// OR a server-side schema/column drift fails LOUD up front, not mid-pass when a Scan hits a renamed
+// column (mirrors OutboxRepo.Probe). It deliberately does NOT probe "updatedDate": that column is read
+// only by `restore current` (FileByID), so gating BACKFILL on it would break backfill under a
+// least-privilege, column-scoped SELECT grant that omits updatedDate. Restore-current preflights it
+// separately via ProbeCurrentVersion.
 func (r *FileRepo) Probe(ctx context.Context) error {
-	const q = `SELECT id, "externalID", "createdBy", "createdDate", "updatedDate", size, "temporaryLocation"
-	FROM file LIMIT 1`
+	return r.probeColumns(ctx,
+		`SELECT id, "externalID", "createdBy", "createdDate", size, "temporaryLocation" FROM file LIMIT 1`,
+		"file table not readable (scoped role SELECT grant / schema drift on file?)")
+}
+
+// ProbeCurrentVersion verifies the columns FileByID reads for `restore current` (id/externalID/
+// updatedDate) are readable via the scoped role, so a missing updatedDate grant or a schema drift fails
+// LOUD up front rather than mid-DR on FileByID's Scan. Separate from Probe so restore-current's
+// updatedDate need does not gate backfill (which never reads it).
+func (r *FileRepo) ProbeCurrentVersion(ctx context.Context) error {
+	return r.probeColumns(ctx,
+		`SELECT id, "externalID", "updatedDate" FROM file LIMIT 1`,
+		"file table not readable for restore-current (scoped role SELECT grant on updatedDate / schema drift?)")
+}
+
+// probeColumns runs a column-covering LIMIT 1 SELECT under the client-side read bound — the ONE owner of
+// the boundRead+Exec+wrap skeleton for the FileRepo probes, so a future column-probe can't copy-paste the
+// prelude and silently OMIT the boundRead wrap (re-opening the unbounded read a black-holed alkemio-DB
+// connection could hang at startup). q is the covering SELECT; msg labels the loud failure.
+func (r *FileRepo) probeColumns(ctx context.Context, q, msg string) error {
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
 	if _, err := r.p.Exec(ctx, q); err != nil {
-		return fmt.Errorf("file table not readable (scoped role SELECT grant / schema drift on file?): %w", err)
+		return fmt.Errorf("%s: %w", msg, err)
 	}
 	return nil
 }

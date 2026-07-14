@@ -55,6 +55,46 @@ func TestRestoreAllVerdict(t *testing.T) {
 	}
 }
 
+// TestBackfillVerdict (Alt#2): a GENUINE failure that coincides with a mid-corpus SIGTERM must return a
+// NON-Canceled error so the dispatch's onShutdownOK CANNOT rescue it to exit 0 — the false-NEGATIVE twin
+// of the round-9 drain-window false-positive. A pure cancel (no failures) returns Canceled for
+// onShutdownOK to map to exit 0 (resumable); a benign tail-drain cancel is in Cancelled, not Failed.
+func TestBackfillVerdict(t *testing.T) {
+	// genuine failure + a coincident mid-corpus SIGTERM → must NOT be Canceled (else onShutdownOK masks it).
+	if err := backfillVerdict(domain.BackfillStats{Failed: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a genuine failure coinciding with a SIGTERM must return a non-Canceled error (onShutdownOK must not mask it), got %v", err)
+	}
+	// pure cancel (no failures, benign tail-drain in Cancelled) → Canceled passes through for onShutdownOK.
+	if err := backfillVerdict(domain.BackfillStats{Backed: 5, Cancelled: 3}, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a pure cancel must pass Canceled through for onShutdownOK → exit 0, got %v", err)
+	}
+	// a real sweep/DB error (not a cancel) → surfaced.
+	if err := backfillVerdict(domain.BackfillStats{}, errors.New("corpus enum failed")); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a real sweep error must surface, got %v", err)
+	}
+	// clean pass → nil.
+	if err := backfillVerdict(domain.BackfillStats{Backed: 5}, nil); err != nil {
+		t.Fatalf("a clean pass must be nil, got %v", err)
+	}
+}
+
+// TestReconcileVerdict (Alt#2): same policy — a genuine failure OR a Skipped (on NO target) coinciding
+// with a SIGTERM must not be masked to exit 0; a pure cancel passes Canceled through.
+func TestReconcileVerdict(t *testing.T) {
+	if err := reconcileVerdict(domain.ReconcileStats{Failed: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a genuine reconcile failure coinciding with a SIGTERM must not be masked, got %v", err)
+	}
+	if err := reconcileVerdict(domain.ReconcileStats{Skipped: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a Skipped (object on NO target) coinciding with a SIGTERM must not be masked, got %v", err)
+	}
+	if err := reconcileVerdict(domain.ReconcileStats{Repaired: 5, Cancelled: 2}, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a pure cancel must pass Canceled through, got %v", err)
+	}
+	if err := reconcileVerdict(domain.ReconcileStats{Repaired: 5}, nil); err != nil {
+		t.Fatalf("a clean pass must be nil, got %v", err)
+	}
+}
+
 // TestSelectReadTarget (Pillar 4b): the default source SKIPS WORM (write-only) targets; an EXPLICIT
 // WORM --from is now ALLOWED (restoring from the sole surviving immutable copy must not be refused);
 // an all-WORM config has no default readable source; an unknown --from is not-found.
@@ -116,6 +156,62 @@ func TestBuildReadSourceWormAnnotatesFetch(t *testing.T) {
 		t.Fatalf("worm source read mismatch: %q", got)
 	}
 }
+
+// TestBuildReadSourceWormWithAuditCredNotWrapped (vanilla8 E1): a worm source that HAS an audit
+// credential is READ-CAPABLE (readClient uses the audit cred), so buildReadSource must NOT wrap it in
+// the write-only credential-hint wrapper — a read failure there is transient/real, and the "supply a
+// read-capable credential" hint would misdirect. Only a write-only (no-audit-cred) worm is wrapped.
+func TestBuildReadSourceWormWithAuditCredNotWrapped(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeConfig(t, dir,
+		"targets:\n  - name: offsite\n    type: s3\n    worm: true\n    insecure: true\n"+
+			"    endpoint: 127.0.0.1:9000\n    bucket: bkt\n    region: us-east-1\n"+
+			"    accessKey: AK\n    secretKey: SK\n    auditAccessKey: AAK\n    auditSecretKey: ASK\n")
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	src, name, err := buildReadSource(cfg, "offsite")
+	if err != nil || name != "offsite" {
+		t.Fatalf("an s3 worm --from with an audit cred must build, got %q err=%v", name, err)
+	}
+	if _, wrapped := src.(wormReadSource); wrapped {
+		t.Fatal("a read-capable (audit-cred) worm source must NOT be wrapped in the write-only credential-hint wrapper")
+	}
+}
+
+// TestWormReadSourceAnnotatesLazyReadError (E1): the s3 sink's GetObject is LAZY — its 403 surfaces on
+// the first Read, not from Fetch — so wormReadSource must annotate a READ-TIME failure too, not only an
+// eager Fetch error. A filesystem sink can't exercise this (os.Open fails eagerly), so use a sink whose
+// Fetch succeeds but whose reader errors on Read (the real off-site WORM/s3 shape).
+func TestWormReadSourceAnnotatesLazyReadError(t *testing.T) {
+	w := wormReadSource{Sink: lazyFetchSink{name: "offsite"}}
+	rc, err := w.Fetch(context.Background(), sha3hex([]byte("x")))
+	if err != nil {
+		t.Fatalf("Fetch must not error for a lazy sink (the READ does), got %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	if _, rerr := io.ReadAll(rc); rerr == nil || !strings.Contains(rerr.Error(), "WORM/write-only") {
+		t.Fatalf("a lazy (read-time) WORM read failure must carry the recovery hint, got %v", rerr)
+	}
+}
+
+// lazyFetchSink models the s3 sink's lazy GetObject: Fetch returns a reader with no error; the (403)
+// failure surfaces on the first Read. Name() is provided (wormReadSource.annotate reads the promoted
+// Sink.Name()).
+type lazyFetchSink struct {
+	domain.Sink
+	name string
+}
+
+func (s lazyFetchSink) Name() string { return s.name }
+func (lazyFetchSink) Fetch(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(errReader{}), nil
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("AccessDenied") }
 
 // ---- restore sub-verb dispatch (no DB) ------------------------------------
 
@@ -241,7 +337,7 @@ func TestRunRestoreVersionHashDefaultsToFirstTarget(t *testing.T) {
 }
 
 // ---- config-error paths of the ledger-backed restore/drill subcommands ----
-// Each fails on ValidateDR (fsConfig has no ledgerDB) BEFORE opening a pool.
+// Each fails on ValidateDRLimits (fsConfig has no ledgerDB) BEFORE opening a pool.
 
 // TestDrillReportInterruptedPreservesTextfile (re-review item 4): an INTERRUPTED drill (derr is a
 // ctx cancellation) must write NO gauges — it must not clobber the prior textfile's pass=1 with a red
@@ -252,7 +348,7 @@ func TestDrillReportInterruptedPreservesTextfile(t *testing.T) {
 	// A prior FULL PASS writes the file (a separate short-lived drill process).
 	pass := metrics.NewDrillMetrics()
 	pass.SetPass(true, time.Unix(1_700_000_000, 0))
-	if err := pass.WriteTextfile(path); err != nil {
+	if err := pass.WriteTextfile(path, true); err != nil {
 		t.Fatalf("seed pass textfile: %v", err)
 	}
 	// An interrupted run (a partial outcome + a ctx-cancellation error) must leave the file untouched.
@@ -286,17 +382,52 @@ func TestDrillReportPassWritesGauges(t *testing.T) {
 	}
 }
 
-// TestRunRestoreVersionVerbRenamed: the old `restore version` verb errors loud pointing at
-// `restore current` (Pillar 7), rather than silently falling through to the bare-hash alias.
-func TestRunRestoreVersionVerbRenamed(t *testing.T) {
+// TestDrillReportZeroSampledWritesRedButKeepsLastSuccess pins the 0-sampled policy (CodeRabbit PR#4
+// raised moving the 0-sampled guard BEFORE the metrics write — that would be a FAIL-OPEN regression):
+// a drill that sampled 0 objects PROVED NOTHING (renamed/misconfigured target, or an empty/wrong
+// ledger), so it MUST write pass=0 and exit nonzero — leaving the textfile untouched would keep the
+// PRIOR pass=1 and show a STALE GREEN gauge while the drill is actually broken. It must NOT, however,
+// clobber `last_success`: SetPass only stamps last_success on a PASS, and WriteTextfile carries the
+// prior file's value forward on a non-pass — so the "when did a drill last actually succeed" signal
+// survives a red run.
+func TestDrillReportZeroSampledWritesRedButKeepsLastSuccess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drill.prom")
+	// A prior HEALTHY drill writes pass=1 + a real last_success.
+	prior := metrics.NewDrillMetrics()
+	prior.SetPass(true, time.Unix(1_700_000_000, 0))
+	if err := prior.WriteTextfile(path, true); err != nil {
+		t.Fatalf("seed the passing textfile: %v", err)
+	}
+	// Now a 0-sampled drill (nothing to drill) — a distinct FAILURE.
+	err := drillReport(domain.DrillOutcome{Target: "t"}, nil, path, "t")
+	if err == nil || !strings.Contains(err.Error(), "sampled 0 objects") {
+		t.Fatalf("a 0-sampled drill must fail loud (it proved nothing), got %v", err)
+	}
+	b, _ := os.ReadFile(path) //nolint:gosec // test temp path
+	if !strings.Contains(string(b), "filebackup_restore_drill_pass 0") {
+		t.Fatalf("a 0-sampled drill must write pass=0 — NOT leave a stale green gauge:\n%s", b)
+	}
+	if !strings.Contains(string(b), "filebackup_drill_last_success_timestamp_seconds 1.7e+09") {
+		t.Fatalf("a red run must CARRY FORWARD the prior last_success, never clobber it to 0:\n%s", b)
+	}
+}
+
+// TestRunRestoreUnknownSubcommand: a non-flag first arg that isn't a known verb (e.g. the pre-release
+// `version`, or a typo) errors loud as an unknown subcommand — rather than silently falling through to
+// the bare-hash alias and doing a surprising object restore. A bare `--hash` (a flag) still falls
+// through to the alias.
+func TestRunRestoreUnknownSubcommand(t *testing.T) {
 	err := runRestore([]string{"version", "--file-id", "x", "--at", "y"})
-	if err == nil || !strings.Contains(err.Error(), "renamed to `restore current`") {
-		t.Fatalf("`restore version` must error pointing at `restore current`, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unknown restore subcommand") {
+		t.Fatalf("`restore version` must error as an unknown subcommand, got %v", err)
+	}
+	if err := runRestore([]string{"bogus"}); err == nil || !strings.Contains(err.Error(), "unknown restore subcommand") {
+		t.Fatalf("an unknown verb must error, got %v", err)
 	}
 }
 
 func TestRunRestoreAllInvalidConfig(t *testing.T) {
-	// fsConfig has a target but no ledgerDB → ledgerJob's ValidateDR fails before any pool opens.
+	// fsConfig has a target but no ledgerDB → ledgerJob's ValidateDRLimits fails before any pool opens.
 	if err := runRestoreAll([]string{"--config", fsConfig(t, t.TempDir())}); err == nil ||
 		!strings.Contains(err.Error(), "invalid config") {
 		t.Fatalf("restore all without a ledgerDB must fail with an invalid-config error, got %v", err)

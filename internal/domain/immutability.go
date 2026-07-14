@@ -2,15 +2,18 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 )
 
 // immutabilityChecker is an OPTIONAL sink capability (only the s3 sink implements it) for the
 // WORM drift-check (T032/FR-014): report whether the target bucket still enforces object-lock
-// and versioning. It is defined structurally over plain types so the s3 adapter satisfies it
-// WITHOUT importing domain (the sinks stay infrastructure-pure). A read-denying (PutObject-only)
-// credential errors here — that is EXPECTED and surfaces as Unverifiable, never as drift.
+// and versioning. It is defined structurally over plain types (unexported here, so a sink satisfies it
+// by shape, not by naming it) — this keeps DOMAIN from importing the sink packages, the load-bearing
+// hexagonal direction. (The s3 sink does import domain, for the shared ErrReadDenied sentinel — a
+// legitimate adapter→core dependency; the structural interfaces are what keep the reverse edge out.) A
+// read-denying (PutObject-only) credential errors here — EXPECTED, surfaces as Unverifiable, never drift.
 type immutabilityChecker interface {
 	CheckImmutability(ctx context.Context) (objectLock, versioning bool, err error)
 }
@@ -28,8 +31,9 @@ type immutabilityReadable interface {
 // inventoryReader is an OPTIONAL sink capability (s3 + filesystem) for the audit target→ledger
 // direction (T032/FR-025): return the target's most-recent manifest snapshot — its OWN declared
 // inventory — so audit can diff it against the ledger without a full physical object List (which
-// a WORM/PutObject-only target can't do). Structural (plain types) so the adapters don't import
-// domain. A read-denying target's read errors → the target is reported Unverifiable, not failed.
+// a WORM/PutObject-only target can't do). Structural (unexported plain-type interface) so DOMAIN never
+// imports the sink packages (the reverse edge is the one that matters). A read-denying target's read
+// errors → the target is reported Unverifiable, not failed.
 type inventoryReader interface {
 	LatestManifest(ctx context.Context) (io.ReadCloser, error)
 }
@@ -43,6 +47,9 @@ type inventoryReader interface {
 //   - a read-denying credential / transient error / timeout → Unverifiable (the target SHOULD be
 //     readable but wasn't this pass — the gauge drops stale-green and raises a distinct signal);
 //   - object-lock AND versioning both enabled → Verified; either disabled → Drift.
+//
+// Cancellation contract: a parent-ctx SIGTERM yields NoData (benign), not an error — the caller MUST
+// fold ctx.Err() to fail an interrupted run (see Audit's CANCELLATION CONTRACT + runAudit).
 func CheckImmutability(ctx context.Context, targets []Target) VerdictReport {
 	worm := make([]Target, 0, len(targets))
 	for _, t := range targets {
@@ -61,18 +68,35 @@ func immutabilityProbe(pctx context.Context, t Target) TargetVerdict {
 	if !ok {
 		return TargetVerdict{Status: StatusNoData, Detail: "target type cannot report object-lock (not an S3 target)"}
 	}
-	// A WORM target WITHOUT a read/audit credential can't be checked by the worker's write-only
-	// credential — the drift-check is legitimately N/A → NoData (silent), never a false pass and never
-	// a false alert. Its immutability is asserted by object-lock + the audit + never_verified.
-	if r, ok := t.Sink.(immutabilityReadable); ok && !r.ImmutabilityReadable() {
+	// This is the ONLY audit direction that short-circuits a no-audit-credential WORM target to NoData
+	// (the existence + inventory directions probe such a target via the worker credential, since object
+	// reads work on an object-lock bucket). The drift-check reads GetObjectLockConfig / GetBucketVersioning
+	// — BUCKET-config reads that a PutObject-only worker credential can't do AND that even a read-capable
+	// OBJECT credential typically lacks the permission for — so without the dedicated audit credential the
+	// check is legitimately N/A → NoData (silent), never a false pass and never a false alert (and, unlike
+	// existence/inventory, the serve immutability sampler treats an Unverifiable here as ALERTABLE, so a
+	// by-design write-only copy must land on NoData, not Unverifiable, to avoid a continuous false page).
+	// Its immutability is asserted by object-lock + the audit (with a read cred) + never_verified.
+	if targetUnverifiableExempt(t) {
 		return TargetVerdict{Status: StatusNoData, Detail: "no audit/read credential — immutability asserted by object-lock + never_verified"}
 	}
 	lock, versioning, err := ic.CheckImmutability(pctx)
 	if err != nil {
-		// A read-denying WORM credential (403), or any inability to READ the config, is Unverifiable
-		// by design — NOT drift: the immutable off-site copy's write-only credential legitimately
-		// can't read its own config, and a normally-readable target that suddenly can't be read is a
-		// broken read path, not a lock that was removed.
+		// A parent SIGTERM propagates through pctx as context.Canceled (the per-target auditProbeTimeout
+		// fires as DeadlineExceeded instead), so a prompt Canceled return here is a benign SHUTDOWN →
+		// NoData — matching the existence + inventory directions (classifyAuditErr / classifyInventoryErr
+		// both lead with cancelledInFlight). Without this, a graceful-shutdown SIGTERM landing mid-pass
+		// would return Unverifiable and make serve's ImmutabilitySampler raise the ALERTABLE
+		// filebackup_immutability_unverifiable series for a HEALTHY WORM target on every deploy. (The
+		// probeTargets abandon path already demotes a parent-cancel to NoData; this handles the prompt
+		// return that returns before abandonment.)
+		if cancelledInFlight(pctx, err) {
+			return shutdownVerdict(err)
+		}
+		// A read-denying WORM credential (403), a per-target DEADLINE (a wedged config read), or any other
+		// inability to READ the config, is Unverifiable by design — NOT drift: the immutable off-site
+		// copy's write-only credential legitimately can't read its own config, and a normally-readable
+		// target that suddenly can't be read is a broken read path, not a lock that was removed.
 		return TargetVerdict{Status: StatusUnverifiable, Detail: fmt.Sprintf("unverifiable (read-denying credential or transient error): %v", err)}
 	}
 	if lock && versioning {
@@ -127,11 +151,15 @@ func NewImmutabilitySampler(targets []Target, gauge ImmutabilityGauge) *Immutabi
 //     read failed this pass (a transient error, a wedged endpoint, a driver panic) — a genuinely
 //     unexpected fault that should alert, so the _ok series is dropped without going silent.
 //
-// It never returns an error for an unverifiable target; a genuine drift is surfaced via the gauge (0).
+// A transient/read-deny Unverifiable returns NO error (the gauge carries it); a Fault (a recovered
+// driver panic — a code bug on OUR side) is ALSO returned so the serve loop LOGS it distinctly rather
+// than flattening it into the same silent gauge flip as a benign read blip. A genuine drift is
+// surfaced via the gauge (0), never a returned error.
 func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	var faults []error
 	for _, v := range CheckImmutability(ctx, s.targets).Targets {
 		switch v.Status {
 		case StatusVerified:
@@ -146,7 +174,12 @@ func (s *ImmutabilitySampler) Sample(ctx context.Context) error {
 		default: // Unverifiable / Fault on a READ-CAPABLE target — drop stale-green AND alert
 			s.gauge.ClearImmutabilityOK(v.Target)
 			s.gauge.SetImmutabilityUnverifiable(v.Target, true)
+			// A Fault carries a recovered driver panic in Err — a code bug, not a benign read blip:
+			// surface it so it is LOGGED distinctly, while the gauge above still pages either way.
+			if v.Status == StatusFault && v.Err != nil {
+				faults = append(faults, v.Err)
+			}
 		}
 	}
-	return nil
+	return errors.Join(faults...)
 }

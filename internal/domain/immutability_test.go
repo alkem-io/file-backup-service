@@ -20,6 +20,11 @@ func (s *immSink) CheckImmutability(context.Context) (bool, bool, error) {
 	return s.lock, s.versioning, s.err
 }
 
+// ImmutabilityReadable: immSink models a READ-CAPABLE target (it HAS an audit/read credential and can
+// report object-lock/versioning), so an Unverifiable on it is a genuine anomaly that FAILS — NOT the
+// exempt by-design write-only case (that is noAuditCredSink, ImmutabilityReadable()==false).
+func (s *immSink) ImmutabilityReadable() bool { return true }
+
 // noAuditCredSink is a WORM s3-like target WITHOUT an audit/read credential (ImmutabilityReadable() ==
 // false — the standard immutable prod config, a PutObject-only worker credential). Its drift-check is
 // N/A → NoData (silent), so it never false-passes AND never false-alerts.
@@ -62,17 +67,44 @@ func TestCheckImmutabilityOKAndDrift(t *testing.T) {
 	}
 }
 
-func TestCheckImmutabilityReadDenyingIsUnverifiable(t *testing.T) {
-	// A read-denying (PutObject-only) WORM credential 403s the config GET — Unverifiable (NOT drift,
-	// NOT structural NoData), and being worm it does NOT fail the audit.
+func TestCheckImmutabilityReadCapableErrorFails(t *testing.T) {
+	// A READ-CAPABLE WORM target (it HAS an audit/read credential — ImmutabilityReadable()==true) whose
+	// config GET errors is Unverifiable AND FAILS: it should have been readable, so a read failure is a
+	// genuine anomaly (a credential rotated to write-only, a wedged endpoint). This is what aligns the
+	// audit CLI with the serve immutability sampler's alert. (A by-design write-only WORM copy is NoData
+	// instead — TestCheckImmutabilityNoAuditCredIsNoData.)
 	rep := CheckImmutability(context.Background(), []Target{
 		wormTarget(&immSink{stubSink: stubSink{name: "worm403"}, err: errors.New("AccessDenied")}),
 	})
-	if v := rep.Targets[0]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("a read-denying WORM target must be Unverifiable and not fail: %+v", v)
+	if v := rep.Targets[0]; v.Status != StatusUnverifiable || !v.Failed() {
+		t.Fatalf("a read-capable WORM target that errors must be Unverifiable and FAIL: %+v", v)
 	}
-	if err := rep.FailErr(); err != nil {
-		t.Fatalf("an unverifiable worm target must not fail the verdict, got %v", err)
+	if err := rep.FailErr(); err == nil {
+		t.Fatal("a read-capable unverifiable worm target must fail the verdict")
+	}
+}
+
+// ctxErrImmSink is a READ-CAPABLE WORM sink whose CheckImmutability returns the ctx's error — models a
+// config read interrupted by a parent SIGTERM (a prompt context.Canceled return, before probeTargets'
+// abandon path fires).
+type ctxErrImmSink struct{ stubSink }
+
+func (ctxErrImmSink) CheckImmutability(ctx context.Context) (bool, bool, error) {
+	return false, false, ctx.Err()
+}
+func (ctxErrImmSink) ImmutabilityReadable() bool { return true }
+
+// TestImmutabilityProbeCancelIsNoData (Alt#1): a parent SIGTERM that surfaces as a prompt context.Canceled
+// from CheckImmutability must be benign NoData — matching the existence + inventory directions — NOT a
+// spurious Unverifiable that serve's ImmutabilitySampler would raise the alertable
+// filebackup_immutability_unverifiable series for on a HEALTHY WORM target during graceful shutdown. (A
+// genuine 403/transient error with the parent LIVE stays Unverifiable — TestCheckImmutabilityReadCapableErrorFails.)
+func TestImmutabilityProbeCancelIsNoData(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the parent SIGTERM; CheckImmutability returns ctx.Err() = Canceled
+	v := immutabilityProbe(ctx, wormTarget(ctxErrImmSink{stubSink{name: "w"}}))
+	if v.Status != StatusNoData || v.Failed() {
+		t.Fatalf("a parent-cancel during the immutability check must be benign NoData, not a spurious Unverifiable: %+v", v)
 	}
 }
 
@@ -218,4 +250,27 @@ type hangingImmSink struct {
 func (h *hangingImmSink) CheckImmutability(context.Context) (bool, bool, error) {
 	<-h.release
 	return false, false, errors.New("released")
+}
+
+// panicImmSink panics inside CheckImmutability — a driver bug that probeTargets recovers into a Fault.
+type panicImmSink struct{ stubSink }
+
+func (panicImmSink) CheckImmutability(context.Context) (bool, bool, error) {
+	panic("boom in drift-check")
+}
+func (panicImmSink) ImmutabilityReadable() bool { return true }
+
+// TestImmutabilitySamplerFaultReturnsError: a Fault (a recovered driver panic in the drift-check) is
+// surfaced as a RETURNED error so the serve loop logs it distinctly — while the gauge still drops
+// stale-green AND raises the unverifiable signal (it pages either way). A plain Unverifiable returns no
+// error (see TestImmutabilitySamplerPolicy's readfail case).
+func TestImmutabilitySamplerFaultReturnsError(t *testing.T) {
+	g := newFakeImmGauge()
+	s := NewImmutabilitySampler([]Target{wormTarget(panicImmSink{stubSink{name: "boom"}})}, g)
+	if err := s.Sample(context.Background()); err == nil {
+		t.Fatal("a Fault (recovered panic) must be returned so it is logged distinctly")
+	}
+	if !g.cleared["boom"] || !g.unverif["boom"] {
+		t.Fatalf("a Fault must still drop _ok AND raise the unverifiable signal, cleared=%v unverif=%v", g.cleared["boom"], g.unverif["boom"])
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -21,13 +22,15 @@ type wormStub struct {
 	lockStatus       int    // HTTP status for GET ?object-lock (200 or 403)
 	lockErrCode      string // on a 404 lockStatus, the S3 <Code> to emit (default ObjectLockConfigurationNotFoundError)
 	lockEnabled      bool   // ObjectLockEnabled value in the 200 body
+	lockNoRule       bool   // if set, an Enabled config with NO default retention Rule (drift — objects get no retention)
 	versioningStatus string // Status in the versioning body ("Enabled"/"Suspended")
 	versioningErr    int    // non-zero HTTP status to fail the versioning GET
 	listErr          int    // non-zero HTTP status to fail the list-objects call
 	listKeys         []string
 	manifest         []byte
-	pointerName      string // if set, GET of _manifest/LATEST returns this (the pointer fast-path)
-	getFail          bool   // fail the object GET (the manifest fetch)
+	pointerName      string      // if set, GET of _manifest/LATEST returns this (the pointer fast-path)
+	getFail          bool        // fail the object GET (the manifest fetch)
+	bucketGone       atomic.Bool // if set, a bucket-level HEAD (BucketExists) returns 404 (gone bucket); atomic so a test can flip it mid-run (a handler goroutine reads it)
 }
 
 // serveList renders the list-objects XML, honoring the bounded StartAfter (exclusive) query param.
@@ -55,7 +58,14 @@ func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
 		if s.lockEnabled {
 			lock = "Enabled"
 		}
-		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled></ObjectLockConfiguration>`, lock)
+		// A real WORM bucket carries a DEFAULT retention Rule (mode+period); the sink treats Enabled
+		// WITHOUT a Rule as drift (objects get no retention). Emit the Rule unless lockNoRule exercises
+		// that drift case.
+		rule := `<Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>30</Days></DefaultRetention></Rule>`
+		if s.lockNoRule {
+			rule = ""
+		}
+		_, _ = fmt.Fprintf(w, `<ObjectLockConfiguration><ObjectLockEnabled>%s</ObjectLockEnabled>%s</ObjectLockConfiguration>`, lock, rule)
 	case http.StatusNotFound:
 		// A 404 — but the CODE decides the meaning. Only ObjectLockConfigurationNotFoundError is the
 		// definitive DRIFT signal (a WORM bucket that lost its lock config); any OTHER 404 code (e.g.
@@ -72,6 +82,31 @@ func (s *wormStub) serveObjectLock(w http.ResponseWriter) {
 	}
 }
 
+// serveHead answers a HEAD: a bucket-level HEAD (path "bkt"/"bkt/") is BucketExists; anything deeper is
+// a StatObject (LatestManifest's EAGER obj.Stat()).
+func (s *wormStub) serveHead(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimPrefix(r.URL.Path, "/")
+	parts := strings.SplitN(p, "/", 2)
+	if len(parts) < 2 || parts[1] == "" { // bucket-level HEAD → BucketExists
+		if s.bucketGone.Load() {
+			w.WriteHeader(http.StatusNotFound) // gone bucket → confirmBucket surfaces an error (Unverifiable)
+			return
+		}
+		w.WriteHeader(http.StatusOK) // bucket present
+		return
+	}
+	if s.getFail {
+		w.WriteHeader(http.StatusForbidden) // a read-deny surfaces at the eager stat → unverifiable
+		return
+	}
+	// StatObject parses Last-Modified (a missing one errors) + Content-Length into ObjectInfo.
+	w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", `"manifest-etag"`)
+	w.Header().Set("Content-Length", strconv.Itoa(len(s.manifest)))
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	switch {
@@ -85,17 +120,8 @@ func (s *wormStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `<VersioningConfiguration><Status>%s</Status></VersioningConfiguration>`, s.versioningStatus)
 	case r.Method == http.MethodGet && q.Has("list-type"):
 		s.serveList(w, q.Get("start-after"))
-	case r.Method == http.MethodHead: // object HEAD = StatObject — LatestManifest's EAGER obj.Stat()
-		if s.getFail {
-			w.WriteHeader(http.StatusForbidden) // a read-deny surfaces at the eager stat → unverifiable
-			return
-		}
-		// StatObject parses Last-Modified (a missing one errors) + Content-Length into ObjectInfo.
-		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("ETag", `"manifest-etag"`)
-		w.Header().Set("Content-Length", strconv.Itoa(len(s.manifest)))
-		w.WriteHeader(http.StatusOK)
+	case r.Method == http.MethodHead:
+		s.serveHead(w, r)
 	case r.Method == http.MethodGet: // object GET
 		if s.getFail {
 			w.WriteHeader(http.StatusForbidden)
@@ -164,6 +190,20 @@ func TestCheckImmutabilityEnabled(t *testing.T) {
 	}
 	if !lock || !ver {
 		t.Fatalf("want object-lock + versioning enabled, got lock=%v versioning=%v", lock, ver)
+	}
+}
+
+func TestCheckImmutabilityEnabledNoRetentionRuleIsDrift(t *testing.T) {
+	// Object-lock Enabled but with NO default retention Rule: the worker PUTs with no per-object
+	// retention header, so new objects get NO retention (deletable) — the WORM guarantee is lost even
+	// though the Enabled flag is on. Must read as drift (lock=false), not Verified.
+	sink := newWormSink(t, &wormStub{lockStatus: http.StatusOK, lockEnabled: true, lockNoRule: true, versioningStatus: "Enabled"})
+	lock, _, err := sink.CheckImmutability(context.Background())
+	if err != nil {
+		t.Fatalf("CheckImmutability: %v", err)
+	}
+	if lock {
+		t.Fatal("object-lock Enabled with no default retention rule must read as drift (lock=false), got lock=true")
 	}
 }
 
@@ -291,6 +331,24 @@ func TestLatestManifestNoneIsNotExist(t *testing.T) {
 	}
 }
 
+// TestLatestManifestUncachedBucketCatchesVanish (Alt#1): the inventory direction must catch a vanished
+// bucket as an ERROR (→ Unverifiable) even after the existence sweep cached the bucket PRESENT — it
+// re-checks the bucket UNCACHED. With the old cached confirmBucket this masked the vanished bucket as
+// os.ErrNotExist → NoData ("no manifest, lost nothing"), diverging from the filesystem sink.
+func TestLatestManifestUncachedBucketCatchesVanish(t *testing.T) {
+	stub := &wormStub{} // bucket present initially
+	sink := newWormSink(t, stub)
+	// Prime confirmBucket's PRESENT cache, exactly as a prior existence sweep on the shared *Sink would.
+	if err := sink.confirmBucket(context.Background()); err != nil {
+		t.Fatalf("prime confirmBucket present: %v", err)
+	}
+	stub.bucketGone.Store(true) // the bucket vanishes AFTER present was cached
+	_, err := sink.LatestManifest(context.Background())
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("LatestManifest must re-check the bucket UNCACHED and surface a vanished bucket as a non-ErrNotExist error (Unverifiable), got %v", err)
+	}
+}
+
 // TestLatestManifestPointerCurrentUsed: the pointer fast-path reads _manifest/LATEST, then a BOUNDED
 // StartAfter=<pointer> list confirms NOTHING newer exists (C1 staleness check), so the pointer's
 // manifest is used (no full scan of the whole prefix).
@@ -319,5 +377,22 @@ func TestLatestManifestListErrorPropagates(t *testing.T) {
 	_, err := sink.LatestManifest(context.Background())
 	if err == nil || errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a list error must propagate as a real error, got %v", err)
+	}
+}
+
+// TestLatestManifestGoneBucketIsError (Altitude #4): a gone/unreachable bucket surfaces as an ERROR
+// (→ Unverifiable) from LatestManifest's upfront confirmBucket — symmetric with the filesystem sink's
+// confirmRoot — even though the (empty) LIST would otherwise resolve name="" → NoData. A vanished
+// target must not read as benign "no manifest yet" (it has NOT lost nothing).
+func TestLatestManifestGoneBucketIsError(t *testing.T) {
+	stub := &wormStub{} // no listKeys → an empty list would be NoData
+	stub.bucketGone.Store(true)
+	sink := newWormSink(t, stub)
+	_, err := sink.LatestManifest(context.Background())
+	if err == nil {
+		t.Fatal("LatestManifest against a gone bucket must return an error (Unverifiable), not (nil, NoData)")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a gone bucket must NOT map to os.ErrNotExist/NoData, got %v", err)
 	}
 }

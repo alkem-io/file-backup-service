@@ -70,6 +70,23 @@ func TestExistsGoneRootIsError(t *testing.T) {
 	}
 }
 
+// TestLatestManifestRootNotADirIsError: a root path that exists but is a FILE (a misconfigured mount)
+// is a target-level fault, not "no manifest yet" — confirmRoot's not-a-directory branch.
+func TestLatestManifestRootNotADirIsError(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "root-is-a-file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	s := New("fs", file)
+	_, err := s.LatestManifest(context.Background())
+	if err == nil {
+		t.Fatal("LatestManifest on a non-directory root must return an error")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a not-a-dir root error must NOT be os.ErrNotExist, got %v", err)
+	}
+}
+
 // TestPutManifestWritesUnderManifestDir: PutManifest lands under _manifest/<name>,
 // is byte-for-byte readable, and a 0-byte ledger snapshot is a legitimate manifest
 // (empty-safe). (S1)

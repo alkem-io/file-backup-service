@@ -17,8 +17,9 @@ import (
 // satisfying the inventoryReader capability.
 type manifestSink struct {
 	stubSink
-	manifest []byte
-	err      error
+	manifest  []byte
+	err       error
+	writeOnly bool // a by-design write-only WORM copy (no audit/read credential) → ImmutabilityReadable()==false
 }
 
 func (s manifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
@@ -27,6 +28,11 @@ func (s manifestSink) LatestManifest(context.Context) (io.ReadCloser, error) {
 	}
 	return io.NopCloser(bytes.NewReader(s.manifest)), nil
 }
+
+// ImmutabilityReadable reports read-capability: a normal manifestSink is readable (it returns a
+// manifest), a writeOnly one is not — modelling a WORM copy whose Unverifiable is EXEMPT (the axis is
+// read-capability, not the worm flag).
+func (s manifestSink) ImmutabilityReadable() bool { return !s.writeOnly }
 
 // manifestOf renders a JSONL manifest listing the given externalIDs in ASCENDING byte order (a real
 // manifest is written from StoredObjectsPage ORDER BY "externalID" COLLATE "C", which the streaming
@@ -96,14 +102,16 @@ func TestAuditInventoryCleanAndMissingOnlyPasses(t *testing.T) {
 	}
 }
 
-// TestAuditInventoryUnverifiableBenign: a NoData target (no capability, or no manifest yet) and a
-// read-denied WORM target are benign — never a failure.
-func TestAuditInventoryUnverifiableBenign(t *testing.T) {
+// TestAuditInventoryBenignNoData: a target with no capability or no manifest yet is benign NoData. A
+// by-design write-only WORM copy (no audit/read credential) is PROBED (like the existence direction) →
+// its manifest read 403s → Unverifiable, which targetUnverifiableExempt makes benign — never a
+// short-circuit-to-NoData (that would silently skip a read-capable WORM).
+func TestAuditInventoryBenignNoData(t *testing.T) {
 	led := newFakeLedger()
 	rep := AuditInventory(context.Background(), led, []Target{
-		{Sink: stubSink{name: "nocap"}},                                                                  // no capability → NoData
-		{Sink: manifestSink{stubSink: stubSink{name: "empty"}, err: os.ErrNotExist}},                     // no manifest yet → NoData
-		{Sink: manifestSink{stubSink: stubSink{name: "wormdenied"}, err: errors.New("403")}, Worm: true}, // worm read-deny → Unverifiable but benign
+		{Sink: stubSink{name: "nocap"}},                                                                                   // no capability → NoData
+		{Sink: manifestSink{stubSink: stubSink{name: "empty"}, err: os.ErrNotExist}},                                      // no manifest yet → NoData
+		{Sink: manifestSink{stubSink: stubSink{name: "wormdenied"}, err: errors.New("403"), writeOnly: true}, Worm: true}, // write-only WORM → probed → Unverifiable but exempt (benign)
 	})
 	by := byTarget(rep)
 	if v := by["nocap"]; v.Status != StatusNoData || v.Failed() {
@@ -113,28 +121,43 @@ func TestAuditInventoryUnverifiableBenign(t *testing.T) {
 		t.Fatalf("empty must be NoData+benign, got %+v", v)
 	}
 	if v := by["wormdenied"]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("wormdenied must be Unverifiable+benign, got %+v", v)
+		t.Fatalf("wormdenied (write-only WORM) is probed → Unverifiable but EXEMPT (benign), got %+v", v)
 	}
 	if err := rep.FailErr(); err != nil {
 		t.Fatalf("an all-benign report must pass, got %v", err)
 	}
 }
 
-// TestAuditInventoryNonWormUnreadableFails: a NON-worm target whose manifest can't be READ (a broken
-// read path — not "no manifest yet") FAILS, consistent with ledger→target's Unverifiable; a worm
-// target with the same error does NOT (read-deny by design).
+// TestAuditInventoryReadableWORMIsDiffed (regression for B): a WORM target whose worker credential can
+// read its manifest (no separate audit cred) must be DIFFED, not skipped. A manifest with an orphan
+// (extra>0) → Drift+fail; the old short-circuit reported NoData (exit 0), hiding the orphan.
+func TestAuditInventoryReadableWORMIsDiffed(t *testing.T) {
+	led := newFakeLedger()
+	orphan := hashOf("orphan") // in the manifest but NOT ledger-stored
+	rep := AuditInventory(context.Background(), led, []Target{
+		{Sink: manifestSink{stubSink: stubSink{name: "w"}, manifest: manifestOf(orphan)}, Worm: true}, // readable (writeOnly=false) worm
+	})
+	if v := rep.Targets[0]; v.Status != StatusDrift || v.Extra != 1 || !v.Failed() {
+		t.Fatalf("a read-capable WORM with an orphan manifest must be Drift+fail (diffed, not skipped): %+v", v)
+	}
+}
+
+// TestAuditInventoryNonWormUnreadableFails: a target whose manifest can't be READ (a broken read path
+// — not "no manifest yet") FAILS unless it is a by-design write-only WORM copy. A non-worm (or any
+// read-capable) target fails; a write-only WORM copy is probed → Unverifiable but EXEMPT (benign). The
+// axis is read-capability, not the worm flag.
 func TestAuditInventoryNonWormUnreadableFails(t *testing.T) {
 	led := newFakeLedger()
 	rep := AuditInventory(context.Background(), led, []Target{
-		{Sink: manifestSink{stubSink: stubSink{name: "broken"}, err: errors.New("connection refused")}},                 // non-worm unreadable → FAIL
-		{Sink: manifestSink{stubSink: stubSink{name: "wormbroken"}, err: errors.New("connection refused")}, Worm: true}, // worm unreadable → benign
+		{Sink: manifestSink{stubSink: stubSink{name: "broken"}, err: errors.New("connection refused")}},                                  // non-worm unreadable → FAIL
+		{Sink: manifestSink{stubSink: stubSink{name: "wormbroken"}, err: errors.New("connection refused"), writeOnly: true}, Worm: true}, // write-only WORM → probed → Unverifiable but exempt
 	})
 	by := byTarget(rep)
 	if v := by["broken"]; v.Status != StatusUnverifiable || !v.Failed() {
 		t.Fatalf("a non-worm unreadable manifest must be Unverifiable+fail, got %+v", v)
 	}
 	if v := by["wormbroken"]; v.Status != StatusUnverifiable || v.Failed() {
-		t.Fatalf("a worm target's unreadable manifest is by design, must not fail, got %+v", v)
+		t.Fatalf("a write-only WORM target is probed → Unverifiable but EXEMPT (benign), got %+v", v)
 	}
 	if rep.FailErr() == nil {
 		t.Fatal("FailErr must flag the non-worm broken read path")
@@ -500,6 +523,33 @@ func TestStallReaderBoundsWedgedRead(t *testing.T) {
 	if _, err := (&stallReader{ctx: cctx, rc: blockingReader{release: make(chan struct{})}, timeout: time.Minute}).Read(make([]byte, 16)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("an already-cancelled ctx must short-circuit the read, got %v", err)
 	}
+}
+
+// blockingCloseReader reads promptly (EOF) but BLOCKS in Close IGNORING ctx — a wedged teardown (a
+// broken NFS mount, a pathological connection close). Only stallReader.Close's per-op bound can stop it.
+type blockingCloseReader struct{ release chan struct{} }
+
+func (blockingCloseReader) Read([]byte) (int, error) { return 0, io.EOF }
+func (b blockingCloseReader) Close() error           { <-b.release; return nil }
+
+// TestStallReaderBoundsWedgedClose (CodeRabbit inline #6): a NORMAL (non-abandoned) read completes, but
+// rc.Close() then WEDGES ignoring ctx. stallReader.Close must be BOUNDED at the per-op timeout — it must
+// never hang the audit critical path after the diff is already computed (AuditInventory imposes no
+// whole-probe deadline). The abandoned Close goroutine still frees rc when it eventually returns.
+func TestStallReaderBoundsWedgedClose(t *testing.T) {
+	br := blockingCloseReader{release: make(chan struct{})}
+	sr := &stallReader{ctx: context.Background(), rc: br, timeout: 50 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- sr.Close() }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a wedged teardown Close must be abandoned with a deadline error, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stallReader.Close HUNG on a wedged teardown — per-op bound not enforced")
+	}
+	close(br.release) // let the abandoned Close goroutine finish (frees rc — no leak)
 }
 
 // trackedCloser records whether Close was called (a leak detector for the abandon path).

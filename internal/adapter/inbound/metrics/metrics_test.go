@@ -246,7 +246,7 @@ func TestDrillMetricsSetAndTextfile(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "drill.prom")
-	if err := d.WriteTextfile(path); err != nil {
+	if err := d.WriteTextfile(path, true); err != nil {
 		t.Fatalf("WriteTextfile: %v", err)
 	}
 	b, err := os.ReadFile(path) //nolint:gosec // test temp path
@@ -263,7 +263,7 @@ func TestDrillMetricsSetAndTextfile(t *testing.T) {
 		t.Errorf("drill textfile must NOT carry runtime collectors (would collide with /metrics):\n%s", body)
 	}
 	// "" path is a no-op (the exit code carries the signal when no textfile is wired).
-	if err := d.WriteTextfile(""); err != nil {
+	if err := d.WriteTextfile("", true); err != nil {
 		t.Fatalf("empty path must be a no-op, got %v", err)
 	}
 }
@@ -280,7 +280,7 @@ func TestDrillWriteTextfileBadPath(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write blocker: %v", err)
 	}
-	if err := d.WriteTextfile(filepath.Join(blocker, "sub", "x.prom")); err == nil {
+	if err := d.WriteTextfile(filepath.Join(blocker, "sub", "x.prom"), true); err == nil {
 		t.Fatal("WriteTextfile under a file-as-dir must error")
 	}
 }
@@ -293,13 +293,13 @@ func TestDrillMetricsCarriesForwardLastSuccess(t *testing.T) {
 	// Process 1: a PASS at t=1700000000 writes the file.
 	pass := NewDrillMetrics()
 	pass.SetPass(true, time.Unix(1_700_000_000, 0))
-	if err := pass.WriteTextfile(path); err != nil {
+	if err := pass.WriteTextfile(path, true); err != nil {
 		t.Fatalf("pass write: %v", err)
 	}
 	// Process 2 (fresh metrics): a FAIL overwrites the file — last-success must be CARRIED FORWARD.
 	fail := NewDrillMetrics()
 	fail.SetPass(false, time.Unix(1_800_000_000, 0))
-	if err := fail.WriteTextfile(path); err != nil {
+	if err := fail.WriteTextfile(path, false); err != nil {
 		t.Fatalf("fail write: %v", err)
 	}
 	b, err := os.ReadFile(path) //nolint:gosec // test temp path
@@ -312,6 +312,30 @@ func TestDrillMetricsCarriesForwardLastSuccess(t *testing.T) {
 	}
 	if !strings.Contains(body, "filebackup_drill_last_success_timestamp_seconds 1.7e+09") {
 		t.Errorf("failing run must CARRY FORWARD the prior last-success (1.7e+09), not clobber to 0:\n%s", body)
+	}
+}
+
+// TestReadPriorLastSuccessErrorPaths: the carry-forward parse yields 0 (nothing to carry) for a
+// missing file, a malformed exposition body, and a valid file that lacks the last-success metric — so
+// a failing drill never fabricates a last-success from an unreadable/irrelevant prior textfile.
+func TestReadPriorLastSuccessErrorPaths(t *testing.T) {
+	dir := t.TempDir()
+	if v := readPriorLastSuccess(filepath.Join(dir, "nope.prom")); v != 0 {
+		t.Fatalf("missing file must yield 0, got %v", v)
+	}
+	bad := filepath.Join(dir, "bad.prom")
+	if err := os.WriteFile(bad, []byte("this is not { valid prometheus\n"), 0o600); err != nil {
+		t.Fatalf("write bad: %v", err)
+	}
+	if v := readPriorLastSuccess(bad); v != 0 {
+		t.Fatalf("malformed exposition must yield 0, got %v", v)
+	}
+	other := filepath.Join(dir, "other.prom")
+	if err := os.WriteFile(other, []byte("# TYPE other_metric gauge\nother_metric 5\n"), 0o600); err != nil {
+		t.Fatalf("write other: %v", err)
+	}
+	if v := readPriorLastSuccess(other); v != 0 {
+		t.Fatalf("a file without the last-success metric must yield 0, got %v", v)
 	}
 }
 

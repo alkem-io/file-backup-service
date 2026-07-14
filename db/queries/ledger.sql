@@ -47,7 +47,11 @@ GROUP BY target;
 -- (target, state, "externalID") index makes the WHERE+ORDER an index-ordered range scan. The
 -- explicit COLLATE "C" pins BYTE order (matching the column collation + the byte-order `<` the
 -- audit inventory diff and manifestIterator's monotonicity check assume) so it can't drift on a
--- locale-collated database.
+-- locale-collated database. This is DELIBERATELY redundant with the column's COLLATE "C" (migration
+-- 000002) — keep BOTH: the query-level COLLATE guarantees byte-ordered RESULTS even on a ledger where
+-- 000002 has not run (an older v0.0.1/v0.0.2 DB), so mergeInventory never miscounts; the column-level
+-- COLLATE makes the covering index serve this order without a sort. Dropping either is a bug (wrong
+-- merge order, or a silent per-page seq-scan+sort on a large corpus).
 SELECT o."externalID", o.size, o."createdBy", o."sourceCreatedDate"
 FROM file_backup_object o
 JOIN file_backup_target_status ts ON ts."externalID" = o."externalID"

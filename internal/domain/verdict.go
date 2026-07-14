@@ -61,41 +61,52 @@ func (s VerdictStatus) String() string {
 	}
 }
 
-// Failed is the ONE audit pass/fail policy, a pure function of (status, worm), shared by every
-// direction so the rule can't drift between them:
+// Failed is the ONE audit pass/fail policy, a pure function of (status, exemptUnverifiable), shared by
+// every direction so the rule can't drift between them:
 //   - Verified / NoData → benign (not a failure).
 //   - Drift / Corrupt / Fault → always a failure.
-//   - Unverifiable → a failure iff the target is NOT worm (a read-denying WORM copy is expected to
-//     be unverifiable by design; a normally-readable target that suddenly can't be read is a broken
-//     read path, and an incomplete integrity check must not read green).
-func (s VerdictStatus) Failed(worm bool) bool {
+//   - Unverifiable → a failure UNLESS exemptUnverifiable. The axis is read-capability, NOT worm: ONLY
+//     a by-design write-only WORM copy (a WORM target whose sink declares !ImmutabilityReadable — no
+//     audit/read credential) is exempt, because it legitimately can't be read; every other target —
+//     a normal target, a WORM target WITH an audit credential, a filesystem target — FAILS an
+//     Unverifiable (a read path that should work but didn't; an incomplete integrity check must not
+//     read green). This is why `audit` and the serve immutability sampler agree: a read-capable WORM
+//     target that turns unreadable fails BOTH. exemptUnverifiable defaults to FALSE, so an unstamped
+//     verdict fails CLOSED (like StatusUnknown) — only an explicit write-only-WORM stamp exempts it.
+func (s VerdictStatus) Failed(exemptUnverifiable bool) bool {
 	switch s {
 	case StatusDrift, StatusCorrupt, StatusFault, StatusUnknown:
 		return true // StatusUnknown (the zero value) fails closed — an unpopulated verdict is never a pass
 	case StatusUnverifiable:
-		return !worm
+		return !exemptUnverifiable
 	default: // StatusVerified, StatusNoData
 		return false
 	}
 }
 
 // TargetVerdict is one target's outcome for ONE audit direction. Status is the sole source of truth
-// for the pass/fail verdict and the gauge; the count fields are direction-specific breadcrumbs the
-// printed report shows. Illegal combinations are unrepresentable: a target has exactly one Status,
-// and Failed() derives from it — there is no way to record "drift" and "benign" at once.
+// for the pass/fail verdict and the gauge; the count fields (Checked/Missing/Extra) are the TYPED,
+// direction-specific breadcrumbs — the programmatic/test-observable view (tests assert on them), while
+// Detail is the human-readable line printAudit prints. Both are computed from the same per-probe locals
+// at each construction site (so they can't drift). Illegal combinations are unrepresentable: a target
+// has exactly one Status, and Failed() derives from it — no way to record "drift" and "benign" at once.
 type TargetVerdict struct {
-	Target  string
-	Worm    bool
-	Status  VerdictStatus
-	Detail  string
-	Checked int   // ledger→target: objects probed on the sink
-	Missing int   // ledger→target: ledger-stored but absent; inventory: ledger-stored, not in manifest
-	Extra   int   // inventory: in the manifest but NOT ledger-stored (orphan / lost ledger record)
-	Err     error // Corrupt/Fault: the underlying cause, surfaced by FailErr so a caller can errors.Is it
+	Target string
+	// ExemptUnverifiable is the axis the Unverifiable pass/fail policy turns on (see
+	// VerdictStatus.Failed): true ONLY for a by-design write-only WORM copy (a WORM target whose sink
+	// declares !ImmutabilityReadable) that legitimately can't be read; false for every read-capable
+	// target. It defaults to false so an unstamped verdict fails CLOSED; probeOne stamps it once.
+	ExemptUnverifiable bool
+	Status             VerdictStatus
+	Detail             string
+	Checked            int   // ledger→target: objects probed on the sink
+	Missing            int   // ledger→target: ledger-stored but absent; inventory: ledger-stored, not in manifest
+	Extra              int   // inventory: in the manifest but NOT ledger-stored (orphan / lost ledger record)
+	Err                error // Corrupt/Fault: the underlying cause, surfaced by FailErr so a caller can errors.Is it
 }
 
 // Failed reports whether this verdict fails the audit, per the shared VerdictStatus policy.
-func (v TargetVerdict) Failed() bool { return v.Status.Failed(v.Worm) }
+func (v TargetVerdict) Failed() bool { return v.Status.Failed(v.ExemptUnverifiable) }
 
 // VerdictReport is one direction's per-target verdicts plus the ONE shared pass/fail verdict.
 type VerdictReport struct{ Targets []TargetVerdict }
@@ -131,7 +142,7 @@ func (r VerdictReport) FailErr() error {
 // (NoData, propagated), a per-target DeadlineExceeded while the parent is still live is a wedged
 // target (Unverifiable, which fails a non-worm target). Each direction supplies ONLY its per-target
 // closure, which returns a partial verdict (Status/Detail/counts/Err); probeTargets stamps
-// Target/Worm and guarantees an always-populated slice.
+// Target + ExemptUnverifiable and guarantees an always-populated slice.
 //
 // perTargetTimeout<=0 runs the closure on the parent ctx (no whole-probe deadline) — for the sweep
 // directions that must scale with the corpus and bound their own per-page/per-read operations
@@ -151,7 +162,9 @@ func probeTargets(ctx context.Context, targets []Target, perTargetTimeout time.D
 	// into an explicit failing Fault so no target can silently pass on a body panic. Never discard.
 	for i, err := range errs {
 		if err != nil {
-			out[i] = TargetVerdict{Target: safeSinkName(targets[i]), Worm: targets[i].Worm, Status: StatusFault, Err: err}
+			// StatusFault always fails regardless of ExemptUnverifiable, so no need to compute it here (and
+			// the panic being folded may have come from probing the sink — don't re-touch it).
+			out[i] = TargetVerdict{Target: safeSinkName(targets[i]), Status: StatusFault, Err: err}
 		}
 	}
 	return out
@@ -187,8 +200,30 @@ func probeOne(ctx context.Context, t Target, timeout time.Duration,
 			return TargetVerdict{Status: StatusFault, Err: PanicErr("probe "+safeSinkName(t), r)}
 		})
 	v.Target = safeSinkName(t)
-	v.Worm = t.Worm
+	v.ExemptUnverifiable = targetUnverifiableExempt(t)
 	return v
+}
+
+// targetUnverifiableExempt reports whether an Unverifiable verdict for this target is EXPECTED (a
+// by-design write-only WORM copy). Two consumers: (1) probeOne stamps it onto every verdict so
+// VerdictStatus.Failed exempts such a target's Unverifiable from failing the existence + inventory
+// directions (which PROBE every target and let a genuinely-unreadable WORM copy read-deny → Unverifiable
+// → benign); (2) the immutability direction uses it to short-circuit to NoData (that direction's
+// bucket-config read genuinely needs the dedicated audit credential — see immutabilityProbe). The ONLY
+// exempt case is a WORM target whose sink declares !ImmutabilityReadable() — no audit/read credential.
+// A non-worm target, a WORM target WITH an audit credential, and a sink that can't declare readability
+// (the filesystem sink) are all NOT exempt, so a read failure on any of them fails the audit. Defaults
+// to false → fail-closed. NOTE: for existence/inventory this exempts only a target that ACTUALLY
+// read-denied (reached Unverifiable); a read-capable worker credential on a WORM bucket reads fine and
+// gets a real Verified/Drift verdict, so the exemption never masks a verifiable target's silent loss.
+func targetUnverifiableExempt(t Target) bool {
+	if !t.Worm {
+		return false
+	}
+	if r, ok := t.Sink.(immutabilityReadable); ok {
+		return !r.ImmutabilityReadable()
+	}
+	return false
 }
 
 // abandonVerdict classifies a probe abandoned at its ctx boundary: a PARENT cancel (SIGTERM) is a

@@ -223,8 +223,10 @@ version's became-current time; content-version history is out of scope.) It fail
 To recover a genuinely HISTORICAL version — or when the guard over-refuses a metadata-only
 edit — recover `file.externalID` as of `--at` from a **DB point-in-time restore / backup**
 and pass it via `--hash` (which restores it directly, needing only the target). The
-`updatedDate` column is preflighted (`FileRepo.Probe`) so a schema drift fails loud up
-front. See `contracts/restore-and-ops.md`.
+`updatedDate` column is preflighted by `restore current`'s own `ProbeCurrentVersion` (NOT
+the backfill `FileRepo.Probe`, which deliberately omits it so backfill still runs under a
+least-privilege grant without the column) so a schema drift fails loud up front. See
+`contracts/restore-and-ops.md`.
 
 **`restore all` completeness.** It restores only what the `--from` source holds, so
 before restoring it prints each configured target's stored-object count (marking the

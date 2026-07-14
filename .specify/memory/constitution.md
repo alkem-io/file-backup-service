@@ -61,8 +61,10 @@ Database interactions MUST use **sqlc** for query generation and **pgx**.
 - Tests MUST defend real invariants (idempotency, hash-verify, no-loss under
   fault) — no coverage-padding tests. Fault-injection and restore-drill tests
   are first-class.
-- **Statement test coverage MUST exceed 95%** (measured by `go test
-  -coverprofile` over `./...`). This bar and the no-padding rule above are
+- **Statement test coverage MUST exceed 95%** (measured over `./...` by
+  `make cover-check`, which merges per-binary `GOCOVERDIR` streams with `go tool
+  covdata` — NOT a single `-coverprofile`, which double-counts under `-coverpkg`
+  across many test binaries and under-reports). This bar and the no-padding rule above are
   **complementary, not in tension**: the 95% MUST be reached with real
   invariant, fault-injection, and integration tests — never with superficial
   or assertion-free tests. The pgx DB adapters (outbox, ledger, corpus) MUST be
@@ -74,7 +76,16 @@ Database interactions MUST use **sqlc** for query generation and **pgx**.
   Postgres/container is reserved for the fault-injection and restore-drill
   suites, not a prerequisite for the coverage bar. The bar is gated by
   `make cover-check`, which fails when total coverage drops below 95%; that gate
-  MUST run in CI and MUST NOT be waived per-package to accommodate untested glue.
+  MUST run in CI and MUST NOT be waived per-package to accommodate untested
+  **hand-written** glue. **Machine-GENERATED code** (files carrying a "Code
+  generated … DO NOT EDIT." header — e.g. the sqlc `db/queries` package) MAY be
+  excluded from the coverage denominator: it is the code generator's output, not
+  glue we author, and the generator emits members the service never calls (e.g.
+  sqlc's `WithTx`) that could only be covered by the very padding tests this
+  principle bans. The hand-written adapters that wrap it (the pgx repos in
+  `internal/adapter/outbound/db`) are NOT generated and MUST stay in the
+  denominator and covered, including each query's error-wrap via pgxmock
+  error-injection. The exclusion list MUST contain only generated packages.
 - All debugging MUST be driven by root-cause analysis; the cause MUST be
   documented with evidence before a fix is applied.
 
@@ -84,10 +95,20 @@ concerns and the feature's authoritative spec live in the workspace
 (`agents-hq/specs/008-continuous-file-backup/`). Amendments MUST be recorded
 here with rationale.
 
-**Version**: 1.1.0 (adapted from file-service) · **Ratified**: 2026-07-03 ·
-**Last amended**: 2026-07-08
+**Version**: 1.2.0 (adapted from file-service) · **Ratified**: 2026-07-03 ·
+**Last amended**: 2026-07-10
 
 **Amendments**
+- 1.2.0 (2026-07-10): Principle VII's "MUST NOT be waived per-package" gate
+  clarified to permit excluding **machine-generated** packages (the sqlc
+  `db/queries` "DO NOT EDIT." output) from the coverage denominator, while the
+  ban on waiving **hand-written** glue stands (the pgx repos wrapping the
+  generated queries stay in the denominator and covered). Rationale: the
+  generated package emits members the service never calls (sqlc's `WithTx`) that
+  are uncoverable without exactly the padding tests VII forbids, so counting the
+  generator's output would pit the coverage bar against the no-padding rule;
+  excluding only generated code keeps the bar an honest measure of OUR tests of
+  OUR code.
 - 1.1.0 (2026-07-08): Principle VII gains a **>95% statement-coverage**
   requirement, CI-enforced, reached via real invariant/integration tests
   (pgmock/pgxmock/pgxpoolmock for the pgx adapters, an httptest S3 stub for the

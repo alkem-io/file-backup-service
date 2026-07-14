@@ -296,7 +296,7 @@ func TestPutManifestRoutesToManifestPrefix(t *testing.T) {
 }
 
 // TestPutManifestPointerWriteFailureSwallowed: the LATEST pointer is a read-time OPTIMIZATION —
-// SelectLatestManifest self-heals via a prefix scan when it is absent/stale — so a pointer-only write
+// OpenLatestManifest self-heals via a prefix scan when it is absent/stale — so a pointer-only write
 // failure must NOT fail PutManifest. When the pointer write is denied but the manifest object itself
 // writes durably, PutManifest returns nil, having still ATTEMPTED the pointer (proved by its initiate).
 func TestPutManifestPointerWriteFailureSwallowed(t *testing.T) {

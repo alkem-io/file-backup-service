@@ -33,9 +33,14 @@ var errLedgerRead = errors.New("ledger read")
 var errNonAscendingManifest = errors.New("manifest not byte-ascending (old-format / locale)")
 
 // maxSortedManifestIDs bounds the order-independent fallback's in-memory manifest buffer so a huge
-// non-ascending manifest can't OOM the pod: past it the target is reported Unverifiable rather than
-// buffered. A var (not const) so tests can lower it.
-var maxSortedManifestIDs = 5_000_000
+// non-ascending manifest can't OOM the pod: past it the target is reported Unverifiable (fail-closed)
+// rather than buffered. Sized for a MODEST DR pod: 1M ids × (64-hex + string header ≈ 80B) ≈ 80MB, and
+// append's growth-doubling peaks ~1.5× (~120MB) before the sort — comfortably safe under a ~512MB pod,
+// where the old 5M (~400MB slice, ~600MB peak) could OOM. This path is rare + transitional (only a
+// PRE-COLLATE-migration manifest is non-ascending; the next serve manifest-write rewrites it
+// byte-ascending, so an over-bound target self-heals to a normal verified diff within one manifest
+// cycle). A var (not const) so tests can lower it.
+var maxSortedManifestIDs = 1_000_000
 
 // AuditInventory runs the target→ledger direction for every target, returning one TargetVerdict
 // each: it stream-merges each target's most recent manifest (its self-declared inventory) against
@@ -53,10 +58,29 @@ var maxSortedManifestIDs = 5_000_000
 // bounded per-OPERATION (the manifest fetch, each manifest read, each ledger page) rather than by a
 // single whole-diff deadline, so a healthy LARGE corpus never false-fails while a wedged target is
 // still bounded.
+//
+// Cancellation contract: a parent-ctx SIGTERM yields NoData (benign), not an error — the caller MUST
+// fold ctx.Err() to fail an interrupted run (see Audit's CANCELLATION CONTRACT + runAudit).
 func AuditInventory(ctx context.Context, led Ledger, targets []Target) VerdictReport {
 	return VerdictReport{Targets: probeTargets(ctx, targets, 0, func(pctx context.Context, t Target) TargetVerdict {
 		return inventoryProbe(pctx, led, t)
 	})}
+}
+
+// openManifestReader opens the target's latest manifest via readClient(), bounding the fetch at
+// auditProbeTimeout and wrapping the result in a stallReader — the ONE owner of the fd-race-safe
+// abandon/close prelude shared by the streaming and sorted-fallback diffs (so a change to the fetch
+// timeout, the abandon/close contract, or the fetch-error classification can't drift between them).
+// The stallReader OWNS closing rc: on an abandoned (wedged) read it closes rc only AFTER the read
+// goroutine finishes, so the caller's deferred Close can't race an in-flight Read. On a fetch error it
+// returns a classified verdict (sr==nil); the caller returns *verdict directly.
+func openManifestReader(ctx context.Context, ir inventoryReader, name string) (*stallReader, *TargetVerdict) {
+	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
+	if err != nil {
+		v := classifyInventoryErr(ctx, name, err)
+		return nil, &v
+	}
+	return &stallReader{ctx: ctx, rc: rc, timeout: auditProbeTimeout}, nil
 }
 
 // inventoryProbe is one target's target→ledger closure. It runs on the parent probe ctx (probeTargets
@@ -66,39 +90,46 @@ func inventoryProbe(ctx context.Context, led Ledger, t Target) TargetVerdict {
 	if !ok {
 		return TargetVerdict{Status: StatusNoData, Detail: "target type cannot enumerate its manifest"}
 	}
+	// This direction ALWAYS attempts the manifest read via readClient() — it does NOT short-circuit a
+	// WORM target on "has a separate audit credential". A read-capable worker credential on a WORM bucket
+	// CAN read its manifest (object-lock restricts delete/overwrite, not GET), so it MUST be diffed for
+	// orphans/lost records; skipping it to NoData silently disabled that. A genuinely write-only WORM
+	// copy instead read-denies → Unverifiable, which targetUnverifiableExempt (worm && no audit cred)
+	// makes benign — same policy as the existence direction.
 	name := t.Sink.Name()
-	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
-	if err != nil {
-		return classifyInventoryErr(ctx, name, err)
+	sr, verr := openManifestReader(ctx, ir, name)
+	if verr != nil {
+		return *verr
 	}
-	// The stallReader OWNS closing rc: on an abandoned (wedged) read it closes rc only AFTER the read
-	// goroutine finishes, so a deferred Close here can't race an in-flight Read (an fd race).
-	sr := &stallReader{ctx: ctx, rc: rc, timeout: auditProbeTimeout}
 	defer func() { _ = sr.Close() }()
 
 	extra, missing, msize, merr := mergeInventory(manifestIterator(sr), ledgerStoredPull(ctx, led, name))
+	// A non-monotonic (old-format / locale) manifest with NO definitive orphan yet is not a fault: retry
+	// with an order-independent diff so a legitimately-written older manifest doesn't hard-fail. (An
+	// orphan already seen — extra>0 — is a REAL drift mergeToVerdict preserves, so don't discard it.)
+	if merr != nil && extra == 0 && errors.Is(merr, errNonAscendingManifest) {
+		return inventorySortedDiff(ctx, ir, led, name)
+	}
+	return mergeToVerdict(ctx, name, extra, missing, msize, merr)
+}
+
+// mergeToVerdict maps a completed-or-faulted inventory merge to a verdict — the ONE owner of the
+// counts→verdict + fault rules, shared by the streaming and the order-independent (sorted) paths so
+// they can't diverge. A definitive orphan (Extra>0) observed BEFORE a transient read fault is a REAL
+// drift (report it, don't relabel the target Unverifiable — mirrors the immutability 404-drift
+// preservation); any other merge fault classifies via classifyInventoryErr; a clean merge → the
+// counts verdict.
+func mergeToVerdict(ctx context.Context, name string, extra, missing, msize int, merr error) TargetVerdict {
 	if merr != nil {
-		// A definitive orphan (Extra>0) observed BEFORE a transient read fault is a REAL drift — report
-		// it, don't discard it and relabel the target Unverifiable (mirrors the immutability 404-drift
-		// preservation). A non-monotonic (old-format / locale) manifest is not a fault: retry with an
-		// order-independent diff so a legitimately-written older manifest doesn't hard-fail.
-		if extra > 0 {
+		if extra > 0 { // a definitive orphan seen BEFORE the read fault is a real drift — don't discard it
 			return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
-		}
-		if errors.Is(merr, errNonAscendingManifest) {
-			return inventorySortedDiff(ctx, ir, led, name)
 		}
 		return classifyInventoryErr(ctx, name, merr)
 	}
-	return inventoryVerdict(extra, missing, msize)
-}
-
-// inventoryVerdict maps a completed diff's counts to a verdict: an orphan (Extra>0) is Drift; a
-// clean or merely snapshot-stale (Missing-only) diff is Verified — shared by the streaming and the
-// order-independent (sorted) paths so they can't diverge on the counts→verdict rule.
-func inventoryVerdict(extra, missing, manifestSize int) TargetVerdict {
-	detail := fmt.Sprintf("manifest=%d extra=%d missing=%d", manifestSize, extra, missing)
-	if extra > 0 { // an orphan / lost ledger record — the genuine target→ledger drift
+	// A clean, complete diff → the counts verdict: an orphan (Extra>0) is Drift (a lost ledger record);
+	// a clean or merely snapshot-stale (Missing-only) diff is Verified.
+	detail := fmt.Sprintf("manifest=%d extra=%d missing=%d", msize, extra, missing)
+	if extra > 0 {
 		return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: detail}
 	}
 	return TargetVerdict{Status: StatusVerified, Extra: extra, Missing: missing, Detail: detail}
@@ -111,11 +142,10 @@ func inventoryVerdict(extra, missing, manifestSize int) TargetVerdict {
 // only on the rare fallback path (new manifests are ascending and never reach here). A manifest too
 // large to buffer safely → Unverifiable (can't diff it order-independently without risking an OOM).
 func inventorySortedDiff(ctx context.Context, ir inventoryReader, led Ledger, name string) TargetVerdict {
-	rc, err := abandonableFetch(ctx, auditProbeTimeout, func() (io.ReadCloser, error) { return ir.LatestManifest(ctx) })
-	if err != nil {
-		return classifyInventoryErr(ctx, name, err)
+	sr, verr := openManifestReader(ctx, ir, name)
+	if verr != nil {
+		return *verr
 	}
-	sr := &stallReader{ctx: ctx, rc: rc, timeout: auditProbeTimeout}
 	defer func() { _ = sr.Close() }()
 
 	ids, cerr := collectManifestIDs(sr, maxSortedManifestIDs)
@@ -124,13 +154,9 @@ func inventorySortedDiff(ctx context.Context, ir inventoryReader, led Ledger, na
 	}
 	sort.Strings(ids)
 	extra, missing, msize, merr := mergeInventory(sliceIterator(ids), ledgerStoredPull(ctx, led, name))
-	if merr != nil {
-		if extra > 0 {
-			return TargetVerdict{Status: StatusDrift, Extra: extra, Missing: missing, Detail: fmt.Sprintf("extra=%d (orphan) seen before read fault: %v", extra, merr)}
-		}
-		return classifyInventoryErr(ctx, name, merr)
-	}
-	return inventoryVerdict(extra, missing, msize)
+	// Same counts→verdict + orphan-preservation rule as the streaming path (one owner: mergeToVerdict).
+	// The non-ascending signal can't recur here (ids are sorted), so there's no further fallback.
+	return mergeToVerdict(ctx, name, extra, missing, msize, merr)
 }
 
 // collectManifestIDs reads every externalID from a (possibly non-ascending) manifest into a slice,
@@ -254,27 +280,33 @@ func manifestIterator(r io.Reader) func() (string, bool, error) { return manifes
 func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	prev := ""
-	first := true
+	prev := "" // "" iff no id yet yielded — every yielded id is non-empty (guarded below), so this
+	// doubles as the "first line" flag: strict monotonicity is only enforced once prev is set.
 	return func() (string, bool, error) {
 		for sc.Scan() {
 			line := sc.Bytes()
 			if len(line) == 0 {
 				continue
 			}
-			var ml manifestLine
+			// Decode ONLY externalID — the diff compares ids by byte order and never touches
+			// size/createdBy/sourceCreatedDate, so unmarshaling the full manifestLine (a string alloc for
+			// createdBy + a *time.Time RFC3339 parse per line) would be pure waste over a whole-corpus
+			// manifest. json ignores the unlisted keys.
+			var ml struct {
+				ExternalID string `json:"externalID"`
+			}
 			if uerr := json.Unmarshal(line, &ml); uerr != nil {
 				return "", false, fmt.Errorf("%w: parse line: %w", errCorruptManifest, uerr)
 			}
 			if ml.ExternalID == "" {
 				continue
 			}
-			if strict && !first && ml.ExternalID <= prev {
+			if strict && prev != "" && ml.ExternalID <= prev {
 				// NOT corruption: an old-format / locale-collated manifest can be non-ascending in byte
 				// order → signal the caller to retry with an order-independent (sorted) diff.
 				return "", false, fmt.Errorf("%w (%q after %q)", errNonAscendingManifest, ml.ExternalID, prev)
 			}
-			prev, first = ml.ExternalID, false
+			prev = ml.ExternalID
 			return ml.ExternalID, true, nil
 		}
 		if serr := sc.Err(); serr != nil {
@@ -307,13 +339,7 @@ func manifestScanner(r io.Reader, strict bool) func() (string, bool, error) {
 func ledgerStoredPull(ctx context.Context, led Ledger, target string) func() (string, bool, error) {
 	return keysetPull("", KeysetPageSize,
 		func(after string, limit int) ([]string, error) {
-			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
-			defer cancel()
-			page, err := led.StoredExternalIDsPage(pctx, target, after, limit)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %w", errLedgerRead, err)
-			}
-			return page, nil
+			return storedPageLedgerTagged(ctx, led, target, after, limit)
 		},
 		func(id string) string { return id })
 }
@@ -357,11 +383,23 @@ func abandonableFetch(ctx context.Context, timeout time.Duration, fetch func() (
 // underlying ReadCloser: an abandoned read's goroutine keeps running against rc, so Close() must NOT
 // close rc concurrently — the abandon path closes rc only AFTER that goroutine finishes (no fd race).
 type stallReader struct {
-	ctx       context.Context
-	rc        io.ReadCloser
-	timeout   time.Duration
+	ctx     context.Context
+	rc      io.ReadCloser
+	timeout time.Duration
+	// own is the read buffer, REUSED across Read calls. Reuse is safe ONLY because the sole consumer —
+	// manifestIterator's bufio.Scanner — permanently STOPS calling Read once it sees a non-nil error (an
+	// abandoned read returns DeadlineExceeded), so a background read goroutine still writing `own` after an
+	// abandon is never re-read by a later Read on this buffer. A future caller that RETRIES a Read after an
+	// error would race that goroutine on `own` — do NOT reuse stallReader outside manifestIterator without
+	// revisiting this. The `abandoned` short-circuit in Read enforces the no-re-read rule for THIS type.
 	own       []byte
 	abandoned bool // an abandon happened → the abandon path owns rc.Close(); Read/Close must not touch rc
+}
+
+// readResult carries one stallReader read across the RunAbandonableClose boundary.
+type readResult struct {
+	n   int
+	err error
 }
 
 func (s *stallReader) Read(p []byte) (int, error) {
@@ -377,39 +415,38 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	buf := s.own[:len(p)]
 	rctx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	defer cancel()
-	type res struct {
-		n   int
-		err error
-	}
-	ch := make(chan res, 1) // buffered so an abandoned read's send never blocks
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ch <- res{err: PanicErr("manifest read", r)}
-			}
-		}()
-		n, err := s.rc.Read(buf)
-		ch <- res{n, err}
-	}()
-	select {
-	case <-rctx.Done():
-		s.abandoned = true
-		// Own the close: hand rc to a goroutine that waits for the wedged read to finish, THEN closes
-		// it — so a deferred Close() in the caller can't race the in-flight Read (an fd race).
-		go func() { <-ch; _ = s.rc.Close() }()
-		return 0, rctx.Err()
-	case out := <-ch:
-		n := copy(p, buf[:out.n])
-		return n, out.err
-	}
+	// Delegate the abandon + cap-1-buffer + recover + late-close to the shared RunAbandonableClose
+	// primitive rather than a hand-rolled copy: on the per-read deadline it marks the reader abandoned
+	// (so later Reads short-circuit) and closes rc only AFTER the wedged read goroutine finishes via
+	// onLateResult (no fd race with a caller's deferred Close). The read fills s.own; on success we copy
+	// into the caller's p, so an abandoned late read never races p.
+	res := RunAbandonableClose(rctx,
+		func() readResult { n, err := s.rc.Read(buf); return readResult{n, err} },
+		func() readResult { s.abandoned = true; return readResult{err: rctx.Err()} },
+		func(r any) readResult { return readResult{err: PanicErr("manifest read", r)} },
+		func(readResult) { _ = s.rc.Close() }) // free rc once the abandoned read finally completes
+	n := copy(p, buf[:res.n])
+	return n, res.err
 }
 
 // Close closes the underlying reader UNLESS a read was abandoned — in which case the abandon path
 // owns closing it (after the wedged read goroutine finishes), so Close must not race an in-flight
 // Read. Called by inventoryProbe via defer.
+//
+// The teardown close is BOUNDED like every other per-op step in the DR sweep: AuditInventory imposes no
+// whole-probe deadline, so a wedged rc.Close (a broken NFS mount, a pathological connection teardown)
+// would otherwise hang the audit critical path AFTER the diff is already computed. It abandons a wedged
+// close at the per-op timeout via the shared primitive — the abandoned goroutine is bounded and still
+// frees rc when the close eventually returns (no fd leak), so only the WAIT is bounded, not the close.
 func (s *stallReader) Close() error {
 	if s.abandoned {
 		return nil
 	}
-	return s.rc.Close()
+	cctx, cancel := context.WithTimeout(s.ctx, s.timeout)
+	defer cancel()
+	res := RunAbandonable(cctx,
+		func() readResult { return readResult{err: s.rc.Close()} },
+		func() readResult { return readResult{err: cctx.Err()} },
+		func(r any) readResult { return readResult{err: PanicErr("manifest close", r)} })
+	return res.err
 }

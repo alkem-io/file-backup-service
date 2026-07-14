@@ -3,7 +3,9 @@ package domain
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -31,6 +33,47 @@ func TestBackfillPerObjectTimeout(t *testing.T) {
 	}
 	if st.Failed != 2 || st.Backed != 0 {
 		t.Fatalf("stats: %+v (want both objects failed via per-object timeout)", st)
+	}
+}
+
+// TestRunBoundedPacedPanicBackstop (Alt#1 vanilla11): a work closure that lets a panic ESCAPE its own
+// recover (a forgotten guard / a future caller) must NOT crash the process via a fatal bare-goroutine
+// panic — runBoundedPaced's backstop recover catches it and surfaces it as a loud sweep error. (Against
+// the un-backstopped primitive this test would panic the test process instead of returning an error.)
+func TestRunBoundedPacedPanicBackstop(t *testing.T) {
+	err := runBoundedPaced(context.Background(), 2, 0,
+		func(yield func(int) error) error {
+			for i := 0; i < 3; i++ {
+				if e := yield(i); e != nil {
+					return e
+				}
+			}
+			return nil
+		},
+		func(_ int) { panic("poison object with no per-site recover") }) // NO defer recover in this closure
+	if err == nil {
+		t.Fatal("an escaped work-closure panic must surface as a sweep error, not be swallowed (and must not crash the process)")
+	}
+	if !errors.Is(err, ErrProbePanic) {
+		t.Fatalf("the escaped panic must be wrapped as ErrProbePanic, got %v", err)
+	}
+}
+
+// TestBackfillCancelledInFlightIsNotFailed (Alt#1): a SIGTERM that cancels an in-flight object during
+// the final drain window (enumerate already finished, so runBoundedPaced returns nil) must count
+// Cancelled, NOT Failed — otherwise runBackfill exits nonzero on a fully-successful, resumable pass. A
+// per-object DEADLINE (a wedged source, TestBackfillPerObjectTimeout) still counts Failed, since
+// cancelledInFlight requires the error itself to be context.Canceled.
+func TestBackfillCancelledInFlightIsNotFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the parent (a SIGTERM); hangingSource then returns the per-object ctx's Canceled
+	p := NewPipeline(hangingSource{}, newFakeLedger(), []Target{{Sink: newMemSink("t"), Codec: CodecNone}})
+	b := NewBackfiller(fakeCorpus{}, p, time.Minute, 1)
+	var st BackfillStats
+	var mu sync.Mutex
+	b.backupOne(ctx, BackupItem{ExternalID: hashOf("x")}, &st, &mu)
+	if st.Cancelled != 1 || st.Failed != 0 {
+		t.Fatalf("a SIGTERM-cancelled in-flight object must count Cancelled, not Failed: %+v", st)
 	}
 }
 
@@ -125,19 +168,19 @@ func TestBackfillSkipsSourceGone(t *testing.T) {
 // per-object deadline that fails every object (CodeRabbit #5). Asserts the shared normalizer
 // and that the constructors apply it.
 func TestNormalizePerObjectTimeoutFloor(t *testing.T) {
-	if got := NormalizePerObjectTimeout(0); got != defaultPerObjectTimeout {
+	if got := NormalizePerObjectTimeout(0); got != DefaultPerObjectTimeout {
 		t.Fatalf("0 must floor to the default, got %v", got)
 	}
-	if got := NormalizePerObjectTimeout(-time.Second); got != defaultPerObjectTimeout {
+	if got := NormalizePerObjectTimeout(-time.Second); got != DefaultPerObjectTimeout {
 		t.Fatalf("negative must floor to the default, got %v", got)
 	}
 	if got := NormalizePerObjectTimeout(5 * time.Second); got != 5*time.Second {
 		t.Fatalf("a positive value must pass through, got %v", got)
 	}
-	if b := NewBackfiller(nil, nil, 0, 1); b.perObjectT != defaultPerObjectTimeout {
+	if b := NewBackfiller(nil, nil, 0, 1); b.perObjectT != DefaultPerObjectTimeout {
 		t.Fatalf("NewBackfiller must floor perObjectT, got %v", b.perObjectT)
 	}
-	if rc := NewReconciler(nil, nil, 0, "", 0, nil, 1); rc.perObjectT != defaultPerObjectTimeout {
+	if rc := NewReconciler(nil, nil, 0, "", 0, nil, 1); rc.perObjectT != DefaultPerObjectTimeout {
 		t.Fatalf("NewReconciler must floor perObjectT, got %v", rc.perObjectT)
 	}
 }

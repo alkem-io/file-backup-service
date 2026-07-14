@@ -14,12 +14,56 @@ import (
 // network RTT — e.g. an S3 StatObject HEAD — so a serial sweep is RTT-bound).
 const auditConcurrency = 16
 
+// errAuditReadDenied is auditTarget's INTERNAL early-stop signal (never surfaced): a by-design
+// write-only WORM copy whose whole probed set uniformly read-denied (ErrReadDenied) — the sweep stops
+// and classifies the tally normally (→ Unverifiable, exempt→benign). Not a fault.
+var errAuditReadDenied = errors.New("audit: target uniformly read-denied (write-only WORM early-stop)")
+
 // auditProbeTimeout bounds one per-target operation — a single Exists probe, one immutability config
 // read, a manifest fetch, or a single manifest-read / ledger-page in the inventory diff — so a
 // black-holing backend can't stall the integrity check (the DR ops run under a deadline-less signal
 // ctx). It is a PER-OPERATION bound, never a whole-sweep one, so a large HEALTHY corpus (many fast
 // operations) never false-fails. A var (not const) only so tests can lower it.
 var auditProbeTimeout = 30 * time.Second
+
+// storedPageBounded fetches ONE keyset page of the externalIDs the ledger records stored on target,
+// bounded by a per-PAGE deadline (auditProbeTimeout) — the domain-layer bound for the ONE ledger read
+// the DR audit sweeps drive from the domain (StoredExternalIDsPage, used by audit existence, inventory
+// diff, restore-all, drill), so the ledger page shares the sweep's per-operation timeout (the same
+// auditProbeTimeout that bounds a sink Exists/manifest read). EVERY OTHER adapter DB read self-bounds
+// at the DB ADAPTER with db.boundRead (StoredObjectsPage, StoredCountByTarget, TargetGapsPage,
+// filesPage, FileByID, the Probes, …). Between the two, every client-side DB read is bounded and none
+// can drift into an UNBOUNDED raw-ctx read a black-holed connection would hang (the pool's server-side
+// statement_timeout can't fire when no bytes ever return). It is a per-page bound, never a whole-sweep
+// one, so a large HEALTHY corpus (many fast pages) never false-fails. Callers wrap the error with their
+// own tag (errLedgerRead for audit/inventory, a command-specific message for drill/restore-all).
+//
+// Why auditProbeTimeout and NOT the operator's cfg.DBTimeout() (which db.boundRead uses): a DR sweep
+// bounds EVERY per-operation step at ONE uniform budget — a sink Exists/manifest read AND this ledger
+// page — so the sweep can't stall on any single op. A single index-only keyset page (KeysetPageSize
+// rows on the COLLATE "C" covering index) completing in <30s is a healthy ledger; a page exceeding it
+// is a sick one, which a DR integrity check SHOULD fault on rather than wait out. So this is
+// deliberately the sweep's per-operation bound, not the operator's whole-DB-op budget — raising
+// DBTimeout for a slow-but-alive ledger does not (and should not) loosen the audit's per-page bound.
+func storedPageBounded(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
+	pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
+	defer cancel()
+	return led.StoredExternalIDsPage(pctx, target, after, limit)
+}
+
+// storedPageLedgerTagged fetches one bounded ledger page and, on error, tags it with the errLedgerRead
+// sentinel — the ONE owner of the load-bearing "a ledger-page read error must route to FAULT (never a
+// silent worm-exempt benign Unverifiable)" contract that classifyAuditErr / classifyInventoryErr key on.
+// Shared by BOTH the existence sweep (auditTarget's keysetSample pageFn) and the inventory sweep
+// (ledgerStoredPull's keysetPull pageFn), so a future change to the tagging can't update one direction
+// and leave the other misrouting a wedged ledger page to a benign pass on a WORM target.
+func storedPageLedgerTagged(ctx context.Context, led Ledger, target, after string, limit int) ([]string, error) {
+	page, err := storedPageBounded(ctx, led, target, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("%w: ledger page for %s: %w", errLedgerRead, target, err)
+	}
+	return page, nil
+}
 
 // randKeysetStart returns a random externalID-shaped hex string — a rotating keyset start so a
 // SAMPLED audit checks a different band each run instead of the same fixed lowest-prefix band
@@ -31,6 +75,17 @@ func randKeysetStart() string {
 		return ""
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// sampledStart returns the keyset start for a sweep of `sample` ids: a rotating randKeysetStart() for a
+// SAMPLED sweep (sample>0), so successive runs cover a different band; "" for a FULL sweep (sample<=0),
+// which starts at the beginning and never wraps. The ONE owner of the sample→start pairing, shared by
+// Audit and the drill sampler so they can't drift on the band policy (keysetSample owns the wrap logic).
+func sampledStart(sample int) string {
+	if sample > 0 {
+		return randKeysetStart()
+	}
+	return ""
 }
 
 // Audit verifies the ledger against reality (FR-014 drift check / T030), returning one TargetVerdict
@@ -53,12 +108,17 @@ func randKeysetStart() string {
 // prefix every run, a permanent blind spot). A sampled sweep that reaches the end of the keyspace
 // with budget remaining WRAPS ONCE to "" so it still checks min(sample, total) objects. A full audit
 // (samplePerTarget<=0) starts at "" and never wraps.
+//
+// CANCELLATION CONTRACT (shared by CheckImmutability + AuditInventory): a parent-ctx cancellation
+// (SIGTERM) yields a benign NoData verdict for every target NOT YET completed (a target that finished a
+// real Drift/Verified before the cancel keeps it), NOT an error — an aborted sweep proved nothing about
+// the remaining targets, but their verdicts must not be spurious FAILURES. So VerdictReport.FailErr()
+// alone CANNOT tell a cancelled (INCOMPLETE) audit from a clean pass — the incomplete targets read
+// benign. The caller MUST fold ctx.Err() into its exit verdict to fail an interrupted run — see
+// runAudit's `verdicts = append(verdicts, ctx.Err())`. A future caller reducing via FailErr() alone
+// would read a cancelled, unverified audit as green.
 func Audit(ctx context.Context, led Ledger, targets []Target, samplePerTarget int) VerdictReport {
-	startAfter := ""
-	if samplePerTarget > 0 {
-		startAfter = randKeysetStart()
-	}
-	return auditWithStart(ctx, led, targets, samplePerTarget, startAfter)
+	return auditWithStart(ctx, led, targets, samplePerTarget, sampledStart(samplePerTarget))
 }
 
 // auditWithStart is the deterministic core: it sweeps from an EXPLICIT startAfter (Audit derives a
@@ -77,18 +137,21 @@ func auditWithStart(ctx context.Context, led Ledger, targets []Target, samplePer
 // confirm the target still holds them (Sink.Exists), keyset-paged from startAfter with a single
 // wrap. It tallies checked/missing/errored probes and classifies the result into a verdict.
 func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int, startAfter string) TargetVerdict {
-	var checked, missing, errored int
-	var panicErr error
+	// This direction ALWAYS probes via Sink.Exists (readClient) — it does NOT short-circuit a WORM target
+	// on the a-priori "has a separate audit credential" predicate. That predicate mis-classifies a
+	// READ-CAPABLE worker credential on a WORM (object-lock) bucket — object-lock restricts delete/
+	// overwrite, NOT GET — so such a target IS existence-verifiable and MUST be probed for silent loss;
+	// short-circuiting it to NoData silently disabled its DR verification. So: probe every target. A
+	// genuinely write-only WORM copy (PutObject-only creds) instead read-denies on each StatObject →
+	// errored++ → Unverifiable, which targetUnverifiableExempt (worm && no audit cred) then makes benign.
+	// A doomed HEAD per object on a full audit of a strictly-write-only target is avoided by the
+	// read-deny early-stop (auditTally.allReadDenied — not by skipping the target a-priori, the old bug).
+	var tally auditTally
 	name := t.Sink.Name()
+	exempt := targetUnverifiableExempt(t)
 	err := keysetSample(ctx, samplePerTarget, startAfter,
 		func(after string, limit int) ([]string, error) {
-			pctx, cancel := context.WithTimeout(ctx, auditProbeTimeout)
-			defer cancel()
-			page, perr := led.StoredExternalIDsPage(pctx, name, after, limit)
-			if perr != nil {
-				return nil, fmt.Errorf("%w: audit target %s: %w", errLedgerRead, name, perr)
-			}
-			return page, nil
+			return storedPageLedgerTagged(ctx, led, name, after, limit)
 		},
 		func(page []string) error {
 			results := existsPage(ctx, t.Sink, page)
@@ -97,49 +160,91 @@ func auditTarget(ctx context.Context, led Ledger, t Target, samplePerTarget int,
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
 			}
-			for _, e := range results {
-				checked++
-				switch {
-				case e.err != nil:
-					errored++
-					if errors.Is(e.err, ErrProbePanic) { // a driver panic is a code bug, not a benign read error
-						panicErr = e.err
-					}
-				case !e.present:
-					missing++
-				}
+			tally.add(results)
+			// Early-stop the doomed full sweep of a by-design write-only WORM copy: once EVERY probe so
+			// far uniformly read-denied, the credential demonstrably can't read ANY object, so the
+			// remaining objects are guaranteed to 403 to the SAME Unverifiable-exempt (benign) verdict.
+			// allReadDenied turns permanently false the instant any probe returns present / a clean
+			// 404-missing / a transient (non-403) error / a panic, so a READ-CAPABLE WORM (the silent-loss
+			// case the round-6 fix restored) is NEVER short-circuited — it full-sweeps and still catches
+			// missing objects. Gated on `exempt` so a non-worm target (whose Unverifiable FAILS) is fully swept.
+			if exempt && tally.allReadDenied() {
+				return errAuditReadDenied
 			}
 			return nil
 		})
-	if err != nil {
+	stoppedEarly := errors.Is(err, errAuditReadDenied)
+	if err != nil && !stoppedEarly {
 		return classifyAuditErr(ctx, name, err)
 	}
-	if panicErr != nil { // a recovered probe panic → Fault (fail-loud), not swallowed to Unverifiable
-		return TargetVerdict{Status: StatusFault, Checked: checked, Err: fmt.Errorf("audit probe %s: %w", name, panicErr), Detail: "probe panicked"}
+	return tally.verdict(name, stoppedEarly)
+}
+
+// auditTally accumulates one target's existence-probe outcomes across the swept pages, then classifies
+// them into a verdict — extracted from auditTarget so the loop + verdict switch don't inflate its
+// cyclomatic complexity, and so the early-stop signal (allReadDenied) has one clear owner.
+type auditTally struct {
+	checked, missing, errored, readDenied int
+	panicErr                              error
+}
+
+func (a *auditTally) add(results []existsResult) {
+	for _, e := range results {
+		a.checked++
+		switch {
+		case e.err != nil:
+			a.errored++
+			if errors.Is(e.err, ErrReadDenied) { // a definitive 403 (write-only credential)
+				a.readDenied++
+			}
+			if errors.Is(e.err, ErrProbePanic) { // a driver panic is a code bug, not a benign read error
+				a.panicErr = e.err
+			}
+		case !e.present:
+			a.missing++
+		}
 	}
-	detail := fmt.Sprintf("checked=%d missing=%d errors=%d", checked, missing, errored)
+}
+
+// allReadDenied reports whether EVERY probe so far uniformly read-denied (a definitively write-only
+// credential) — the write-only-WORM early-stop signal.
+func (a *auditTally) allReadDenied() bool { return a.checked > 0 && a.readDenied == a.checked }
+
+// verdict classifies the accumulated tally: a recovered panic → Fault (fail-loud on a code bug); a
+// missing object → Drift (silent loss); any other errored probe → Unverifiable (a WORM read-deny or a
+// broken read path); else Verified. stoppedEarly annotates the detail (a partial sweep of a write-only WORM).
+func (a *auditTally) verdict(name string, stoppedEarly bool) TargetVerdict {
+	if a.panicErr != nil {
+		return TargetVerdict{Status: StatusFault, Checked: a.checked, Err: fmt.Errorf("audit probe %s: %w", name, a.panicErr), Detail: "probe panicked"}
+	}
+	detail := fmt.Sprintf("checked=%d missing=%d errors=%d", a.checked, a.missing, a.errored)
+	if stoppedEarly {
+		detail += " (write-only WORM: stopped after a uniform read-deny page)"
+	}
 	switch {
-	case missing > 0: // ledger-stored but absent on the sink — silent loss
-		return TargetVerdict{Status: StatusDrift, Checked: checked, Missing: missing, Detail: detail}
-	case errored > 0: // couldn't determine presence for part/all of the sample — a WORM read-deny, or a broken read path
-		return TargetVerdict{Status: StatusUnverifiable, Checked: checked, Detail: detail}
+	case a.missing > 0: // ledger-stored but absent on the sink — silent loss
+		return TargetVerdict{Status: StatusDrift, Checked: a.checked, Missing: a.missing, Detail: detail}
+	case a.errored > 0: // couldn't determine presence for part/all of the sample — a WORM read-deny, or a broken read path
+		return TargetVerdict{Status: StatusUnverifiable, Checked: a.checked, Detail: detail}
 	default: // every probed object present (or nothing recorded stored) — clean
-		return TargetVerdict{Status: StatusVerified, Checked: checked, Detail: detail}
+		return TargetVerdict{Status: StatusVerified, Checked: a.checked, Detail: detail}
 	}
 }
 
 // classifyAuditErr folds a ledger→target sweep error into a verdict: a PARENT cancel (SIGTERM) →
-// NoData (benign; the top-level ctx.Err() fold surfaces the abort); a ledger read error → Fault;
-// anything else (a per-page deadline while the parent is live) → Unverifiable.
+// NoData (benign; the top-level ctx.Err() fold surfaces the abort); ANY other error → Fault — this
+// INCLUDES a per-page auditProbeTimeout DeadlineExceeded, which auditTarget wraps as errLedgerRead,
+// because a stalled/unreadable OWN ledger is our-side infra: page loudly, never worm-exempt. The
+// existence direction runs with NO per-target deadline (probeTargets timeout=0), so err here can ONLY be
+// a parent Canceled or an errLedgerRead-wrapped page error — the final Fault is a fail-LOUD catch-all for
+// any error class a future change could introduce: an unexpected classification here must PAGE, never
+// silently become an exempt-benign Unverifiable on a WORM target (the fail-open direction).
 func classifyAuditErr(parentCtx context.Context, name string, err error) TargetVerdict {
-	switch {
-	case cancelledInFlight(parentCtx, err):
+	if cancelledInFlight(parentCtx, err) {
 		return shutdownVerdict(err)
-	case errors.Is(err, errLedgerRead):
-		return TargetVerdict{Status: StatusFault, Err: fmt.Errorf("audit target %s: %w", name, err), Detail: "ledger read error"}
-	default:
-		return TargetVerdict{Status: StatusUnverifiable, Detail: fmt.Sprintf("sweep unverifiable (wedged/deadline): %v", err)}
 	}
+	// errLedgerRead (the only other reachable class today) AND any unexpected future class → Fault.
+	return TargetVerdict{Status: StatusFault, Err: fmt.Errorf("audit target %s: %w", name, err), Detail: "ledger/sweep read error"}
 }
 
 // keysetSample drives a random-band, single-wrap keyset sweep of up to `sample` ids (sample<=0 =
