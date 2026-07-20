@@ -56,7 +56,7 @@ func drConfig(t *testing.T, fileServiceBase string, extra ...string) (cfgPath, t
 func seedBackedUp(t *testing.T, n int, verTime time.Time) (cfgPath, targetDir, name string, hashes []string, fids []uuid.UUID) {
 	t.Helper()
 	ctx := context.Background()
-	content := map[uuid.UUID][]byte{}
+	var bodies [][]byte
 	for i := 0; i < n; i++ {
 		body := []byte(fmt.Sprintf("backed-up object %d — %s", i, uuid.NewString()))
 		h := sha3hex(body)
@@ -66,11 +66,11 @@ func seedBackedUp(t *testing.T, n int, verTime time.Time) (cfgPath, targetDir, n
 			fid, h, int64(len(body)), verTime); err != nil {
 			t.Fatalf("seed file %d: %v", i, err)
 		}
-		content[fid] = body
+		bodies = append(bodies, body)
 		hashes = append(hashes, h)
 		fids = append(fids, fid)
 	}
-	fs := stubFileService(t, content)
+	fs := stubFileService(t, bodies...)
 	cfgPath, targetDir, name = drConfig(t, fs.URL)
 	if err := runBackfill([]string{"--config", cfgPath}); err != nil {
 		t.Fatalf("seed backfill: %v", err)

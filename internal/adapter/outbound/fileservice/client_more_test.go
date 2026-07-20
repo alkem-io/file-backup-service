@@ -45,7 +45,7 @@ func TestFetchContentSuccess(t *testing.T) {
 	}
 }
 
-// TestPreflightPassesOn200: a 200 for the probe id means the server answered — Preflight's
+// TestPreflightPassesOn200: a 200 means the server answered — Preflight's
 // happy path (err==nil) closes the body and passes.
 func TestPreflightPassesOn200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

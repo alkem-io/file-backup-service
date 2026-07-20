@@ -10,15 +10,15 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
-// TestPreflightReachableOnServerResponse: any HTTP response means the server ANSWERED, so
-// Preflight passes — a transient 5xx (file-service up but its DB not ready during a
-// coordinated deploy), a 404 (probe id absent), or a 403 must NOT turn a required startup
-// check into a CrashLoopBackOff. (F3)
-func TestPreflightReachableOnServerResponse(t *testing.T) {
+// TestPreflightPassesWhenEndpointPresent: a non-404 answer means the server ANSWERED and the
+// by-hash endpoint EXISTS. 400 is the expected reply to the invalid-key probe (the handler ran
+// and rejected it); a transient 5xx (file-service up but DB not ready during a coordinated
+// deploy) or a 403 must also NOT crash-loop a required startup check.
+func TestPreflightPassesWhenEndpointPresent(t *testing.T) {
 	for _, status := range []int{
-		http.StatusServiceUnavailable,  // 503 — the crash-loop case
+		http.StatusBadRequest,          // 400 — endpoint validated the invalid probe key (present)
+		http.StatusServiceUnavailable,  // 503 — transient, reachable
 		http.StatusInternalServerError, // 500
-		http.StatusNotFound,            // 404 — probe id absent (ErrSourceGone)
 		http.StatusForbidden,           // 403
 	} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -28,7 +28,24 @@ func TestPreflightReachableOnServerResponse(t *testing.T) {
 		err := c.Preflight(context.Background())
 		srv.Close()
 		if err != nil {
-			t.Fatalf("Preflight on HTTP %d must pass (server answered = reachable), got: %v", status, err)
+			t.Fatalf("Preflight on HTTP %d must pass (endpoint present / reachable), got: %v", status, err)
+		}
+	}
+}
+
+// TestPreflightFailsWhenEndpointMissing: a 404/410 to the invalid-key probe means the route is
+// NOT registered — this file-service predates GET /internal/blob/{hash}/content. Preflight MUST
+// fail so an out-of-order deploy is a loud CrashLoopBackOff, not a silent whole-outbox skip.
+func TestPreflightFailsWhenEndpointMissing(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+		}))
+		c := New(srv.URL, 4, nil)
+		err := c.Preflight(context.Background())
+		srv.Close()
+		if err == nil {
+			t.Fatalf("Preflight on HTTP %d must FAIL (endpoint missing → out-of-order deploy)", status)
 		}
 	}
 }
