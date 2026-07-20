@@ -523,23 +523,12 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	if st.Failed > 0 {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
-	// A pass that made NO forward progress — nothing backed up, nothing even reaching a target
-	// (Deferred==0) — yet enumerated objects that every 404'd (Skipped>0) on a CLEAN sweep means
-	// the SOURCE 404'd every fetch: a store outage, a wrong fileServiceBase, or a file-service
-	// missing the /internal/blob endpoint (out-of-order deploy). Exit nonzero instead of a false
-	// all-clear that reports "backed=0" as success. Precisely guarded so it does NOT false-page on:
-	//   - a SIGTERM-interrupted resumable pass — sweepErr!=nil (Canceled), so we fall through and
-	//     `return sweepErr` for onShutdownOK to map to exit 0 (checked BEFORE this guard via the
-	//     sweepErr==nil condition);
-	//   - a DOWN BACKUP TARGET — objects fetched fine but Deferred>0 (a different fault, already
-	//     covered by FileBackupTargetCircuitOpen), so Deferred==0 is required;
-	//   - an empty corpus — Skipped==0.
-	// (A corpus where every `file` row references a blob the store no longer has is itself an
-	// inconsistency worth the nonzero exit — a refcount/GC bug, not a benign state.)
-	if sweepErr == nil && st.Backed == 0 && st.Deferred == 0 && st.Skipped > 0 {
-		return fmt.Errorf("backfill backed up NOTHING while skipping %d object(s) — the source 404'd every fetch "+
-			"(store outage / wrong fileServiceBase / missing /internal/blob/{hash}/content endpoint?)", st.Skipped)
-	}
+	// Skipped/Deferred/Cancelled are all benign for the exit code (the codebase's documented
+	// invariant: routine source-gone deletions do NOT fail a pass). A backfill that backed up
+	// NOTHING because the source 404'd everything (missing endpoint / outage) is surfaced as a
+	// LOUD ADVISORY in runBackfill's output instead — an exit-code guard there kept mis-firing on
+	// benign edges (a drain-window SIGTERM, a tiny all-deleted corpus) because "all-skipped" is
+	// ambiguous between an outage and legit deletions, which counts alone can't disambiguate.
 	return sweepErr
 }
 
@@ -834,6 +823,14 @@ func runBackfill(args []string) error {
 	pipeline, _ := isolatedPipeline(cfg, fsClient, ledger, targets)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d cancelled=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed, st.Cancelled)
+	// Loud advisory (not an exit-code verdict — "all-skipped" is ambiguous between an outage and
+	// legit deletions): a pass that backed up NOTHING yet enumerated objects that all 404'd is
+	// almost always a SOURCE problem worth an operator's eyes.
+	if st.Backed == 0 && st.Skipped > 0 && st.Deferred == 0 {
+		fmt.Fprintf(os.Stderr, "WARNING: backfill backed up NOTHING while skipping %d object(s) — the source 404'd every fetch. "+
+			"If unexpected, check source health: store outage / wrong fileServiceBase / a file-service missing "+
+			"the /internal/blob/{hash}/content endpoint (out-of-order deploy).\n", st.Skipped)
+	}
 	return backfillVerdict(st, err)
 }
 

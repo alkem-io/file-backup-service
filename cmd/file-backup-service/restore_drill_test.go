@@ -76,23 +76,19 @@ func TestBackfillVerdict(t *testing.T) {
 	if err := backfillVerdict(domain.BackfillStats{Backed: 5}, nil); err != nil {
 		t.Fatalf("a clean pass must be nil, got %v", err)
 	}
-	// clean sweep, backed=0, nothing deferred, objects skipped = the source 404'd every fetch
-	// (outage / missing endpoint) → must NOT pass as a clean backfill.
-	if err := backfillVerdict(domain.BackfillStats{Skipped: 100}, nil); err == nil {
-		t.Fatal("clean sweep, backed=0, all-skipped (source 404'd everything) must be a nonzero-exit error, got nil")
+	// Skipped is BENIGN for the exit code (the documented "routine deletions don't fail a pass"
+	// invariant): an all-skipped pass returns nil (the missing-endpoint case is surfaced as a loud
+	// stderr advisory in runBackfill, not an exit-code verdict, because all-skipped is ambiguous
+	// between an outage and legit deletions). This also means a drain-window SIGTERM and a tiny
+	// all-deleted corpus can't false-page.
+	if err := backfillVerdict(domain.BackfillStats{Skipped: 100}, nil); err != nil {
+		t.Fatalf("an all-skipped pass is benign for the exit code, got %v", err)
 	}
-	// a SIGTERM mid-backfill (backed=0, a couple skipped, rest cancelled, sweepErr=Canceled) must
-	// pass Canceled through — a resumable interruption is NOT a source outage.
+	// a SIGTERM mid-backfill passes Canceled through — a resumable interruption, exit 0.
 	if err := backfillVerdict(domain.BackfillStats{Skipped: 2, Cancelled: 98}, context.Canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("a cancelled backfill must pass Canceled through (resumable), got %v", err)
 	}
-	// backed=0 because a BACKUP TARGET is down (Deferred>0) is a target fault, not a source
-	// outage — must NOT false-page as "the source 404'd" (FileBackupTargetCircuitOpen covers it).
-	if err := backfillVerdict(domain.BackfillStats{Deferred: 50, Skipped: 3}, nil); err != nil {
-		t.Fatalf("a down-target pass (Deferred>0) must not be misdiagnosed as a source outage, got %v", err)
-	}
-	// empty corpus (backed=0, skipped=0) is a clean no-op; a normal run with a few incidental
-	// deletions (backed>0, some skipped) still passes.
+	// empty corpus is a clean no-op; a normal run with a few incidental deletions passes.
 	if err := backfillVerdict(domain.BackfillStats{}, nil); err != nil {
 		t.Fatalf("an empty corpus must be a clean no-op, got %v", err)
 	}
