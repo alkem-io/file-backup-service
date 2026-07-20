@@ -113,8 +113,8 @@ func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.Read
 // A genuinely-missing endpoint (out-of-order deploy) instead surfaces at RUNTIME: every fetch
 // 404s and each object is Skipped, which spikes filebackup_source_gone_total → the
 // FileBackupSourceGoneSpike alert pages; the skipped objects stay in the corpus and a later
-// backfill re-backs-them-up (and `backfill` itself exits nonzero on an all-404 sweep). Deploy
-// order stays file-service-first.
+// backfill re-backs-them-up (and a backfill that backs up nothing prints a loud source-health
+// advisory). Deploy order stays file-service-first.
 func (c *Client) Preflight(ctx context.Context) error {
 	rc, err := c.FetchContent(ctx, domain.BackupItem{ExternalID: preflightProbeHash})
 	switch {

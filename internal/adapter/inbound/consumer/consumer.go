@@ -245,8 +245,8 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 		// by-hash endpoint 404ing every path — spikes filebackup_source_gone_total and pages via
 		// FileBackupSourceGoneSpike, rather than being a silent drop to zero coverage. The skipped
 		// objects are recoverable: they stay in the corpus, so a backfill re-backs-them-up once the
-		// source is healthy (and `backfill` itself exits nonzero if it backs up nothing — see
-		// backfillVerdict — so an out-of-order deploy can't pass as a clean backfill either).
+		// source is healthy (and a backfill that backs up nothing prints a loud source-health
+		// advisory — see runBackfill — so an all-404 sweep is visible to an operator too).
 		if c.d.OnSourceGone != nil {
 			c.d.OnSourceGone()
 		}

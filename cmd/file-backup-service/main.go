@@ -824,9 +824,11 @@ func runBackfill(args []string) error {
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d cancelled=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed, st.Cancelled)
 	// Loud advisory (not an exit-code verdict — "all-skipped" is ambiguous between an outage and
-	// legit deletions): a pass that backed up NOTHING yet enumerated objects that all 404'd is
-	// almost always a SOURCE problem worth an operator's eyes.
-	if st.Backed == 0 && st.Skipped > 0 && st.Deferred == 0 {
+	// legit deletions): a CLEAN pass that backed up NOTHING yet enumerated objects that all 404'd
+	// is almost always a SOURCE problem worth an operator's eyes. Excludes Cancelled (a drain-window
+	// SIGTERM is a resumable interruption, not an outage) and Failed (a genuine failure already
+	// exits nonzero via backfillVerdict — a different signal), so the advisory can't cry wolf.
+	if st.Backed == 0 && st.Skipped > 0 && st.Deferred == 0 && st.Cancelled == 0 && st.Failed == 0 {
 		fmt.Fprintf(os.Stderr, "WARNING: backfill backed up NOTHING while skipping %d object(s) — the source 404'd every fetch. "+
 			"If unexpected, check source health: store outage / wrong fileServiceBase / a file-service missing "+
 			"the /internal/blob/{hash}/content endpoint (out-of-order deploy).\n", st.Skipped)
