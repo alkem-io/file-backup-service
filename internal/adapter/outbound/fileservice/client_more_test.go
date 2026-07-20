@@ -20,9 +20,9 @@ import (
 // FileID — so replication reads the exact enqueued version, not the document's current content.
 func TestFetchContentSuccess(t *testing.T) {
 	const hash = "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
-	var gotPath string
+	pathCh := make(chan string, 1) // channel receive gives the happens-before edge -race needs
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
+		pathCh <- r.URL.Path
 		_, _ = io.WriteString(w, "hello-bytes")
 	}))
 	defer srv.Close()
@@ -32,7 +32,7 @@ func TestFetchContentSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchContent on 200 must succeed: %v", err)
 	}
-	if want := "/internal/blob/" + hash + "/content"; gotPath != want {
+	if want, gotPath := "/internal/blob/"+hash+"/content", <-pathCh; gotPath != want {
 		t.Fatalf("fetch path = %q, want %q (must key on ExternalID, not FileID)", gotPath, want)
 	}
 	defer func() { _ = rc.Close() }()

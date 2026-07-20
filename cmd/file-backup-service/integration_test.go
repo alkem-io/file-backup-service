@@ -43,14 +43,11 @@ func TestMain(m *testing.M) {
 
 // (sha3hex is defined in main_test.go — reused here.)
 
-// stubFileService is a faithful stand-in for file-service's content-addressed read
+// stubFileService is a stand-in for file-service's content-addressed read
 // GET /internal/blob/{hash}/content. It keys on the object's SHA3-256 hash (the content itself),
 // so callers pass the bodies — there is no id: the stub keys each by sha3hex(body), which equals
-// the outbox/corpus externalID the worker requests. It mirrors the real endpoint's status
-// contract so Preflight's invalid-key probe behaves as in production:
-//   - a key that fails the store's 32–128-alphanumeric rule → 400 (the endpoint validated it),
-//   - a valid-but-absent hash → 404,
-//   - a present hash → 200 + bytes.
+// the outbox/corpus externalID the worker requests. A present hash → 200 + bytes; anything else
+// (incl. the Preflight probe's valid-but-absent hash) → 404, which Preflight treats as reachable.
 func stubFileService(t *testing.T, bodies ...[]byte) *httptest.Server {
 	t.Helper()
 	byHash := make(map[string][]byte, len(bodies))
@@ -59,39 +56,16 @@ func stubFileService(t *testing.T, bodies ...[]byte) *httptest.Server {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(r.URL.Path, "/") // /internal/blob/{hash}/content
-		if len(parts) < 4 {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		key := parts[3]
-		if !validStoreKey(key) {
-			w.WriteHeader(http.StatusBadRequest) // matches file-service's ErrInvalidKey → 400
-			return
-		}
-		if b, ok := byHash[key]; ok {
-			_, _ = w.Write(b)
-			return
+		if len(parts) >= 4 {
+			if b, ok := byHash[parts[3]]; ok {
+				_, _ = w.Write(b)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
-}
-
-// validStoreKey mirrors file-service's isValidExternalID (32–128 ASCII alphanumerics) — the
-// permissive rule that accepts SHA3-256 hex and legacy IPFS CIDs while rejecting traversal.
-func validStoreKey(s string) bool {
-	if len(s) < 32 || len(s) > 128 {
-		return false
-	}
-	for _, c := range s {
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // harnessConfig renders a config.yaml pointing at the harness + a single filesystem target in a

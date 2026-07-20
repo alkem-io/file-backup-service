@@ -523,13 +523,20 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	if st.Failed > 0 {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
-	// backed=0 while objects WERE enumerated and skipped (source-absent) is NOT a clean run: a
-	// healthy backfill backs up at least the objects it enumerates (already-present counts as
-	// Backed). All-skipped means the source 404'd every fetch — a store outage, a wrong
-	// fileServiceBase, or a file-service missing the /internal/blob endpoint (an out-of-order
-	// deploy) — so exit nonzero instead of a false all-clear that reports "backed=0" as success.
-	// (An empty corpus is backed=0 AND skipped=0 → a clean no-op, correctly not flagged.)
-	if st.Backed == 0 && st.Skipped > 0 {
+	// A pass that made NO forward progress — nothing backed up, nothing even reaching a target
+	// (Deferred==0) — yet enumerated objects that every 404'd (Skipped>0) on a CLEAN sweep means
+	// the SOURCE 404'd every fetch: a store outage, a wrong fileServiceBase, or a file-service
+	// missing the /internal/blob endpoint (out-of-order deploy). Exit nonzero instead of a false
+	// all-clear that reports "backed=0" as success. Precisely guarded so it does NOT false-page on:
+	//   - a SIGTERM-interrupted resumable pass — sweepErr!=nil (Canceled), so we fall through and
+	//     `return sweepErr` for onShutdownOK to map to exit 0 (checked BEFORE this guard via the
+	//     sweepErr==nil condition);
+	//   - a DOWN BACKUP TARGET — objects fetched fine but Deferred>0 (a different fault, already
+	//     covered by FileBackupTargetCircuitOpen), so Deferred==0 is required;
+	//   - an empty corpus — Skipped==0.
+	// (A corpus where every `file` row references a blob the store no longer has is itself an
+	// inconsistency worth the nonzero exit — a refcount/GC bug, not a benign state.)
+	if sweepErr == nil && st.Backed == 0 && st.Deferred == 0 && st.Skipped > 0 {
 		return fmt.Errorf("backfill backed up NOTHING while skipping %d object(s) — the source 404'd every fetch "+
 			"(store outage / wrong fileServiceBase / missing /internal/blob/{hash}/content endpoint?)", st.Skipped)
 	}

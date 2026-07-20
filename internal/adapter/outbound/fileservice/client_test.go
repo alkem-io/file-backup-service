@@ -14,7 +14,7 @@ import (
 // Preflight passes — the expected 404 (probe hash absent), a transient 5xx (file-service up but
 // DB not ready during a coordinated deploy / a mid-rollout old pod), or a 403 must NOT turn a
 // required startup check into a CrashLoopBackOff. A genuinely-missing endpoint surfaces at
-// runtime (fetches 404 → the corpus cross-check DEFERS live objects → RPO alert), never here.
+// runtime (fetches 404 → objects Skipped → FileBackupSourceGoneSpike alert; backfill recovers), never here.
 func TestPreflightReachableOnServerResponse(t *testing.T) {
 	for _, status := range []int{
 		http.StatusNotFound,            // 404 — probe hash absent (or a mid-rollout old pod / missing route)
