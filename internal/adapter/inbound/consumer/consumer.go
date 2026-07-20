@@ -239,17 +239,7 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 			c.d.Logger.Error("release claim on shutdown", zap.Int64("id", e.ID), zap.Error(rerr))
 		}
 	case errors.Is(err, domain.ErrSourceGone):
-		// The source was deleted before we could back it up — benign and terminal.
-		// Skip it so it doesn't burn ~10 retries and page on a non-problem. Emit a
-		// metric so a MASS skip (e.g. a wrong fileServiceBase 404ing every path) is
-		// visible/alertable rather than a silent, invisible drop to zero coverage.
-		if c.d.OnSourceGone != nil {
-			c.d.OnSourceGone()
-		}
-		c.d.Logger.Info("source gone, skipping", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID))
-		if serr := c.d.Outbox.Skip(bctx, e.ID); serr != nil {
-			c.d.Logger.Error("skip vanished source", zap.Int64("id", e.ID), zap.Error(serr))
-		}
+		c.settleSourceGone(bctx, e)
 	case deferred:
 		// The object stored on every REACHABLE target; its only gap is a persistently-down
 		// (circuit-open) target — NOT a failure of THIS object. Defer it (backoff,
@@ -272,6 +262,42 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 		c.fail(bctx, e.ID, err.Error())
 	default: // !ok
 		c.fail(bctx, e.ID, "not all targets stored")
+	}
+}
+
+// settleSourceGone handles a source 404, which is AMBIGUOUS: the object was genuinely deleted
+// (superseded/orphaned) OR the source is transiently unavailable — a store outage, file-service
+// down/rolling, or a missing endpoint 404ing a live object. Skipping the latter would record a
+// still-existing object as gone (mass false source-deletion in the DR signal), so we do NOT take
+// file-service's 404 as authoritative — we consult the DB corpus (the source of truth for
+// "should this exist"):
+//   - still referenced   → the source is unavailable → DEFER (re-claimable, NO attempt burn); a
+//     persistent outage then surfaces via the RPO/oldest-pending-age alert and auto-recovers
+//     when the source returns — nothing is wrongly skipped.
+//   - not referenced     → genuinely gone → Skip (benign, terminal) + the source-gone metric.
+//   - corpus query fails → fail-safe to DEFER; never Skip on uncertainty.
+func (c *Consumer) settleSourceGone(bctx context.Context, e domain.OutboxEntry) {
+	referenced, cerr := c.d.Outbox.SourceStillReferenced(bctx, e.ExternalID)
+	if cerr != nil || referenced {
+		if cerr != nil {
+			c.d.Logger.Warn("source-gone corpus check failed; deferring (fail-safe, will not skip on uncertainty)",
+				zap.Int64("id", e.ID), zap.String("hash", e.ExternalID), zap.Error(cerr))
+		} else {
+			c.d.Logger.Warn("source 404 but object still referenced in corpus — source unavailable, deferring",
+				zap.Int64("id", e.ID), zap.String("hash", e.ExternalID))
+		}
+		if derr := c.d.Outbox.Defer(bctx, e.ID); derr != nil {
+			c.d.Logger.Error("defer unavailable source", zap.Int64("id", e.ID), zap.Error(derr))
+		}
+		return
+	}
+	// Genuinely gone. Emit the metric so a residual mass-skip is still visible/alertable.
+	if c.d.OnSourceGone != nil {
+		c.d.OnSourceGone()
+	}
+	c.d.Logger.Info("source gone (not referenced in corpus), skipping", zap.Int64("id", e.ID), zap.String("hash", e.ExternalID))
+	if serr := c.d.Outbox.Skip(bctx, e.ID); serr != nil {
+		c.d.Logger.Error("skip vanished source", zap.Int64("id", e.ID), zap.Error(serr))
 	}
 }
 

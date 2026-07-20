@@ -17,6 +17,7 @@ import (
 type recordingOutbox struct {
 	action     string
 	failReason string
+	referenced bool // SourceStillReferenced's return (default false → genuinely gone → Skip)
 }
 
 func (o *recordingOutbox) Claim(context.Context, int) ([]domain.OutboxEntry, error) { return nil, nil }
@@ -29,7 +30,10 @@ func (o *recordingOutbox) Fail(_ context.Context, _ int64, reason string) (bool,
 func (o *recordingOutbox) ReapStale(context.Context, time.Duration) (int, error) { return 0, nil }
 func (o *recordingOutbox) Release(context.Context, int64) error                  { o.action = "release"; return nil }
 func (o *recordingOutbox) Skip(context.Context, int64) error                     { o.action = "skip"; return nil }
-func (o *recordingOutbox) Probe(context.Context) error                           { return nil }
+func (o *recordingOutbox) SourceStillReferenced(context.Context, string) (bool, error) {
+	return o.referenced, nil
+}
+func (o *recordingOutbox) Probe(context.Context) error { return nil }
 
 // expiredDeadline returns a context already past its deadline (Err()==DeadlineExceeded) —
 // the per-object-timeout signal, without sleeping.
@@ -56,6 +60,7 @@ func TestSettleRoutesEachOutcome(t *testing.T) {
 		name         string
 		ctx, objCtx  context.Context
 		ok, deferred bool
+		referenced   bool // corpus still references the hash → a 404 means source-unavailable, not gone
 		err          error
 		wantAction   string
 		wantTimeout  bool // OnObjectTimeout fired
@@ -64,7 +69,11 @@ func TestSettleRoutesEachOutcome(t *testing.T) {
 		{name: "done", ctx: bg, objCtx: bg, ok: true, wantAction: "done"},
 		// Shutdown (parent ctx cancelled) takes precedence over a failure err: Release, no attempt.
 		{name: "shutdown-release", ctx: cancelled(t), objCtx: cancelled(t), err: errFail, wantAction: "release"},
+		// 404 AND the corpus no longer references the hash → genuinely gone → Skip + metric.
 		{name: "source-gone-skip", ctx: bg, objCtx: bg, err: domain.ErrSourceGone, wantAction: "skip", wantGone: true},
+		// 404 BUT the corpus still references the hash → the source is unavailable, not gone →
+		// Defer (no attempt burn), and the source-gone metric must NOT fire (it isn't gone).
+		{name: "source-unavailable-defer", ctx: bg, objCtx: bg, err: domain.ErrSourceGone, referenced: true, wantAction: "defer"},
 		// A plain defer (circuit-open target, no timeout): Defer, and the timeout metric must NOT fire.
 		{name: "defer-no-timeout", ctx: bg, objCtx: bg, deferred: true, wantAction: "defer"},
 		// A per-object timeout that tripped the circuit surfaces as a defer — still fire the metric (V5).
@@ -79,7 +88,7 @@ func TestSettleRoutesEachOutcome(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ob := &recordingOutbox{}
+			ob := &recordingOutbox{referenced: tc.referenced}
 			var timeoutFired, goneFired bool
 			c := New(Deps{
 				Outbox:          ob,

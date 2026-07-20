@@ -198,3 +198,32 @@ func TestOutboxReapStale(t *testing.T) {
 		}
 	})
 }
+
+// SourceStillReferenced maps the file-corpus EXISTS query to a bool, and surfaces a query error.
+func TestSourceStillReferenced(t *testing.T) {
+	t.Run("referenced", func(t *testing.T) {
+		repo, mock := newMockOutbox(t)
+		mock.ExpectQuery("EXISTS").WithArgs("h1").
+			WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+		got, err := repo.SourceStillReferenced(context.Background(), "h1")
+		if err != nil || !got {
+			t.Fatalf("got (%v,%v), want (true,nil)", got, err)
+		}
+	})
+	t.Run("gone", func(t *testing.T) {
+		repo, mock := newMockOutbox(t)
+		mock.ExpectQuery("EXISTS").WithArgs("h2").
+			WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+		got, err := repo.SourceStillReferenced(context.Background(), "h2")
+		if err != nil || got {
+			t.Fatalf("got (%v,%v), want (false,nil)", got, err)
+		}
+	})
+	t.Run("query error", func(t *testing.T) {
+		repo, mock := newMockOutbox(t)
+		mock.ExpectQuery("EXISTS").WithArgs("h3").WillReturnError(errors.New("boom"))
+		if _, err := repo.SourceStillReferenced(context.Background(), "h3"); err == nil {
+			t.Fatal("want error from a failed corpus query")
+		}
+	})
+}

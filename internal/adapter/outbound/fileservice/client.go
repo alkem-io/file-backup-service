@@ -17,12 +17,10 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
-// preflightProbeKey is a deliberately INVALID content key. A file-service that exposes
-// GET /internal/blob/{hash}/content validates the key and returns 400; one that predates the
-// endpoint 404s (chi route-miss). Preflight uses that gap to tell "endpoint present" from
-// "endpoint missing" — which a valid-but-absent hash could NOT (both 404). The hyphens make it
-// fail the store's alphanumeric key rule.
-const preflightProbeKey = "preflight-probe-not-a-content-hash"
+// preflightProbeHash is a syntactically valid but never-existing content hash: a by-hash GET
+// that a healthy file-service answers with a definite 404, exercising the same route the
+// runtime fetch uses. 64 zeros is a valid SHA3-256 shape no real content can produce.
+const preflightProbeHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
 // errRemoteStatus marks a fetch that got a NON-success HTTP status (not 200/404/410) — the
 // server ANSWERED, it just returned an error (e.g. a transient 5xx during a coordinated
@@ -102,30 +100,30 @@ func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.Read
 	return resp.Body, nil
 }
 
-// Preflight checks, at startup, that file-service is reachable AND actually exposes the
-// by-hash blob endpoint — by probing with an invalid key that a present endpoint rejects (400):
+// Preflight checks file-service is REACHABLE at startup (parity with the DB/sink checks): a GET
+// for a nonexistent object. ANY HTTP response — the expected 404 (ErrSourceGone) for the probe
+// hash, or a transient 5xx/403 — means the server ANSWERED and is reachable, so the gate passes
+// and runtime fetches retry with backoff until file-service is healthy. Only a connection/dial/
+// timeout error (the server did NOT answer) fails, so a transient 5xx or a mid-rollout old pod
+// can't turn this required check into a CrashLoopBackOff.
 //
-//   - 400 (errRemoteStatus — the handler ran and rejected the bad key), or any other
-//     non-success like a transient 5xx (a coordinated deploy where file-service is up but its
-//     DB isn't ready, or a 403): the server ANSWERED and the endpoint EXISTS → PASS. A transient
-//     5xx must not crash-loop startup; runtime fetches retry with backoff.
-//   - 404/410 (ErrSourceGone): the route is NOT registered — this file-service predates
-//     GET /internal/blob/{hash}/content. FAIL. Running the worker against it would 404 every
-//     fetch and silently drain the whole outbox to 'skipped' with green health; a loud
-//     CrashLoopBackOff until file-service is upgraded is the correct, visible failure. (Deploy
-//     order is file-service first; this catches an out-of-order deploy.)
-//   - transport error (dial/TLS/timeout — the server did NOT answer): unreachable → FAIL.
+// It deliberately does NOT try to prove the by-hash endpoint EXISTS (a probe can't tell a
+// route-miss 404 from an object-miss 404, and hard-failing on 404 would crash-loop the worker
+// during a normal file-service rolling update — an old pod behind the ClusterIP 404s the probe).
+// A genuinely-missing endpoint (out-of-order deploy) instead surfaces at RUNTIME: every fetch
+// 404s, but the corpus cross-check (SourceStillReferenced) DEFERS those live objects rather than
+// skipping, so nothing is lost and the RPO/oldest-pending-age alert pages. Deploy order stays
+// file-service-first.
 func (c *Client) Preflight(ctx context.Context) error {
-	rc, err := c.FetchContent(ctx, domain.BackupItem{ExternalID: preflightProbeKey})
+	rc, err := c.FetchContent(ctx, domain.BackupItem{ExternalID: preflightProbeHash})
 	switch {
 	case err == nil:
 		_ = rc.Close()
-		return nil // 200 (unexpected for an invalid key, but the server answered) — reachable
-	case errors.Is(err, errRemoteStatus):
-		return nil // 400 (endpoint validated the bad key) or 5xx/403 — reachable AND endpoint present
+		return nil
 	case errors.Is(err, domain.ErrSourceGone):
-		return fmt.Errorf("file-service is missing GET /internal/blob/{hash}/content "+
-			"(404 on the endpoint probe) — upgrade file-service before the worker: %w", err)
+		return nil // 404/410: reachable, the probe hash simply doesn't exist
+	case errors.Is(err, errRemoteStatus):
+		return nil // 5xx/403/…: the server ANSWERED (reachable); a transient error must not crash-loop startup
 	default:
 		return fmt.Errorf("file-service unreachable: %w", err)
 	}
