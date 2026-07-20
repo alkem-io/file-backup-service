@@ -14,7 +14,7 @@ import (
 // field that backfill/reconcile don't populate (which would silently be the zero value); the
 // "pipeline reads only content-identity" invariant is thus enforced by the type, not a comment.
 type BackupItem struct {
-	FileID     uuid.UUID     // file.id — the fileservice Source fetches bytes by it (uuid.Nil for reconcile, which keys on ExternalID)
+	FileID     uuid.UUID     // file.id — a breadcrumb only (attribution, backfill enumeration); the fileservice Source fetches bytes by ExternalID, so this may be uuid.Nil (e.g. reconcile)
 	ExternalID string        // content hash (SHA3-256), NOT a uuid — the identity, key, and verifier
 	Size       int64         // object size (breadcrumb; unverified outbox hearsay until the stream is hashed)
 	CreatedBy  uuid.NullUUID // breadcrumb; Valid=false for a NULL createdBy

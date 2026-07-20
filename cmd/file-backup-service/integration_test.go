@@ -43,23 +43,25 @@ func TestMain(m *testing.M) {
 
 // (sha3hex is defined in main_test.go — reused here.)
 
-// stubFileService serves object content at GET /internal/file/{id}/content: a known id returns
-// its bytes; anything else 404s (which Preflight treats as reachable). The uuid.Nil preflight
-// probe therefore passes.
+// stubFileService serves object content at GET /internal/blob/{hash}/content — the
+// content-addressed read the worker now uses: it keys on the object's SHA3-256 hash, not the
+// document id. Callers still pass a fileId→bytes map (the fileId is the outbox breadcrumb); the
+// stub re-keys it by sha3hex(bytes), which equals the outbox externalID the worker requests. A
+// known hash returns its bytes; anything else 404s (which Preflight treats as reachable), so the
+// preflightProbeHash probe passes.
 func stubFileService(t *testing.T, content map[uuid.UUID][]byte) *httptest.Server {
 	t.Helper()
+	byHash := make(map[string][]byte, len(content))
+	for _, b := range content {
+		byHash[sha3hex(b)] = b
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.URL.Path, "/") // /internal/file/{id}/content
+		parts := strings.Split(r.URL.Path, "/") // /internal/blob/{hash}/content
 		if len(parts) < 4 {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		id, err := uuid.Parse(parts[3])
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if b, ok := content[id]; ok {
+		if b, ok := byHash[parts[3]]; ok {
 			_, _ = w.Write(b)
 			return
 		}

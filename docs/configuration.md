@@ -56,7 +56,7 @@ file-backup-service serve     # the worker
 
 | YAML key | Env override | Type | Default | Constraints | Description |
 |---|---|---|---|---|---|
-| `fileServiceBase` | `FBS_FILESERVICEBASE` | string (URL) | — | **required** (serve/backfill) | Base URL of the file-service internal content API (`GET {base}/internal/file/{id}/content`). |
+| `fileServiceBase` | `FBS_FILESERVICEBASE` | string (URL) | — | **required** (serve/backfill) | Base URL of the file-service internal content API (`GET {base}/internal/blob/{hash}/content` — content-addressed read by SHA3-256 hash). |
 | `concurrency` | `FBS_CONCURRENCY` | int | `8` | ≤ 1024 | In-flight objects: the fan-out worker pool size (serve) and the batch sweep parallelism (backfill/reconcile). Also sizes the pgx pools. |
 | `perObjectTimeoutSec` | `FBS_PEROBJECTTIMEOUTSEC` | int (s) | `1800` | ≤ 604800 (1 wk) | Deadline for backing up / repairing one object. A hung fetch/sink fails that object, not the pass. |
 | `staleTTLSec` | `FBS_STALETTLSEC` | int (s) | `3600` | > `perObjectTimeoutSec` + 30s; ≤ 1 wk | How long a claimed outbox row may stay `in_progress` before the reaper requeues it. Must exceed the per-object timeout + the bookkeeping window so a settling object isn't reaped. |

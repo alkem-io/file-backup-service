@@ -8,22 +8,32 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
 // TestFetchContentSuccess: a 200 response streams the object body back to the caller. It also
 // exercises New's maxIdleConns<1 default (the pool falls back to 16) — a nil http.Client with an
-// unset concurrency must still build a working transport.
+// unset concurrency must still build a working transport. And it asserts the fetch is keyed by
+// the object's ExternalID (content hash) on the /internal/blob/{hash}/content path — NOT by
+// FileID — so replication reads the exact enqueued version, not the document's current content.
 func TestFetchContentSuccess(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	const hash = "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
 		_, _ = io.WriteString(w, "hello-bytes")
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, 0, nil) // maxIdleConns<1 → default idle-conn pool
-	rc, err := c.FetchContent(context.Background(), domain.BackupItem{})
+	rc, err := c.FetchContent(context.Background(), domain.BackupItem{ExternalID: hash, FileID: uuid.New()})
 	if err != nil {
 		t.Fatalf("FetchContent on 200 must succeed: %v", err)
+	}
+	if want := "/internal/blob/" + hash + "/content"; gotPath != want {
+		t.Fatalf("fetch path = %q, want %q (must key on ExternalID, not FileID)", gotPath, want)
 	}
 	defer func() { _ = rc.Close() }()
 	b, err := io.ReadAll(rc)
