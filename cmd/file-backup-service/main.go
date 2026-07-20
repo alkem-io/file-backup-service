@@ -523,6 +523,16 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	if st.Failed > 0 {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
+	// backed=0 while objects WERE enumerated and skipped (source-absent) is NOT a clean run: a
+	// healthy backfill backs up at least the objects it enumerates (already-present counts as
+	// Backed). All-skipped means the source 404'd every fetch — a store outage, a wrong
+	// fileServiceBase, or a file-service missing the /internal/blob endpoint (an out-of-order
+	// deploy) — so exit nonzero instead of a false all-clear that reports "backed=0" as success.
+	// (An empty corpus is backed=0 AND skipped=0 → a clean no-op, correctly not flagged.)
+	if st.Backed == 0 && st.Skipped > 0 {
+		return fmt.Errorf("backfill backed up NOTHING while skipping %d object(s) — the source 404'd every fetch "+
+			"(store outage / wrong fileServiceBase / missing /internal/blob/{hash}/content endpoint?)", st.Skipped)
+	}
 	return sweepErr
 }
 

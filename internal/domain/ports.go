@@ -60,13 +60,6 @@ type Outbox interface {
 	// Skip terminally records an entry as 'skipped' — the source object no longer
 	// exists (ErrSourceGone), which is benign, not a failure to retry.
 	Skip(ctx context.Context, id int64) error
-	// SourceStillReferenced reports whether any permanent file row still references this
-	// content hash. On a source 404 it disambiguates the ONLY two things a 404 can mean:
-	// the object is genuinely gone (no file row → Skip) vs the source is transiently
-	// unavailable (still referenced → a store outage / file-service down / missing endpoint
-	// is 404ing a live object → Defer, never Skip). The DB corpus is the source of truth for
-	// "should this exist", so we never record a live object as gone on file-service's word.
-	SourceStillReferenced(ctx context.Context, externalID string) (bool, error)
 	// Probe verifies the outbox is reachable AND has the columns the consumer
 	// depends on (visibleAt/deliveries/attempts/claimedAt/size) so a scoped-role or
 	// schema/contract drift fails loudly at startup, not as a green-health silent

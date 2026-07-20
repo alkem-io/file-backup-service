@@ -76,6 +76,19 @@ func TestBackfillVerdict(t *testing.T) {
 	if err := backfillVerdict(domain.BackfillStats{Backed: 5}, nil); err != nil {
 		t.Fatalf("a clean pass must be nil, got %v", err)
 	}
+	// backed=0 while objects were skipped = the source 404'd every fetch (outage / missing
+	// endpoint) → must NOT pass as a clean backfill, even with a nil sweepErr.
+	if err := backfillVerdict(domain.BackfillStats{Skipped: 100}, nil); err == nil {
+		t.Fatal("backed=0 with skips (source 404'd everything) must be a nonzero-exit error, got nil")
+	}
+	// but an empty corpus (backed=0, skipped=0) is a clean no-op, and a normal run with a few
+	// incidental deletions (backed>0, some skipped) still passes.
+	if err := backfillVerdict(domain.BackfillStats{}, nil); err != nil {
+		t.Fatalf("an empty corpus must be a clean no-op, got %v", err)
+	}
+	if err := backfillVerdict(domain.BackfillStats{Backed: 90, Skipped: 3}, nil); err != nil {
+		t.Fatalf("a normal run with a few incidental deletions must pass, got %v", err)
+	}
 }
 
 // TestReconcileVerdict (Alt#2): same policy — a genuine failure OR a Skipped (on NO target) coinciding

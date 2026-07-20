@@ -214,21 +214,6 @@ func (r *OutboxRepo) Skip(ctx context.Context, id int64) error {
 	return r.transition(ctx, id, "skip", `status='skipped', "claimedAt"=NULL`)
 }
 
-// SourceStillReferenced reports whether any permanent file row still references this content
-// hash — the authoritative "should this object exist" the worker consults on a source 404 to
-// tell a genuinely-gone object from a transiently-unavailable source. Uses the SELECT-on-file
-// grant (same grant backfill's corpus enumeration uses). A bounded, index-friendly EXISTS.
-func (r *OutboxRepo) SourceStillReferenced(ctx context.Context, externalID string) (bool, error) {
-	const q = `SELECT EXISTS(SELECT 1 FROM file WHERE "externalID"=$1 AND "temporaryLocation" IS NOT TRUE)`
-	ctx, cancel := boundRead(ctx, r.readTimeout)
-	defer cancel()
-	var exists bool
-	if err := r.p.QueryRow(ctx, q, externalID).Scan(&exists); err != nil {
-		return false, fmt.Errorf("source-referenced check: %w", err)
-	}
-	return exists, nil
-}
-
 // ReapStale requeues entries stuck in_progress past ttl (a crashed/wedged
 // delivery — the per-object timeout would have Failed a merely-slow one). It
 // counts them via `deliveries` and dead-letters a crash-looping object once it

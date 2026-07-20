@@ -27,17 +27,15 @@ import (
 // recorder must be race-clean. It is DISTINCT from consumer_test.go's recordingOutbox (which
 // only serves the settle() table) — reused would have meant tangling two unrelated fakes.
 type fakeOutbox struct {
-	mu            sync.Mutex
-	claimFn       func(n int) ([]domain.OutboxEntry, error)
-	reapFn        func(ttl time.Duration) (int, error)
-	failRet       func() (bool, error) // Fail's return (deadLettered, err); nil => (false, nil)
-	errOn         map[string]error     // per-method error injection (markdone/defer/release/skip)
-	markDone      int
-	failed        int
-	skipped       int
-	deferred      int
-	referencedRet func() (bool, error) // SourceStillReferenced's return; nil => (false, nil)
-	failReasons   []string
+	mu          sync.Mutex
+	claimFn     func(n int) ([]domain.OutboxEntry, error)
+	reapFn      func(ttl time.Duration) (int, error)
+	failRet     func() (bool, error) // Fail's return (deadLettered, err); nil => (false, nil)
+	errOn       map[string]error     // per-method error injection (markdone/defer/release/skip)
+	markDone    int
+	failed      int
+	skipped     int
+	failReasons []string
 }
 
 func (o *fakeOutbox) Claim(_ context.Context, n int) ([]domain.OutboxEntry, error) {
@@ -60,18 +58,7 @@ func (o *fakeOutbox) MarkDone(context.Context, int64) error {
 func (o *fakeOutbox) Defer(context.Context, int64) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.deferred++
 	return o.errOn["defer"]
-}
-
-func (o *fakeOutbox) SourceStillReferenced(context.Context, string) (bool, error) {
-	o.mu.Lock()
-	fn := o.referencedRet
-	o.mu.Unlock()
-	if fn != nil {
-		return fn()
-	}
-	return false, nil // default: not referenced → genuinely gone → Skip (prior behaviour)
 }
 
 func (o *fakeOutbox) Release(context.Context, int64) error {
