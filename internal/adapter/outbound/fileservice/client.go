@@ -136,7 +136,7 @@ func (c *Client) Preflight(ctx context.Context) error {
 	case errors.Is(err, domain.ErrSourceGone):
 		// 404/410 for an INVALID key ⇒ the /blob route is missing (deploy skew: an old pod behind
 		// the ClusterIP) or this isn't file-service. Refuse to start; do NOT mass-skip the outbox.
-		return fmt.Errorf("file-service preflight: %s has no /internal/blob route (404 to an invalid-key probe) — deploy skew or wrong fileServiceBase: %w", c.baseURL, err)
+		return fmt.Errorf("file-service preflight: %s has no /internal/blob route (source-gone status 404/410 to an invalid-key probe) — deploy skew or wrong fileServiceBase: %w", c.baseURL, err)
 	case errors.Is(err, errRemoteStatus):
 		// The route ANSWERED with a non-success status: a 400 (validated the bad key → route
 		// present) or a transient 5xx/403 (reachable). Either way it's not a route-miss; pass, so
