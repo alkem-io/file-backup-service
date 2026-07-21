@@ -528,8 +528,9 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	// corpus and a drain-window SIGTERM look the same as a mass outage — and an exit-code guard for
 	// it kept mis-firing on those benign edges. Preflight narrows but does NOT eliminate the bad
 	// case: it proves the /blob ROUTE is present (an invalid-key probe is rejected 400 BEFORE
-	// file-service touches storage), so it catches a route-miss / wrong endpoint, but NOT a
-	// route-healthy-but-storage-wiped file-service that 404s every real hash. For backfill that
+	// file-service touches storage), so it catches a route-miss / wrong endpoint AT STARTUP — but,
+	// being one-shot, not a mid-run route-miss nor a route-healthy-but-storage-wiped file-service
+	// that 404s every real hash. For backfill that
 	// residual is NOT alerted: backfill is a one-shot Job with Nop metrics and no scrape endpoint,
 	// and it routes ErrSourceGone to st.Skipped (never the source-gone counter — that path exists
 	// only in the long-running serve consumer, where FileBackupSourceGoneSpike does fire). So a

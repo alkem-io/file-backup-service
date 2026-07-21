@@ -240,16 +240,18 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 		}
 	case errors.Is(err, domain.ErrSourceGone):
 		// A 404/410 means the source object is gone. Skip it (benign, terminal) so it doesn't burn
-		// ~10 retries and page on a non-problem. The SYSTEMIC causes — a wrong fileServiceBase or a
-		// file-service missing the /blob route — are caught at STARTUP by the strict Preflight
-		// (it refuses to start rather than mass-skipping), so at runtime this fires only for the
-		// narrow residuals: the claim-then-GC race (the blob was refcount-deleted between claim and
-		// fetch), or a route-healthy-but-storage-wiped file-service 404ing real hashes. The
-		// source-gone metric fires on every skip, so the latter (a mass runtime skip) still spikes
-		// filebackup_source_gone_total → FileBackupSourceGoneSpike rather than silently dropping to
-		// zero coverage. Skipped objects are recoverable: they stay in the corpus, so a backfill
-		// re-backs-them-up once the source is healthy (its printed backed/skipped counts make an
-		// all-404 sweep plainly visible).
+		// ~10 retries and page on a non-problem. A wrong fileServiceBase or a file-service with no
+		// /blob route AT STARTUP is caught by the strict Preflight (serve/backfill refuse to start).
+		// Preflight is one-shot, though, so at runtime source-gone still fires for: the claim-then-GC
+		// race (the blob was refcount-deleted between claim and fetch — correctly, terminally gone);
+		// a MID-RUN route-miss (a rolling file-service deploy briefly serving an old /blob-less pod
+		// behind the ClusterIP); or a storage-wiped file-service 404ing real hashes. Every skip feeds
+		// the source-gone metric, so any mass case spikes filebackup_source_gone_total →
+		// FileBackupSourceGoneSpike rather than a silent drop to zero coverage. Recoverability differs
+		// by cause: a mid-run route-miss is transient — the blobs still exist, so a backfill
+		// re-captures them once the deploy settles (its printed backed/skipped counts make an all-404
+		// sweep visible); a claim-then-GC skip is correctly gone (no recovery needed or possible); a
+		// storage wipe is unrecoverable here (the bytes are lost).
 		if c.d.OnSourceGone != nil {
 			c.d.OnSourceGone()
 		}
