@@ -528,14 +528,16 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	// corpus and a drain-window SIGTERM look the same as a mass outage — and an exit-code guard for
 	// it kept mis-firing on those benign edges. Preflight narrows but does NOT eliminate the bad
 	// case: it proves the /blob ROUTE is present (an invalid-key probe is rejected 400 BEFORE
-	// file-service touches storage), so it catches a route-miss / wrong endpoint AT STARTUP — but,
-	// being one-shot, not a mid-run route-miss nor a route-healthy-but-storage-wiped file-service
-	// that 404s every real hash. For backfill that
-	// residual is NOT alerted: backfill is a one-shot Job with Nop metrics and no scrape endpoint,
-	// and it routes ErrSourceGone to st.Skipped (never the source-gone counter — that path exists
-	// only in the long-running serve consumer, where FileBackupSourceGoneSpike does fire). So a
-	// backfill's ONLY signal for "protected nothing" is the printed backed/skipped counts — an
-	// operator running a recovery MUST read them; a clean exit is not proof anything was backed up.
+	// file-service touches storage), so it catches a route-miss / wrong endpoint at startup. Two
+	// residuals slip past it: a MID-RUN route-miss (Preflight is one-shot — a rolling deploy can
+	// swap in an old /blob-less pod after startup), and a route-healthy-but-storage-wiped
+	// file-service (fundamentally invisible to Preflight — the invalid-key probe is rejected before
+	// any storage read, so no repeating probe would catch it either). Either can 404 every real
+	// hash. For backfill NEITHER is alerted: it is a one-shot Job with Nop metrics and no scrape
+	// endpoint, and it routes every ErrSourceGone to st.Skipped (the source-gone counter +
+	// FileBackupSourceGoneSpike exist only in the long-running serve consumer). So a backfill's ONLY
+	// signal for "protected nothing" is the printed backed/skipped counts — an operator running a
+	// recovery MUST read them; a clean exit is not proof anything was backed up.
 	return sweepErr
 }
 
