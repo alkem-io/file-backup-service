@@ -244,9 +244,9 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 		// MASS skip — a store outage, a wrong fileServiceBase, or a file-service missing the
 		// by-hash endpoint 404ing every path — spikes filebackup_source_gone_total and pages via
 		// FileBackupSourceGoneSpike, rather than being a silent drop to zero coverage. The skipped
-		// objects are recoverable: they stay in the corpus, so a backfill re-backs-them-up once the
-		// source is healthy (and a backfill that backs up nothing prints a loud source-health
-		// advisory — see runBackfill — so an all-404 sweep is visible to an operator too).
+		// objects are recoverable: they stay in the corpus, so a backfill re-backs-them-up once
+		// the source is healthy (backfill prints backed/skipped counts, so an all-404 sweep is
+		// plainly visible in its output).
 		if c.d.OnSourceGone != nil {
 			c.d.OnSourceGone()
 		}

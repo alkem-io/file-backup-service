@@ -77,10 +77,9 @@ func TestBackfillVerdict(t *testing.T) {
 		t.Fatalf("a clean pass must be nil, got %v", err)
 	}
 	// Skipped is BENIGN for the exit code (the documented "routine deletions don't fail a pass"
-	// invariant): an all-skipped pass returns nil (the missing-endpoint case is surfaced as a loud
-	// stderr advisory in runBackfill, not an exit-code verdict, because all-skipped is ambiguous
-	// between an outage and legit deletions). This also means a drain-window SIGTERM and a tiny
-	// all-deleted corpus can't false-page.
+	// invariant): an all-skipped pass returns nil — "all-skipped" is ambiguous between an outage
+	// and legit deletions, and the printed backed/skipped counts make it visible either way. This
+	// also means a drain-window SIGTERM and a tiny all-deleted corpus can't false-page.
 	if err := backfillVerdict(domain.BackfillStats{Skipped: 100}, nil); err != nil {
 		t.Fatalf("an all-skipped pass is benign for the exit code, got %v", err)
 	}

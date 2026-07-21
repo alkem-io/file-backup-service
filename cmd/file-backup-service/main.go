@@ -524,11 +524,10 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
 	// Skipped/Deferred/Cancelled are all benign for the exit code (the codebase's documented
-	// invariant: routine source-gone deletions do NOT fail a pass). A backfill that backed up
-	// NOTHING because the source 404'd everything (missing endpoint / outage) is surfaced as a
-	// LOUD ADVISORY in runBackfill's output instead — an exit-code guard there kept mis-firing on
-	// benign edges (a drain-window SIGTERM, a tiny all-deleted corpus) because "all-skipped" is
-	// ambiguous between an outage and legit deletions, which counts alone can't disambiguate.
+	// invariant: routine source-gone deletions do NOT fail a pass). An all-404 sweep (missing
+	// endpoint / outage) is visible in the printed backed/skipped counts; an exit-code guard for
+	// it kept mis-firing on benign edges (a drain-window SIGTERM, a tiny all-deleted corpus)
+	// because "all-skipped" is ambiguous between an outage and legit deletions.
 	return sweepErr
 }
 
@@ -823,16 +822,6 @@ func runBackfill(args []string) error {
 	pipeline, _ := isolatedPipeline(cfg, fsClient, ledger, targets)
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d cancelled=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed, st.Cancelled)
-	// Loud advisory (not an exit-code verdict — "all-skipped" is ambiguous between an outage and
-	// legit deletions): a CLEAN pass that backed up NOTHING yet enumerated objects that all 404'd
-	// is almost always a SOURCE problem worth an operator's eyes. Excludes Cancelled (a drain-window
-	// SIGTERM is a resumable interruption, not an outage) and Failed (a genuine failure already
-	// exits nonzero via backfillVerdict — a different signal), so the advisory can't cry wolf.
-	if st.Backed == 0 && st.Skipped > 0 && st.Deferred == 0 && st.Cancelled == 0 && st.Failed == 0 {
-		fmt.Fprintf(os.Stderr, "WARNING: backfill backed up NOTHING while skipping %d object(s) — the source 404'd every fetch. "+
-			"If unexpected, check source health: store outage / wrong fileServiceBase / a file-service missing "+
-			"the /internal/blob/{hash}/content endpoint (out-of-order deploy).\n", st.Skipped)
-	}
 	return backfillVerdict(st, err)
 }
 
