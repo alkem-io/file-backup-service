@@ -112,7 +112,10 @@ func TestIntegrationRunAuditEmpty(t *testing.T) {
 
 func TestIntegrationRunBackfill(t *testing.T) {
 	ctx := context.Background()
-	content := []byte("backfill me — a pre-existing corpus object")
+	// Unique content per run — see TestIntegrationServeBacksUpOutboxRow: a fixed hash already in
+	// the shared ledger would be skipped on a re-run, so the physical write to this run's fresh
+	// target never happens and the os.Stat below would falsely fail.
+	content := []byte("backfill me — a pre-existing corpus object " + uuid.NewString())
 	h := sha3hex(content)
 	fid := uuid.New()
 	// Seed the corpus row file-service would have.
@@ -134,7 +137,10 @@ func TestIntegrationRunBackfill(t *testing.T) {
 
 func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	ctx := context.Background()
-	content := []byte("serve me — an enqueued object")
+	// Unique content per run: a fixed hash would already be in the shared ledger from a prior run
+	// (or a prior -count iteration), so the pipeline would dedup and skip the physical write to
+	// this run's fresh target — a false "done with no bytes". (Mirrors the fault suite's uuid body.)
+	content := []byte("serve me — an enqueued object " + uuid.NewString())
 	h := sha3hex(content)
 	fid := uuid.New()
 	if err := harness.Exec(ctx, harness.AlkemioDB,
@@ -151,22 +157,15 @@ func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- serveCtx(sctx, cfgPath) }()
 
-	// Wait for the worker to back up the object, then shut it down.
-	stored := storedPath(targetDir, h)
-	deadline := time.After(30 * time.Second)
-	for {
-		if _, err := os.Stat(stored); err == nil {
-			break
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("serve did not back up the enqueued object within 30s")
-		case err := <-done:
-			t.Fatalf("serveCtx returned early: %v", err)
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
+	// Wait for the row to be FINISHED (status → done), not merely for the target file to appear.
+	// done is set last — after the target write and the ledger — so it is the authoritative
+	// completion signal. Breaking on the file's appearance instead would race: the bytes land
+	// before MarkDone commits, so cancelling then can abort the in-flight MarkDone (it runs on
+	// the cancelled context) and leave the row pending. (Mirrors the fault suite's waitForServe.)
+	waitForServe(t, done, 30*time.Second, func() bool {
+		return outboxStatusOf(t, h) == "done"
+	}, "serve to back up the enqueued object")
+
 	cancel()
 	select {
 	case err := <-done:
@@ -176,14 +175,9 @@ func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("serveCtx did not return after cancel")
 	}
-	// The outbox row is marked done.
-	var status string
-	if err := harness.ScalarRow(ctx, harness.AlkemioDB,
-		fmt.Sprintf(`SELECT status FROM file_backup_outbox WHERE "externalID"='%s'`, h), &status); err != nil {
-		t.Fatalf("read outbox status: %v", err)
-	}
-	if status != "done" {
-		t.Fatalf("outbox status = %q, want done", status)
+	// done implies the object was written to the target first — so the bytes must be there.
+	if _, err := os.Stat(storedPath(targetDir, h)); err != nil {
+		t.Fatalf("outbox row done but object not stored at the target: %v", err)
 	}
 }
 
