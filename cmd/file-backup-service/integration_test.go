@@ -56,16 +56,42 @@ func stubFileService(t *testing.T, bodies ...[]byte) *httptest.Server {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(r.URL.Path, "/") // /internal/blob/{hash}/content
-		if len(parts) >= 4 {
-			if b, ok := byHash[parts[3]]; ok {
-				_, _ = w.Write(b)
-				return
-			}
+		if len(parts) < 4 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		key := parts[3]
+		if b, ok := byHash[key]; ok {
+			_, _ = w.Write(b)
+			return
+		}
+		// Mirror file-service's /blob route: a MALFORMED key is a 400, a valid-but-absent hash a
+		// 404. The worker's Preflight probes with an INVALID key and REQUIRES 400 to prove the
+		// route exists — a blanket 404 here would fail preflight and never start serve/backfill.
+		if !isValidHashKey(key) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// isValidHashKey mirrors file-service's isValidExternalID (32–128 alphanumeric chars) closely
+// enough to distinguish the Preflight invalid-key probe (→400) from a valid-but-absent hash (→404).
+func isValidHashKey(s string) bool {
+	if len(s) < 32 || len(s) > 128 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // harnessConfig renders a config.yaml pointing at the harness + a single filesystem target in a

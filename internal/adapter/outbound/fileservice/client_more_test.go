@@ -45,17 +45,19 @@ func TestFetchContentSuccess(t *testing.T) {
 	}
 }
 
-// TestPreflightPassesOn200: a 200 means the server answered — Preflight's
-// happy path (err==nil) closes the body and passes.
-func TestPreflightPassesOn200(t *testing.T) {
+// TestPreflightFailsOn200: a 200 to the INVALID-key probe means the endpoint served content it
+// never should — it is not file-service's /blob route (which 400s an invalid key). Preflight must
+// FAIL and still close the body it received (err==nil path) so it doesn't leak the connection.
+func TestPreflightFailsOn200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("some body"))
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL, 4, nil)
-	if err := c.Preflight(context.Background()); err != nil {
-		t.Fatalf("Preflight on a 200 must pass (server answered): %v", err)
+	if err := c.Preflight(context.Background()); err == nil {
+		t.Fatal("Preflight on a 200 to an invalid-key probe must FAIL (not the /blob route)")
 	}
 }
 

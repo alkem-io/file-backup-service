@@ -523,11 +523,13 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	if st.Failed > 0 {
 		return fmt.Errorf("backfill left %d object(s) not fully backed up", st.Failed)
 	}
-	// Skipped/Deferred/Cancelled are all benign for the exit code (the codebase's documented
-	// invariant: routine source-gone deletions do NOT fail a pass). An all-404 sweep (missing
-	// endpoint / outage) is visible in the printed backed/skipped counts; an exit-code guard for
-	// it kept mis-firing on benign edges (a drain-window SIGTERM, a tiny all-deleted corpus)
-	// because "all-skipped" is ambiguous between an outage and legit deletions.
+	// Skipped/Deferred/Cancelled are benign for the exit code (routine source-gone deletions do NOT
+	// fail a pass). The dangerous case — an all-404 sweep against a missing/wrong endpoint — is
+	// caught UPSTREAM: backfill runs the same fsClient.Preflight as serve, which now fails fast on a
+	// route-miss (an invalid-key probe that 404s), so a recovery pass never reaches this verdict
+	// against a broken endpoint. A verdict-level all-skipped guard would therefore be both redundant
+	// and wrong: after a PASSING preflight, "all-skipped" means the corpus was legitimately all
+	// source-gone (a tiny all-deleted corpus, a drain-window SIGTERM) — benign, exit 0.
 	return sweepErr
 }
 

@@ -10,15 +10,12 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
-// TestPreflightReachableOnServerResponse: ANY HTTP response means the server ANSWERED, so
-// Preflight passes — the expected 404 (probe hash absent), a transient 5xx (file-service up but
-// DB not ready during a coordinated deploy / a mid-rollout old pod), or a 403 must NOT turn a
-// required startup check into a CrashLoopBackOff. A genuinely-missing endpoint surfaces at
-// runtime (fetches 404 → objects Skipped → FileBackupSourceGoneSpike alert; backfill recovers), never here.
-func TestPreflightReachableOnServerResponse(t *testing.T) {
+// TestPreflightPassesWhenRouteAnswers: the invalid-key probe proves the /blob route exists when
+// the server answers a non-success status that is NOT a route-miss — a 400 (the real route
+// validated the bad key) or a transient 5xx/403 (reachable, must not crash-loop startup).
+func TestPreflightPassesWhenRouteAnswers(t *testing.T) {
 	for _, status := range []int{
-		http.StatusNotFound,            // 404 — probe hash absent (or a mid-rollout old pod / missing route)
-		http.StatusGone,                // 410
+		http.StatusBadRequest,          // 400 — the real /blob route rejected the invalid probe key: route PRESENT
 		http.StatusServiceUnavailable,  // 503 — transient, reachable
 		http.StatusInternalServerError, // 500
 		http.StatusForbidden,           // 403
@@ -30,7 +27,29 @@ func TestPreflightReachableOnServerResponse(t *testing.T) {
 		err := c.Preflight(context.Background())
 		srv.Close()
 		if err != nil {
-			t.Fatalf("Preflight on HTTP %d must pass (server answered = reachable), got: %v", status, err)
+			t.Fatalf("Preflight on HTTP %d must pass (route answered, not a route-miss), got: %v", status, err)
+		}
+	}
+}
+
+// TestPreflightFailsWhenRouteMissing: for an INVALID key, a 404/410 can only mean the /blob route
+// is absent (deploy skew / wrong endpoint) — the real route 400s an invalid key, never 404s it —
+// and a 200 means a wrong endpoint served content it never should. All must FAIL the gate so the
+// worker refuses to start rather than 404→skip the whole outbox.
+func TestPreflightFailsWhenRouteMissing(t *testing.T) {
+	for _, status := range []int{
+		http.StatusNotFound, // 404 — chi default for a missing route / an endpoint without /blob
+		http.StatusGone,     // 410 — also maps to source-gone; not the real route's invalid-key answer
+		http.StatusOK,       // 200 — a wrong endpoint served content for an invalid key
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+		}))
+		c := New(srv.URL, 4, nil)
+		err := c.Preflight(context.Background())
+		srv.Close()
+		if err == nil {
+			t.Fatalf("Preflight on HTTP %d must FAIL (route missing / wrong endpoint)", status)
 		}
 	}
 }
