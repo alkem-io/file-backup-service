@@ -118,6 +118,13 @@ func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.Read
 // or a sink is unreachable. Runtime 404→skip stays as the narrow claim-then-GC race backstop.
 // A transient 5xx/403 still passes (the route answered; runtime fetches treat 5xx as retryable),
 // so a coordinated-deploy blip can't turn a required check into a crash loop for the wrong reason.
+//
+// CROSS-REPO CONTRACT: this rests on file-service's /blob handler returning 400 (not 404) for a
+// key its validator rejects — the invalid-key path is checked BEFORE any storage backend read, so
+// it holds for the local FS today and an S3 backend later. That contract is enforced on the
+// file-service side by its GetBlobContent invalid-key test; if it is ever changed there, this
+// probe must change in lockstep (a broken contract fails CLOSED here — the worker refuses to start
+// rather than silently mass-skipping, which is the intended direction of failure).
 func (c *Client) Preflight(ctx context.Context) error {
 	rc, err := c.FetchContent(ctx, domain.BackupItem{ExternalID: preflightProbeKey})
 	switch {

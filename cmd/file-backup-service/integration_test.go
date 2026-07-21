@@ -46,8 +46,9 @@ func TestMain(m *testing.M) {
 // stubFileService is a stand-in for file-service's content-addressed read
 // GET /internal/blob/{hash}/content. It keys on the object's SHA3-256 hash (the content itself),
 // so callers pass the bodies — there is no id: the stub keys each by sha3hex(body), which equals
-// the outbox/corpus externalID the worker requests. A present hash → 200 + bytes; anything else
-// (incl. the Preflight probe's valid-but-absent hash) → 404, which Preflight treats as reachable.
+// the outbox/corpus externalID the worker requests. It mirrors file-service's three answers:
+// a present hash → 200 + bytes; a MALFORMED key → 400 (the worker's Preflight probes with an
+// invalid key and requires 400 to prove the route); a valid-but-absent hash → 404 (source-gone).
 func stubFileService(t *testing.T, bodies ...[]byte) *httptest.Server {
 	t.Helper()
 	byHash := make(map[string][]byte, len(bodies))
@@ -78,8 +79,12 @@ func stubFileService(t *testing.T, bodies ...[]byte) *httptest.Server {
 	return srv
 }
 
-// isValidHashKey mirrors file-service's isValidExternalID (32–128 alphanumeric chars) closely
-// enough to distinguish the Preflight invalid-key probe (→400) from a valid-but-absent hash (→404).
+// isValidHashKey is a deliberate approximation of file-service's isValidExternalID (32–128
+// alphanumeric chars) — enough to reproduce the ONE distinction the worker's Preflight relies on:
+// a malformed key (the invalid-key probe) → 400, a valid-shape-but-absent hash → 404. It is NOT a
+// second source of truth for the validation rules; the authoritative invalid-key→400 contract is
+// enforced by file-service's own handler test (GetBlobContent_InvalidKey). If that contract ever
+// changes, update it there first — this stub only needs to keep the 400-vs-404 split faithful.
 func isValidHashKey(s string) bool {
 	if len(s) < 32 || len(s) > 128 {
 		return false
