@@ -529,10 +529,12 @@ func backfillVerdict(st domain.BackfillStats, sweepErr error) error {
 	// it kept mis-firing on those benign edges. Preflight narrows but does NOT eliminate the bad
 	// case: it proves the /blob ROUTE is present (an invalid-key probe is rejected 400 BEFORE
 	// file-service touches storage), so it catches a route-miss / wrong endpoint, but NOT a
-	// route-healthy-but-storage-wiped file-service that 404s every real hash. That residual mass-404
-	// is caught by filebackup_source_gone_total → the FileBackupSourceGoneSpike alert, which is the
-	// right detector for it — not this exit code. Do NOT read a clean backfill exit as proof every
-	// object was backed up; read the printed backed/skipped counts (and the alert).
+	// route-healthy-but-storage-wiped file-service that 404s every real hash. For backfill that
+	// residual is NOT alerted: backfill is a one-shot Job with Nop metrics and no scrape endpoint,
+	// and it routes ErrSourceGone to st.Skipped (never the source-gone counter — that path exists
+	// only in the long-running serve consumer, where FileBackupSourceGoneSpike does fire). So a
+	// backfill's ONLY signal for "protected nothing" is the printed backed/skipped counts — an
+	// operator running a recovery MUST read them; a clean exit is not proof anything was backed up.
 	return sweepErr
 }
 
