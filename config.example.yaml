@@ -1,0 +1,58 @@
+# file-backup-service configuration.
+#
+# YAML defines the structure; environment variables (FBS_*) override any scalar
+# and inject secrets. Env wins. In k8s, mount this (or a ConfigMap) for the
+# structure and inject secrets/DB-host via env from the shared alkemio-config +
+# secrets — e.g. FBS_ALKEMIODB_HOST from DATABASE_HOST, passwords + S3 keys from
+# a Secret. Never commit real secrets here.
+
+fileServiceBase: http://alkemio-file-service   # FBS_FILESERVICEBASE
+
+# Outbox — scoped SELECT/UPDATE role on the Alkemio DB.
+# Password via FBS_ALKEMIODB_PASSWORD; host/port can reuse the shared
+# DATABASE_HOST/PORT via FBS_ALKEMIODB_HOST / FBS_ALKEMIODB_PORT.
+alkemioDB:
+  host: alkemio-postgres
+  port: 5432
+  user: filebackup_consumer
+  dbName: alkemio
+  sslMode: require
+
+# This service's own ledger DB. Password via FBS_LEDGERDB_PASSWORD.
+ledgerDB:
+  host: alkemio-postgres
+  port: 5432
+  user: filebackup
+  dbName: filebackup
+  sslMode: require
+
+concurrency: 8            # FBS_CONCURRENCY
+perObjectTimeoutSec: 1800 # per-object backup deadline (FBS_PEROBJECTTIMEOUTSEC)
+staleTTLSec: 3600         # must exceed perObjectTimeoutSec (FBS_STALETTLSEC)
+metricsPort: 4004         # FBS_METRICSPORT
+# pollEverySec: 10        # outbox polling floor (FBS_POLLEVERYSEC)
+# maxAttempts: 10         # genuine-failure dead-letter threshold (FBS_MAXATTEMPTS)
+# maxDeliveries: 50       # crash-loop dead-letter threshold (FBS_MAXDELIVERIES)
+# manifestEverySec: 86400 # ledger-snapshot cadence to each target (FBS_MANIFESTEVERYSEC)
+# dbTimeoutSec: 30        # bound on a single DB operation (FBS_DBTIMEOUTSEC)
+circuitThreshold: 5       # per-target failures within the last 2x this many outcomes that trip its circuit (T017a; FBS_CIRCUITTHRESHOLD)
+circuitCooldownSec: 60    # how long a tripped target's circuit stays open before a probe (FBS_CIRCUITCOOLDOWNSEC)
+fanoutStallSec: 60        # a target not draining a fan-out chunk in this long is dropped as hung (FBS_FANOUTSTALLSEC)
+# scratchDir: /scratch    # reconcile stages a decoded object here (FBS_SCRATCHDIR); "" = OS temp. Point at a SIZED volume.
+
+# Symmetric targets — every object goes to every target; "done" requires all.
+# Secrets injected per target by name: FBS_TARGET_<NAME>_ACCESSKEY / _SECRETKEY
+# (<NAME> = the name upcased, non-alphanumerics -> '_').
+targets:
+  - name: offsite                    # FBS_TARGET_OFFSITE_ACCESSKEY / _SECRETKEY
+    type: s3
+    endpoint: s3.fr-par.scw.cloud
+    region: fr-par
+    bucket: alkemio-backup
+    useSSL: true                     # required for s3 (TLS)
+    sse: true                        # required for s3 (encryption at rest)
+    # compression: zstd              # optional per-target
+    # worm: true                     # PutObject-only immutable target: audit expects Exists to deny
+  - name: local2
+    type: filesystem
+    path: /backup

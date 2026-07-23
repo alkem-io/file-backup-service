@@ -1,0 +1,35 @@
+# Binaries
+bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.product.out
+coverage.covdir/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vendor (if used)
+vendor/
+
+# sqlc generated (tracked, but ignore local overrides)
+# internal/adapter/outbound/alkemiodb/queries/ is tracked
+
+# Local Claude Code state
+.claude/

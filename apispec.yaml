@@ -1,0 +1,19 @@
+defaults:
+  requestContentType: application/json
+  responseContentType: application/json
+  responseStatus: 200
+info:
+  title: Alkemio File Backup Service
+  description: |
+    Continuous file-backup worker for Alkemio. Consumes the file-service outbox
+    and fans out to N content-addressed backup targets. This HTTP surface is
+    operational only (liveness, readiness, metrics) — there are no public,
+    authorization-guarded endpoints.
+  version: 0.1.0
+  contact:
+    name: Alkemio Foundation
+    url: https://alkem.io
+    email: info@alkem.io
+  license:
+    name: EUPL-1.2
+    url: https://opensource.org/licenses/EUPL-1.2

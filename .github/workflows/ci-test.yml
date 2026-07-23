@@ -1,0 +1,38 @@
+name: CI — Lint & Test
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ci:
+    uses: alkem-io/github-workflows/.github/workflows/go-ci.yml@v1
+    permissions:
+      contents: read
+    with:
+      sqlc-config: db/sqlc.yaml
+      sqlc-generated-path: internal/adapter/outbound/db/queries
+      openapi-make-target: openapi
+
+  # Coverage gate (constitution §VII: >95%). `make cover-check` runs the FULL suite WITH
+  # `-tags integration` — a throwaway Postgres container via testcontainers (Docker is available
+  # on the ubuntu runner) — so this one job both exercises the live-DB integration paths AND
+  # fails the build if total coverage drops below 95%. The reusable go-ci job above does not
+  # run the integration tag, so this is the additive gate, not a fork of the shared workflow.
+  cover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # bound a hung testcontainers/Docker wait (else the 6h default ceiling)
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # don't leave GITHUB_TOKEN available to `make cover-check`
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Coverage gate (>=95%, includes the testcontainers integration suite)
+        run: make cover-check

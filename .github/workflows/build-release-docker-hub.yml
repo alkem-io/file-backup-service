@@ -1,0 +1,19 @@
+name: Deploy to DockerHub
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: dockerhub-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: alkem-io/github-workflows/.github/workflows/container-release.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
