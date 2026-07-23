@@ -9,7 +9,7 @@
 Go microservice that gives every file-service object a durable, off-cluster,
 immutable, integrity-verified **backup**, captured continuously and with low
 RPO. It consumes a transactional **outbox** the file-service writes on each
-store, fetches the bytes by id, and fans them out to **N content-addressed
+store, fetches the bytes by content hash, and fans them out to **N content-addressed
 targets**. It also provides backfill, reconciliation, and operator restore.
 
 ## Tech Stack
@@ -35,7 +35,7 @@ target restorable with nothing but bytes + a hash check.
 - **domain**: the backup pipeline (fetch → optional zstd → fan-out → verify →
   ledger), the `Sink` port, the hash-arbiter transform, reconciliation.
 - **outbound**: `Sink` adapters (s3, filesystem), the file-service content
-  client (`GET /internal/file/{id}/content`), the DB adapters (outbox in the
+  client (`GET /internal/blob/{hash}/content`), the DB adapters (outbox in the
   Alkemio DB; ledger in the own DB).
 - **cmd**: subcommands — `serve`, `backfill`, `restore`, `verify`,
   `reconcile`, `audit`, `drill`, `migrate`.
@@ -78,7 +78,7 @@ same structure as a base; env wins over it. The **target list** comes from
 (`file-service` is env-configured from `alkemio-config` + secrets). Secrets (DB
 passwords, S3 keys) come from env only. `internal/config`.
 
-- `fileServiceBase` / `FBS_FILESERVICEBASE` — base URL for `GET /internal/file/{id}/content`
+- `fileServiceBase` / `FBS_FILESERVICEBASE` — base URL for `GET /internal/blob/{hash}/content`
 - `alkemioDB` (host/port/user/password/dbName/sslMode → a libpq DSN) — the outbox, scoped SELECT/UPDATE role. Env: `FBS_ALKEMIODB_HOST` (reuse the shared `DATABASE_HOST`), `FBS_ALKEMIODB_PASSWORD`, …
 - `ledgerDB` (same shape) — this service's own DB (`filebackup`). Env: `FBS_LEDGERDB_*`
 - `targets[]` — each `{name, type, endpoint/bucket/region/path, compression, useSSL, sse}`. Per-target secrets/overrides: `FBS_TARGET_<NAME>_ACCESSKEY` / `_SECRETKEY` / `_BUCKET` / … (`<NAME>` = name upcased, non-alphanumerics → `_`)

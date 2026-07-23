@@ -239,10 +239,20 @@ func (c *Consumer) settle(ctx, objCtx, bctx context.Context, e domain.OutboxEntr
 			c.d.Logger.Error("release claim on shutdown", zap.Int64("id", e.ID), zap.Error(rerr))
 		}
 	case errors.Is(err, domain.ErrSourceGone):
-		// The source was deleted before we could back it up — benign and terminal.
-		// Skip it so it doesn't burn ~10 retries and page on a non-problem. Emit a
-		// metric so a MASS skip (e.g. a wrong fileServiceBase 404ing every path) is
-		// visible/alertable rather than a silent, invisible drop to zero coverage.
+		// A 404/410 means the source object is gone. Skip it (benign, terminal) so it doesn't burn
+		// ~10 retries and page on a non-problem. A wrong fileServiceBase or a file-service with no
+		// /blob route AT STARTUP is caught by the strict Preflight (serve/backfill refuse to start).
+		// What still reaches this branch at runtime: the claim-then-GC race (the blob was
+		// refcount-deleted between claim and fetch — an inherent race, correctly and terminally
+		// gone); a MID-RUN route-miss (Preflight is one-shot, so a rolling deploy can swap in an old
+		// /blob-less pod after startup); or a storage-wiped file-service (invisible to Preflight —
+		// its invalid-key probe is rejected before any storage read — 404ing real hashes). Every
+		// skip feeds the source-gone metric, so any mass case spikes filebackup_source_gone_total →
+		// FileBackupSourceGoneSpike rather than a silent drop to zero coverage. Recoverability differs
+		// by cause: a mid-run route-miss is transient — the blobs still exist, so a backfill
+		// re-captures them once the deploy settles (its printed backed/skipped counts make an all-404
+		// sweep visible); a claim-then-GC skip is correctly gone (no recovery needed or possible); a
+		// storage wipe is unrecoverable here (the bytes are lost).
 		if c.d.OnSourceGone != nil {
 			c.d.OnSourceGone()
 		}

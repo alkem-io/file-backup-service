@@ -60,21 +60,31 @@ func TestRestoreAllVerdict(t *testing.T) {
 // of the round-9 drain-window false-positive. A pure cancel (no failures) returns Canceled for
 // onShutdownOK to map to exit 0 (resumable); a benign tail-drain cancel is in Cancelled, not Failed.
 func TestBackfillVerdict(t *testing.T) {
-	// genuine failure + a coincident mid-corpus SIGTERM → must NOT be Canceled (else onShutdownOK masks it).
-	if err := backfillVerdict(domain.BackfillStats{Failed: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
-		t.Fatalf("a genuine failure coinciding with a SIGTERM must return a non-Canceled error (onShutdownOK must not mask it), got %v", err)
+	// backfillVerdict has two paths: st.Failed>0 → a non-Canceled failure; else → sweepErr
+	// verbatim. The Backed/Skipped/Cancelled COUNTS never branch it, so cover each distinct
+	// outcome ONCE — enumerating count combinations would be coverage padding, not new invariants.
+
+	// (1) A genuine per-object failure coinciding with a mid-corpus SIGTERM must NOT surface as
+	// Canceled — else the dispatch's onShutdownOK would mask a real failure as exit 0.
+	if err := backfillVerdict(domain.BackfillStats{Failed: 1, Skipped: 2}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("a genuine failure coinciding with a SIGTERM must return a non-Canceled error, got %v", err)
 	}
-	// pure cancel (no failures, benign tail-drain in Cancelled) → Canceled passes through for onShutdownOK.
-	if err := backfillVerdict(domain.BackfillStats{Backed: 5, Cancelled: 3}, context.Canceled); !errors.Is(err, context.Canceled) {
-		t.Fatalf("a pure cancel must pass Canceled through for onShutdownOK → exit 0, got %v", err)
+	// (2) No failures, no sweep error → nil. Skipped is benign for the exit code (the "routine
+	// source-gone deletions don't fail a pass" invariant; the outage case is caught upstream at
+	// preflight, not here), so even an exact all-skipped pass stays successful.
+	if err := backfillVerdict(domain.BackfillStats{Skipped: 100}, nil); err != nil {
+		t.Fatalf("an all-skipped pass with no failures must be nil, got %v", err)
 	}
-	// a real sweep/DB error (not a cancel) → surfaced.
-	if err := backfillVerdict(domain.BackfillStats{}, errors.New("corpus enum failed")); err == nil || errors.Is(err, context.Canceled) {
-		t.Fatalf("a real sweep error must surface, got %v", err)
+	// (3) No failures + a SIGTERM (Canceled sweepErr) → Canceled passes through for onShutdownOK →
+	// exit 0 (the pass is resumable), even when some objects were skipped first.
+	if err := backfillVerdict(domain.BackfillStats{Backed: 5, Skipped: 2, Cancelled: 3}, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a pure cancel must pass Canceled through (resumable → exit 0), got %v", err)
 	}
-	// clean pass → nil.
-	if err := backfillVerdict(domain.BackfillStats{Backed: 5}, nil); err != nil {
-		t.Fatalf("a clean pass must be nil, got %v", err)
+	// (4) No failures + a real (non-cancel) sweep/DB error → the original error is preserved,
+	// including when objects were skipped before enumeration failed.
+	sweepErr := errors.New("corpus enum failed")
+	if err := backfillVerdict(domain.BackfillStats{Skipped: 2}, sweepErr); !errors.Is(err, sweepErr) {
+		t.Fatalf("the original sweep error must be preserved, got %v", err)
 	}
 }
 

@@ -42,10 +42,11 @@ type Sink interface {
 	Preflight(ctx context.Context) error
 }
 
-// Source fetches an object's bytes. It takes a BackupItem (the content-identity, no outbox ID)
-// because different sources key on different fields: the file-service source fetches by FileID
-// (uuid), while reconcile's target-backed source fetches by ExternalID (content hash) — so
-// neither has to fake the other's identifier.
+// Source fetches an object's bytes. It takes a BackupItem (the content-identity, no outbox ID).
+// Every source keys on the SAME field — ExternalID, the content hash: the file-service source
+// GETs /internal/blob/{ExternalID}/content, and reconcile's target-backed source decodes the
+// object stored under ExternalID. FileID is a breadcrumb, never the fetch key — keying a fetch
+// on it would return whichever version the document points at now, reintroducing the by-id bug.
 type Source interface {
 	// FetchContent streams the object's bytes for e.
 	FetchContent(ctx context.Context, e BackupItem) (io.ReadCloser, error)

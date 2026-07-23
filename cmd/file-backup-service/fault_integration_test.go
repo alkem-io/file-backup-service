@@ -47,12 +47,12 @@ func waitForServe(t *testing.T, done <-chan error, timeout time.Duration, cond f
 // on the recovered target — nothing lost.
 func TestIntegrationFaultInjectionResumeNoLoss(t *testing.T) {
 	ctx := context.Background()
-	content := map[uuid.UUID][]byte{}
+	var bodies [][]byte
 	var hashes []string
 	for i := 0; i < 3; i++ {
 		body := []byte(fmt.Sprintf("fault-inject %d — %s", i, uuid.NewString()))
 		fid := uuid.New()
-		content[fid] = body
+		bodies = append(bodies, body)
 		h := sha3hex(body)
 		if err := harness.Exec(ctx, harness.AlkemioDB,
 			`INSERT INTO file_backup_outbox ("fileId","externalID",size,status) VALUES ($1,$2,$3,'pending')`,
@@ -61,7 +61,7 @@ func TestIntegrationFaultInjectionResumeNoLoss(t *testing.T) {
 		}
 		hashes = append(hashes, h)
 	}
-	fs := stubFileService(t, content)
+	fs := stubFileService(t, bodies...)
 
 	goodDir := t.TempDir()
 	// The "bad" target's root is a regular FILE, so MkdirAll fails and every Store to it errors —
@@ -139,12 +139,12 @@ func TestIntegrationFaultInjectionResumeNoLoss(t *testing.T) {
 func TestIntegrationThroughputSoak(t *testing.T) {
 	ctx := context.Background()
 	const n = 40
-	content := map[uuid.UUID][]byte{}
+	var bodies [][]byte
 	var hashes []string
 	for i := 0; i < n; i++ {
 		body := []byte(fmt.Sprintf("throughput %d — %s", i, uuid.NewString()))
 		fid := uuid.New()
-		content[fid] = body
+		bodies = append(bodies, body)
 		h := sha3hex(body)
 		if err := harness.Exec(ctx, harness.AlkemioDB,
 			`INSERT INTO file_backup_outbox ("fileId","externalID",size,status) VALUES ($1,$2,$3,'pending')`,
@@ -153,7 +153,7 @@ func TestIntegrationThroughputSoak(t *testing.T) {
 		}
 		hashes = append(hashes, h)
 	}
-	fs := stubFileService(t, content)
+	fs := stubFileService(t, bodies...)
 	cfgPath, targetDir, _ := drConfig(t, fs.URL, "metricsPort: 14202", "pollEverySec: 1", "concurrency: 8")
 
 	ctxS, cancel := context.WithCancel(ctx)

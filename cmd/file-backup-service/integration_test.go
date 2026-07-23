@@ -43,30 +43,60 @@ func TestMain(m *testing.M) {
 
 // (sha3hex is defined in main_test.go — reused here.)
 
-// stubFileService serves object content at GET /internal/file/{id}/content: a known id returns
-// its bytes; anything else 404s (which Preflight treats as reachable). The uuid.Nil preflight
-// probe therefore passes.
-func stubFileService(t *testing.T, content map[uuid.UUID][]byte) *httptest.Server {
+// stubFileService is a stand-in for file-service's content-addressed read
+// GET /internal/blob/{hash}/content. It keys on the object's SHA3-256 hash (the content itself),
+// so callers pass the bodies — there is no id: the stub keys each by sha3hex(body), which equals
+// the outbox/corpus externalID the worker requests. It mirrors file-service's three answers:
+// a present hash → 200 + bytes; a MALFORMED key → 400 (the worker's Preflight probes with an
+// invalid key and requires 400 to prove the route); a valid-but-absent hash → 404 (source-gone).
+func stubFileService(t *testing.T, bodies ...[]byte) *httptest.Server {
 	t.Helper()
+	byHash := make(map[string][]byte, len(bodies))
+	for _, b := range bodies {
+		byHash[sha3hex(b)] = b
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.URL.Path, "/") // /internal/file/{id}/content
+		parts := strings.Split(r.URL.Path, "/") // /internal/blob/{hash}/content
 		if len(parts) < 4 {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		id, err := uuid.Parse(parts[3])
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
+		key := parts[3]
+		if b, ok := byHash[key]; ok {
+			_, _ = w.Write(b)
 			return
 		}
-		if b, ok := content[id]; ok {
-			_, _ = w.Write(b)
+		// Mirror file-service's /blob route: a MALFORMED key is a 400, a valid-but-absent hash a
+		// 404. The worker's Preflight probes with an INVALID key and REQUIRES 400 to prove the
+		// route exists — a blanket 404 here would fail preflight and never start serve/backfill.
+		if !isValidHashKey(key) {
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// isValidHashKey is a deliberate approximation of file-service's isValidExternalID (32–128
+// alphanumeric chars) — enough to reproduce the ONE distinction the worker's Preflight relies on:
+// a malformed key (the invalid-key probe) → 400, a valid-shape-but-absent hash → 404. It is NOT a
+// second source of truth for the validation rules; the authoritative invalid-key→400 contract is
+// enforced by file-service's own handler test (GetBlobContent_InvalidKey). If that contract ever
+// changes, update it there first — this stub only needs to keep the 400-vs-404 split faithful.
+func isValidHashKey(s string) bool {
+	if len(s) < 32 || len(s) > 128 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // harnessConfig renders a config.yaml pointing at the harness + a single filesystem target in a
@@ -113,7 +143,10 @@ func TestIntegrationRunAuditEmpty(t *testing.T) {
 
 func TestIntegrationRunBackfill(t *testing.T) {
 	ctx := context.Background()
-	content := []byte("backfill me — a pre-existing corpus object")
+	// Unique content per run — see TestIntegrationServeBacksUpOutboxRow: a fixed hash already in
+	// the shared ledger would be skipped on a re-run, so the physical write to this run's fresh
+	// target never happens and the os.Stat below would falsely fail.
+	content := []byte("backfill me — a pre-existing corpus object " + uuid.NewString())
 	h := sha3hex(content)
 	fid := uuid.New()
 	// Seed the corpus row file-service would have.
@@ -122,7 +155,7 @@ func TestIntegrationRunBackfill(t *testing.T) {
 		fid, h, int64(len(content))); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}
-	fs := stubFileService(t, map[uuid.UUID][]byte{fid: content})
+	fs := stubFileService(t, content)
 	cfgPath, targetDir := harnessConfig(t, fs.URL)
 
 	if err := runBackfill([]string{"--config", cfgPath}); err != nil {
@@ -135,7 +168,10 @@ func TestIntegrationRunBackfill(t *testing.T) {
 
 func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	ctx := context.Background()
-	content := []byte("serve me — an enqueued object")
+	// Unique content per run: a fixed hash would already be in the shared ledger from a prior run
+	// (or a prior -count iteration), so the pipeline would dedup and skip the physical write to
+	// this run's fresh target — a false "done with no bytes". (Mirrors the fault suite's uuid body.)
+	content := []byte("serve me — an enqueued object " + uuid.NewString())
 	h := sha3hex(content)
 	fid := uuid.New()
 	if err := harness.Exec(ctx, harness.AlkemioDB,
@@ -143,7 +179,7 @@ func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 		fid, h, int64(len(content))); err != nil {
 		t.Fatalf("seed outbox: %v", err)
 	}
-	fs := stubFileService(t, map[uuid.UUID][]byte{fid: content})
+	fs := stubFileService(t, content)
 	// A distinct metrics port so serve's HTTP bind can't clash with a real 4004.
 	cfgPath, targetDir := harnessConfig(t, fs.URL, "metricsPort: 14087", "pollEverySec: 1")
 
@@ -152,22 +188,15 @@ func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- serveCtx(sctx, cfgPath) }()
 
-	// Wait for the worker to back up the object, then shut it down.
-	stored := storedPath(targetDir, h)
-	deadline := time.After(30 * time.Second)
-	for {
-		if _, err := os.Stat(stored); err == nil {
-			break
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("serve did not back up the enqueued object within 30s")
-		case err := <-done:
-			t.Fatalf("serveCtx returned early: %v", err)
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
+	// Wait for the row to be FINISHED (status → done), not merely for the target file to appear.
+	// done is set last — after the target write and the ledger — so it is the authoritative
+	// completion signal. Breaking on the file's appearance instead would race: the bytes land
+	// before MarkDone commits, so cancelling then can abort the in-flight MarkDone (it runs on
+	// the cancelled context) and leave the row pending. (Mirrors the fault suite's waitForServe.)
+	waitForServe(t, done, 30*time.Second, func() bool {
+		return outboxStatusOf(t, h) == "done"
+	}, "serve to back up the enqueued object")
+
 	cancel()
 	select {
 	case err := <-done:
@@ -177,14 +206,9 @@ func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("serveCtx did not return after cancel")
 	}
-	// The outbox row is marked done.
-	var status string
-	if err := harness.ScalarRow(ctx, harness.AlkemioDB,
-		fmt.Sprintf(`SELECT status FROM file_backup_outbox WHERE "externalID"='%s'`, h), &status); err != nil {
-		t.Fatalf("read outbox status: %v", err)
-	}
-	if status != "done" {
-		t.Fatalf("outbox status = %q, want done", status)
+	// done implies the object was written to the target first — so the bytes must be there.
+	if _, err := os.Stat(storedPath(targetDir, h)); err != nil {
+		t.Fatalf("outbox row done but object not stored at the target: %v", err)
 	}
 }
 

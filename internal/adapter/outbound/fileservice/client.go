@@ -1,6 +1,6 @@
-// Package fileservice reads object bytes from file-service's internal content
-// API (GET /internal/file/{id}/content) — the network read path that keeps the
-// worker off the RWO volume and S3-ready.
+// Package fileservice reads object bytes from file-service's internal
+// content-addressed API (GET /internal/blob/{hash}/content) — a network read
+// keyed by content hash that keeps the worker off the RWO volume and S3-ready.
 package fileservice
 
 import (
@@ -14,10 +14,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
+
+// preflightProbeKey is a deliberately INVALID content-hash key (a hyphen is not a valid hash
+// char, and it is far short of the 32-char minimum). A correctly-deployed file-service /blob
+// route validates the key and answers 400 (ErrInvalidKey) BEFORE touching storage — so a 400
+// PROVES the route exists. A 404 for an INVALID key can only mean the route is missing (an
+// out-of-order/rolling deploy: an old pod behind the ClusterIP) or this isn't file-service at
+// all — the real route 400s an invalid key, it never 404s it. That is what makes the startup
+// gate able to distinguish a route-miss from an object-miss. See Preflight.
+const preflightProbeKey = "preflight-probe-invalid-key"
 
 // errRemoteStatus marks a fetch that got a NON-success HTTP status (not 200/404/410) — the
 // server ANSWERED, it just returned an error (e.g. a transient 5xx during a coordinated
@@ -61,10 +68,16 @@ func New(baseURL string, maxIdleConns int, hc *http.Client) *Client {
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: hc}
 }
 
-// FetchContent streams GET {base}/internal/file/{id}/content. The caller closes
-// the returned reader.
+// FetchContent streams GET {base}/internal/blob/{hash}/content — a CONTENT-ADDRESSED read
+// keyed by the object's externalID (its SHA3-256 content hash), NOT by the document id.
+// A blob under a hash is immutable, so this is version-exact: it returns the EXACT bytes the
+// outbox enqueued, never whichever version the (mutable) document points at now. This is why
+// a create-empty-then-fill doc, or any edited file, no longer integrity-fails: fetch-by-id
+// would return the current content and mismatch the enqueued hash. A superseded (refcount-
+// deleted) hash is a clean 404 → ErrSourceGone (FR-008; we replicate blobs by externalID).
+// The caller closes the returned reader.
 func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.ReadCloser, error) {
-	reqURL := fmt.Sprintf("%s/internal/file/%s/content", c.baseURL, url.PathEscape(e.FileID.String()))
+	reqURL := fmt.Sprintf("%s/internal/blob/%s/content", c.baseURL, url.PathEscape(e.ExternalID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -91,26 +104,44 @@ func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.Read
 	return resp.Body, nil
 }
 
-// Preflight checks file-service is reachable at startup (parity with the DB/sink
-// checks): a GET for a nonexistent object. ANY HTTP response — the expected 404
-// (ErrSourceGone) for the probe id, OR a non-success status like a transient 5xx (a
-// coordinated platform deploy where file-service is up but its DB isn't ready yet, or a 403)
-// — means the server ANSWERED and is reachable, so the startup gate passes and the worker
-// starts; runtime fetches retry with backoff until file-service is healthy. Only a
-// connection/dial/timeout error (wrong host, down — the server did NOT answer) fails, so a
-// transient 5xx can't turn this required check into a CrashLoopBackOff. It can't detect a
-// wrong path PREFIX (that also 404s, indistinguishable from a missing object) — a mass
-// filebackup_source_gone_total spike surfaces that at runtime.
+// Preflight PROVES the by-hash route is actually present at startup (parity with the DB/sink
+// checks), not merely that some HTTP server answers. It probes with an INVALID key
+// (preflightProbeKey): the real /blob route validates the key and returns 400, so a 400 proves
+// the route; a 404 can ONLY mean a route-miss (deploy skew / wrong endpoint), since the real
+// route never 404s an invalid key. This is why the probe key is invalid, not a valid-but-absent
+// hash — it collapses the route-miss-vs-object-miss ambiguity a valid-hash probe can't resolve.
+//
+// A 404 therefore FAILS the gate: serve and backfill refuse to start rather than 404→skip the
+// whole outbox against a missing/wrong endpoint (which would silently protect nothing until an
+// alert + manual backfill). This self-enforces the file-service-first deploy order — the worker
+// crash-loops until file-service genuinely serves /blob, exactly as it already does when its DB
+// or a sink is unreachable. Runtime 404→skip stays as the narrow claim-then-GC race backstop.
+// A transient 5xx/403 still passes (the route answered; runtime fetches treat 5xx as retryable),
+// so a coordinated-deploy blip can't turn a required check into a crash loop for the wrong reason.
+//
+// CROSS-REPO CONTRACT: this rests on file-service's /blob handler returning 400 (not 404) for a
+// key its validator rejects — the invalid-key path is checked BEFORE any storage backend read, so
+// it holds for the local FS today and an S3 backend later. That contract is enforced on the
+// file-service side by its GetBlobContent invalid-key test; if it is ever changed there, this
+// probe must change in lockstep (a broken contract fails CLOSED here — the worker refuses to start
+// rather than silently mass-skipping, which is the intended direction of failure).
 func (c *Client) Preflight(ctx context.Context) error {
-	rc, err := c.FetchContent(ctx, domain.BackupItem{FileID: uuid.Nil})
+	rc, err := c.FetchContent(ctx, domain.BackupItem{ExternalID: preflightProbeKey})
 	switch {
 	case err == nil:
+		// 200 for an INVALID key: the endpoint served content it never should have — this is not
+		// file-service's /blob route (which would 400 the key). Fail loudly (wrong endpoint).
 		_ = rc.Close()
-		return nil
+		return fmt.Errorf("file-service preflight: %s answered 200 to an invalid-key probe — not the /blob route", c.baseURL)
 	case errors.Is(err, domain.ErrSourceGone):
-		return nil // 404/410: reachable, the probe id simply doesn't exist
+		// 404/410 for an INVALID key ⇒ the /blob route is missing (deploy skew: an old pod behind
+		// the ClusterIP) or this isn't file-service. Refuse to start; do NOT mass-skip the outbox.
+		return fmt.Errorf("file-service preflight: %s has no /internal/blob route (source-gone status 404/410 to an invalid-key probe) — deploy skew or wrong fileServiceBase: %w", c.baseURL, err)
 	case errors.Is(err, errRemoteStatus):
-		return nil // 5xx/403/…: the server ANSWERED (reachable); a transient error must not crash-loop startup
+		// The route ANSWERED with a non-success status: a 400 (validated the bad key → route
+		// present) or a transient 5xx/403 (reachable). Either way it's not a route-miss; pass, so
+		// a transient server error can't crash-loop startup.
+		return nil
 	default:
 		return fmt.Errorf("file-service unreachable: %w", err)
 	}

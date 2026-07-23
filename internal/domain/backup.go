@@ -75,7 +75,7 @@ type Target struct {
 
 // Pipeline backs up one object to all configured targets and updates the ledger.
 type Pipeline struct {
-	// Source fetches object bytes by file id.
+	// Source fetches object bytes by content hash (the object's externalID).
 	Source Source
 	// Ledger records object + per-target status and answers dedup.
 	Ledger Ledger
