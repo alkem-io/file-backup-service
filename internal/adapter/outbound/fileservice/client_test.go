@@ -10,6 +10,19 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
+func preflightStatusHandler(t *testing.T, status int) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		wantPath := "/internal/blob/" + preflightProbeKey + "/content"
+		if r.Method != http.MethodGet || r.URL.Path != wantPath {
+			t.Errorf("unexpected preflight request: %s %s; want GET %s", r.Method, r.URL.Path, wantPath)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(status)
+	}
+}
+
 // TestPreflightPassesWhenRouteAnswers: the invalid-key probe proves the /blob route exists when
 // the server answers a non-success status that is NOT a route-miss — a 400 (the real route
 // validated the bad key) or a transient 5xx/403 (reachable, must not crash-loop startup).
@@ -20,9 +33,7 @@ func TestPreflightPassesWhenRouteAnswers(t *testing.T) {
 		http.StatusInternalServerError, // 500
 		http.StatusForbidden,           // 403
 	} {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(status)
-		}))
+		srv := httptest.NewServer(preflightStatusHandler(t, status))
 		c := New(srv.URL, 4, nil)
 		err := c.Preflight(context.Background())
 		srv.Close()
@@ -42,9 +53,7 @@ func TestPreflightFailsWhenRouteMissing(t *testing.T) {
 		http.StatusGone,     // 410 — also maps to source-gone; not the real route's invalid-key answer
 		http.StatusOK,       // 200 — a wrong endpoint served content for an invalid key
 	} {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(status)
-		}))
+		srv := httptest.NewServer(preflightStatusHandler(t, status))
 		c := New(srv.URL, 4, nil)
 		err := c.Preflight(context.Background())
 		srv.Close()

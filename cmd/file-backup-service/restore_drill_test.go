@@ -66,23 +66,25 @@ func TestBackfillVerdict(t *testing.T) {
 
 	// (1) A genuine per-object failure coinciding with a mid-corpus SIGTERM must NOT surface as
 	// Canceled — else the dispatch's onShutdownOK would mask a real failure as exit 0.
-	if err := backfillVerdict(domain.BackfillStats{Failed: 1}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
+	if err := backfillVerdict(domain.BackfillStats{Failed: 1, Skipped: 2}, context.Canceled); err == nil || errors.Is(err, context.Canceled) {
 		t.Fatalf("a genuine failure coinciding with a SIGTERM must return a non-Canceled error, got %v", err)
 	}
 	// (2) No failures, no sweep error → nil. Skipped is benign for the exit code (the "routine
 	// source-gone deletions don't fail a pass" invariant; the outage case is caught upstream at
-	// preflight, not here), so a pass is nil regardless of skip/deletion counts.
-	if err := backfillVerdict(domain.BackfillStats{Backed: 90, Skipped: 100}, nil); err != nil {
-		t.Fatalf("a pass with no failures must be nil regardless of skip counts, got %v", err)
+	// preflight, not here), so even an exact all-skipped pass stays successful.
+	if err := backfillVerdict(domain.BackfillStats{Skipped: 100}, nil); err != nil {
+		t.Fatalf("an all-skipped pass with no failures must be nil, got %v", err)
 	}
 	// (3) No failures + a SIGTERM (Canceled sweepErr) → Canceled passes through for onShutdownOK →
-	// exit 0 (the pass is resumable).
-	if err := backfillVerdict(domain.BackfillStats{Backed: 5, Cancelled: 3}, context.Canceled); !errors.Is(err, context.Canceled) {
+	// exit 0 (the pass is resumable), even when some objects were skipped first.
+	if err := backfillVerdict(domain.BackfillStats{Backed: 5, Skipped: 2, Cancelled: 3}, context.Canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("a pure cancel must pass Canceled through (resumable → exit 0), got %v", err)
 	}
-	// (4) No failures + a real (non-cancel) sweep/DB error → surfaced as a nonzero exit.
-	if err := backfillVerdict(domain.BackfillStats{}, errors.New("corpus enum failed")); err == nil || errors.Is(err, context.Canceled) {
-		t.Fatalf("a real sweep error must surface, got %v", err)
+	// (4) No failures + a real (non-cancel) sweep/DB error → the original error is preserved,
+	// including when objects were skipped before enumeration failed.
+	sweepErr := errors.New("corpus enum failed")
+	if err := backfillVerdict(domain.BackfillStats{Skipped: 2}, sweepErr); !errors.Is(err, sweepErr) {
+		t.Fatalf("the original sweep error must be preserved, got %v", err)
 	}
 }
 
