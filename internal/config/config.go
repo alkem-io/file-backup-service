@@ -54,7 +54,7 @@ type Target struct {
 	Prefix      string `yaml:"prefix,omitempty"`
 	Path        string `yaml:"path,omitempty"`
 	Compression string `yaml:"compression,omitempty"` // "" | "none" | "zstd"
-	AccessKey   string `yaml:"accessKey,omitempty"`   // secret — normally injected via env
+	AccessKey   string `yaml:"accessKey,omitempty"`   // #nosec G117 -- Env/YAML credential input; configuration is never JSON-serialized.
 	SecretKey   string `yaml:"secretKey,omitempty"`   // secret — normally injected via env
 	// AuditAccessKey/AuditSecretKey are an OPTIONAL read/audit credential for a WORM target: the
 	// worker's own credential is PutObject-only (can't read GetObjectLockConfig), so the immutability
@@ -97,7 +97,7 @@ type DBConfig struct {
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	User     string `yaml:"user"`
-	Password string `yaml:"password"`
+	Password string `yaml:"password"` // #nosec G117 -- Env/YAML credential input passed to the database DSN; never JSON-serialized.
 	DBName   string `yaml:"dbName"`
 	SSLMode  string `yaml:"sslMode"`
 }

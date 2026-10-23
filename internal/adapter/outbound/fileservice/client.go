@@ -82,7 +82,7 @@ func (c *Client) FetchContent(ctx context.Context, e domain.BackupItem) (io.Read
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.http.Do(req) // #nosec G704 -- The operator configures the service origin; the content hash is escaped as one path segment.
 	if err != nil {
 		return nil, fmt.Errorf("fetch content: %w", err)
 	}
