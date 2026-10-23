@@ -66,12 +66,14 @@ try:
         config += f'{key}:\n  host: 127.0.0.1\n  port: {port}\n  user: postgres\n  password: synthetic\n  dbName: {db}\n  sslMode: disable\n'
     config += 'targets:\n  - name: local\n    type: filesystem\n    path: /fixture/backup\n    compression: zstd\n'
     (run / 'config.yaml').write_text(config)
-    def cli(*args, check=True):
+    def cli(*args, check=True, fixture_permissions=False):
         cli_name = name + '-cli-' + str(len(manifest['container_ids']))
         manifest['planned_names'].append(cli_name)
         save()
+        options = ['--user', '0', '--entrypoint', '/bin/sh'] if fixture_permissions else []
+        invocation = ['-c', 'chmod -R a+rwX /fixture'] if fixture_permissions else [*args, '--config', '/fixture/config.yaml']
         cid = command('docker', 'create', '--name', cli_name, '--network', 'host', '--label', 'forge.run=091',
-            '-v', str(run) + ':/fixture', image, *args, '--config', '/fixture/config.yaml').stdout.strip()
+            '-v', str(run) + ':/fixture', *options, image, *invocation).stdout.strip()
         manifest['container_ids'].append(cid)
         save()
         try:
@@ -85,21 +87,28 @@ try:
     restored = (run / 'restore' / content_hash).read_bytes()
     assert restored == payload and hashlib.sha3_256(restored).hexdigest() == content_hash
     stored = run / 'backup' / content_hash[:2] / content_hash[2:4] / content_hash
+    assert stored.read_bytes()[:4] == bytes.fromhex('28b52ffd')
+    cli(fixture_permissions=True)
     stored.write_bytes(b'corrupt synthetic backup')
-    assert cli('verify', '--from', 'local', '--hash', content_hash, check=False).returncode != 0
-    assert cli('restore', 'object', '--from', 'local', '--hash', content_hash, '--to', '/fixture/restore-corrupt', check=False).returncode != 0
+    bad_verify = cli('verify', '--from', 'local', '--hash', content_hash, check=False)
+    assert bad_verify.returncode != 0 and 'integrity:' in bad_verify.stdout
+    bad_restore = cli('restore', 'object', '--from', 'local', '--hash', content_hash, '--to', '/fixture/restore-corrupt', check=False)
+    assert bad_restore.returncode != 0 and 'integrity:' in bad_restore.stdout
+    assert not (run / 'restore-corrupt' / content_hash).exists()
     manifest.update(passed=True, content_hash=content_hash, restored_sha256=hashlib.sha256(restored).hexdigest(), compressed_backup=True)
 finally:
     server.shutdown()
     if pgid:
         command('docker', 'rm', '-f', pgid)
-    manifest['cleanup'] = True
-    save()
+    if 'cli' in locals():
+        cli(fixture_permissions=True)
     for child in ('config.yaml', 'backup', 'restore', 'restore-corrupt'):
         path = run / child
         if path.is_dir():
             shutil.rmtree(path)
         elif path.exists():
             path.unlink()
+    manifest['cleanup'] = True
+    save()
     print(manifest_path)
 PY
