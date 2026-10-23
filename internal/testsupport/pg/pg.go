@@ -11,8 +11,10 @@ package pg
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,6 +32,7 @@ type Harness struct {
 	AlkemioDB      string // outbox + file corpus
 	LedgerDB       string // this service's own ledger
 	container      *postgres.PostgresContainer
+	resourcePath   string
 }
 
 // Start boots a Postgres container, creates the two databases, and provisions the foreign
@@ -39,16 +42,52 @@ func Start(ctx context.Context) (*Harness, error) {
 	// Docker (mkdir ... operation not supported), and we terminate the container explicitly in
 	// Cleanup anyway. Must be set before postgres.Run creates the reaper.
 	_ = os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
-	c, err := postgres.Run(ctx, "postgres:16-alpine",
+	resourcePath := ""
+	options := []testcontainers.ContainerCustomizer{
 		postgres.WithDatabase("alkemio"),
 		postgres.WithUsername("test"),
 		postgres.WithPassword("test"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).WithStartupTimeout(90*time.Second)),
-	)
+				WithOccurrence(2).WithStartupTimeout(90 * time.Second)),
+	}
+	if root := os.Getenv("FBS_TEST_RESOURCE_DIR"); root != "" {
+		directory, err := os.MkdirTemp(root, "forge091-fbs-pg-")
+		if err != nil {
+			return nil, err
+		}
+		resourcePath = filepath.Join(directory, "resources.json")
+		name := filepath.Base(directory)
+		planned := fmt.Sprintf(`{"name":%q,"image":"postgres:16-alpine","fresh":true,"ports":"docker-assigned ephemeral","storage":"new testcontainers volume","cleanup":false}`, name)
+		if err := os.WriteFile(filepath.Join(directory, "planned.json"), []byte(planned), 0o600); err != nil {
+			return nil, err
+		}
+		options = append(options, testcontainers.WithName(name), testcontainers.WithLabels(map[string]string{"forge.run": "091"}))
+	}
+	c, err := postgres.Run(ctx, "postgres:16-alpine", options...)
 	if err != nil {
 		return nil, fmt.Errorf("start postgres container: %w", err)
+	}
+	if resourcePath != "" {
+		info, err := c.Inspect(ctx)
+		if err != nil {
+			_ = c.Terminate(ctx)
+			return nil, err
+		}
+		inspection, err := json.Marshal(info)
+		if err != nil {
+			_ = c.Terminate(ctx)
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(filepath.Dir(resourcePath), "inspect.json"), inspection, 0o600); err != nil {
+			_ = c.Terminate(ctx)
+			return nil, err
+		}
+		record := fmt.Sprintf(`{"name":%q,"container_id":%q,"image":%q,"fresh":true,"cleanup":false}`, info.Name, c.GetContainerID(), info.Image)
+		if err := os.WriteFile(resourcePath, []byte(record), 0o600); err != nil {
+			_ = c.Terminate(ctx)
+			return nil, err
+		}
 	}
 	host, err := c.Host(ctx)
 	if err != nil {
@@ -60,7 +99,7 @@ func Start(ctx context.Context) (*Harness, error) {
 	}
 	h := &Harness{
 		Host: host, Port: int(port.Num()), User: "test", Password: "test",
-		AlkemioDB: "alkemio", LedgerDB: "filebackup", container: c,
+		AlkemioDB: "alkemio", LedgerDB: "filebackup", container: c, resourcePath: resourcePath,
 	}
 	if err := h.provision(ctx); err != nil {
 		_ = c.Terminate(ctx)
@@ -171,6 +210,15 @@ func (h *Harness) ConfigYAML(fileServiceBase string, filesystemTargets map[strin
 // Cleanup terminates the container.
 func (h *Harness) Cleanup(ctx context.Context) {
 	if h.container != nil {
-		_ = h.container.Terminate(ctx)
+		if err := h.container.Terminate(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "fixture cleanup:", err)
+			return
+		}
+		if h.resourcePath != "" {
+			record := fmt.Sprintf(`{"container_id":%q,"fresh":true,"cleanup":true}`, h.container.GetContainerID())
+			if err := os.WriteFile(filepath.Join(filepath.Dir(h.resourcePath), "cleanup.json"), []byte(record), 0o600); err != nil {
+				fmt.Fprintln(os.Stderr, "record fixture cleanup:", err)
+			}
+		}
 	}
 }
