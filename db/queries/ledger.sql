@@ -33,6 +33,20 @@ ON CONFLICT ("externalID", target) DO UPDATE SET
 SELECT target FROM file_backup_target_status
 WHERE "externalID" = sqlc.arg(external_id) AND state = 'stored';
 
+-- name: LockLedgerObject :one
+-- Serialize retirement with RecordBackup, which upserts this parent before writing statuses.
+SELECT "externalID" FROM file_backup_object
+WHERE "externalID" = sqlc.arg(external_id) FOR UPDATE;
+
+-- name: DeleteUnstoredStatuses :exec
+DELETE FROM file_backup_target_status
+WHERE "externalID" = sqlc.arg(external_id) AND state <> 'stored';
+
+-- name: DeleteEmptyLedgerObject :execrows
+DELETE FROM file_backup_object o
+WHERE o."externalID" = sqlc.arg(external_id)
+  AND NOT EXISTS (SELECT 1 FROM file_backup_target_status s WHERE s."externalID" = o."externalID");
+
 -- name: StoredCountByTarget :many
 -- Count of objects currently stored per configured target — the restore-all completeness snapshot,
 -- so an operator sees per-target disparity before trusting a single-source restore. Index-only on

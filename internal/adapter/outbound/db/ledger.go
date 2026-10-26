@@ -3,9 +3,11 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/alkem-io/file-backup-service/internal/adapter/outbound/db/queries"
@@ -19,6 +21,7 @@ import (
 // in this repo's migrations for sqlc to type against).
 type LedgerRepo struct {
 	q *queries.Queries
+	p LedgerDB
 	readBounded
 }
 
@@ -35,10 +38,52 @@ type readBounded struct {
 
 func (r *readBounded) setReadTimeout(d time.Duration) { r.readTimeout = d }
 
-// NewLedgerRepo binds a LedgerRepo to the ledger pool. It takes the PgxDB interface (satisfied
-// by *Pool and by pgxmock), which also drives sqlc's queries.New, so the ledger queries are
-// unit-testable against a mocked pool without a live DB.
-func NewLedgerRepo(p PgxDB) *LedgerRepo { return &LedgerRepo{q: queries.New(p)} }
+// LedgerDB adds transactions for guarded metadata retirement.
+type LedgerDB interface {
+	PgxDB
+	// Begin starts the transaction that protects an object's metadata during retirement.
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+// NewLedgerRepo binds a LedgerRepo to a production pool or a pgxmock pool.
+func NewLedgerRepo(p LedgerDB) *LedgerRepo { return &LedgerRepo{q: queries.New(p), p: p} }
+
+// ForgetUnstored removes only metadata for an object with no stored copy on ANY target,
+// including targets no longer configured. The parent lock serializes it with RecordBackup.
+func (r *LedgerRepo) ForgetUnstored(ctx context.Context, externalID string) (bool, error) {
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
+	tx, err := r.p.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin metadata retirement: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := r.q.WithTx(tx)
+	if _, err := q.LockLedgerObject(ctx, externalID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lock metadata retirement: %w", err)
+	}
+	stored, err := q.ListStoredTargets(ctx, externalID)
+	if err != nil {
+		return false, fmt.Errorf("check stored copies before retirement: %w", err)
+	}
+	if len(stored) > 0 {
+		return false, nil
+	}
+	if err := q.DeleteUnstoredStatuses(ctx, externalID); err != nil {
+		return false, fmt.Errorf("retire failed target metadata: %w", err)
+	}
+	n, err := q.DeleteEmptyLedgerObject(ctx, externalID)
+	if err != nil {
+		return false, fmt.Errorf("retire object metadata: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit metadata retirement: %w", err)
+	}
+	return n > 0, nil
+}
 
 // WithReadTimeout sets the client-side per-read bound (boundRead) to match the pool's server-side
 // statement_timeout (the operator's cfg.DBTimeout()), so a client bound never fires BEFORE the server

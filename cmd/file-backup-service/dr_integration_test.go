@@ -35,6 +35,13 @@ func cleanupLedger(t *testing.T, names ...string) {
 	})
 }
 
+func cleanupFileReference(t *testing.T, id uuid.UUID) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = harness.Exec(context.Background(), harness.AlkemioDB, `DELETE FROM file WHERE id=$1`, id)
+	})
+}
+
 // drConfig renders a config with a single filesystem target under a unique NAME, returning the
 // config path, the target's on-disk dir, and the name.
 func drConfig(t *testing.T, fileServiceBase string, extra ...string) (cfgPath, targetDir, name string) {
@@ -66,6 +73,7 @@ func seedBackedUp(t *testing.T, n int, verTime time.Time) (cfgPath, targetDir, n
 			fid, h, int64(len(body)), verTime); err != nil {
 			t.Fatalf("seed file %d: %v", i, err)
 		}
+		cleanupFileReference(t, fid)
 		bodies = append(bodies, body)
 		hashes = append(hashes, h)
 		fids = append(fids, fid)
@@ -282,6 +290,7 @@ func TestIntegrationRestoreCurrentNullUpdatedDate(t *testing.T) {
 		fid, h, int64(len(content))); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}
+	cleanupFileReference(t, fid)
 	cfgPath, _ := harnessConfig(t, "http://unused")
 	err := runRestoreCurrent([]string{
 		"--config", cfgPath, "--file-id", fid.String(), "--at", time.Now().Format(time.RFC3339), "--from", "local",
