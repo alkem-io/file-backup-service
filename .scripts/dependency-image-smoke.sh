@@ -13,11 +13,12 @@ manifest_path = run / 'resources.json'
 def save():
     manifest_path.write_text(json.dumps(manifest, indent=2))
 def command(*args, check=True, data=None):
-    p = subprocess.run(args, input=data, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+    # Parsed output (container IDs, ports) comes from stdout alone; stderr stays apart as diagnostics.
+    p = subprocess.run(args, input=data, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
     with (run / 'commands.log').open('a') as log:
-        log.write(json.dumps(args) + '\n' + p.stdout + '\nexit=' + str(p.returncode) + '\n')
+        log.write(json.dumps(args) + '\n' + p.stdout + '\nstderr:\n' + p.stderr + '\nexit=' + str(p.returncode) + '\n')
     if check and p.returncode:
-        raise RuntimeError(p.stdout)
+        raise RuntimeError(p.stdout + p.stderr)
     return p
 save()
 # A fresh local server implements the existing content-hash read contract.
@@ -45,7 +46,8 @@ try:
     manifest['container_ids'].append(pgid)
     save()
     for _ in range(60):
-        if command('docker', 'exec', pgid, 'pg_isready', '-U', 'postgres', check=False).returncode == 0:
+        # TCP, not the socket: the entrypoint's init-time server listens on the socket only.
+        if command('docker', 'exec', pgid, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres', check=False).returncode == 0:
             break
         time.sleep(1)
     else:
@@ -79,7 +81,7 @@ try:
         try:
             return command('docker', 'start', '-a', cid, check=check)
         finally:
-            command('docker', 'rm', '-v', cid)
+            command('docker', 'rm', '-f', '-v', cid)
     cli('migrate')
     cli('backfill')
     cli('verify', '--from', 'local', '--hash', content_hash)
@@ -91,9 +93,9 @@ try:
     cli(fixture_permissions=True)
     stored.write_bytes(b'corrupt synthetic backup')
     bad_verify = cli('verify', '--from', 'local', '--hash', content_hash, check=False)
-    assert bad_verify.returncode != 0 and 'integrity:' in bad_verify.stdout
+    assert bad_verify.returncode != 0 and 'integrity:' in bad_verify.stdout + bad_verify.stderr
     bad_restore = cli('restore', 'object', '--from', 'local', '--hash', content_hash, '--to', '/fixture/restore-corrupt', check=False)
-    assert bad_restore.returncode != 0 and 'integrity:' in bad_restore.stdout
+    assert bad_restore.returncode != 0 and 'integrity:' in bad_restore.stdout + bad_restore.stderr
     assert not (run / 'restore-corrupt' / content_hash).exists()
     manifest.update(passed=True, content_hash=content_hash, restored_sha256=hashlib.sha256(restored).hexdigest(), compressed_backup=True)
 finally:
