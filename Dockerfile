@@ -3,7 +3,7 @@
 # renovate/dependabot policy in this repo to bump digests, a frozen digest silently misses
 # Alpine/Go base-image CVE patches, whereas the tag picks them up on the next CI rebuild. If a
 # fleet-wide digest-pinning + auto-update policy lands (shared github-workflows), pin here too.
-ARG GO_VERSION=1.26.10
+ARG GO_VERSION=1.26
 ARG ALPINE_VERSION=3.24
 
 # Build stage — static binary, no CGO (no libvips; this service does no image work)
