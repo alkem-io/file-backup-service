@@ -104,10 +104,21 @@ finally:
         command('docker', 'rm', '-f', pgid)
     if 'cli' in locals():
         cli(fixture_permissions=True)
-    # A run or create that hit the command timeout may have created a container without returning its ID;
-    # remove this run's planned names too (already-removed names fail harmlessly).
+    # A run or create that hit the command timeout may have created a container without returning its ID,
+    # so remove this run's planned names too, then confirm none remain before recording cleanup as complete.
+    leftovers = []
     for planned in manifest['planned_names']:
-        command('docker', 'rm', '-f', '-v', planned, check=False)
+        try:
+            command('docker', 'rm', '-f', '-v', planned, check=False)
+            if command('docker', 'container', 'inspect', planned, check=False).returncode == 0:
+                leftovers.append(planned)
+        except subprocess.TimeoutExpired:
+            leftovers.append(planned)
+    if leftovers:
+        # Keep the fixture files for investigation and fail instead of reporting a clean run.
+        manifest['cleanup_leftovers'] = leftovers
+        save()
+        raise SystemExit('cleanup incomplete, containers remain: ' + ', '.join(leftovers))
     for child in ('config.yaml', 'backup', 'restore', 'restore-corrupt'):
         path = run / child
         if path.is_dir():
