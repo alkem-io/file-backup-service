@@ -11,3 +11,7 @@ specs/
 .claude/
 Dockerfile*
 .dockerignore
+
+.forge-evidence/
+coverage.covdir/
+coverage.product.out
