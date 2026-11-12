@@ -110,7 +110,10 @@ finally:
     for planned in manifest['planned_names']:
         try:
             command('docker', 'rm', '-f', '-v', planned, check=False)
-            if command('docker', 'container', 'inspect', planned, check=False).returncode == 0:
+            probe = command('docker', 'container', 'inspect', planned, check=False)
+            # Only Docker's own "no such container" answer confirms absence; any other failure
+            # (an unreachable daemon, a permission error) leaves the container's state unknown.
+            if probe.returncode == 0 or not ('No such container' in probe.stderr or 'No such object' in probe.stderr):
                 leftovers.append(planned)
         except subprocess.TimeoutExpired:
             leftovers.append(planned)
