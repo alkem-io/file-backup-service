@@ -31,7 +31,7 @@ type Config struct {
 	Region    string
 	Bucket    string
 	Prefix    string
-	AccessKey string
+	AccessKey string // #nosec G117 -- Internal SDK credential input; this configuration is never JSON-serialized.
 	SecretKey string
 	// AuditAccessKey/AuditSecretKey are an OPTIONAL read/audit credential (see config.Target): when
 	// BOTH are set, the WORM immutability drift-check runs against a SECOND, read-capable client;

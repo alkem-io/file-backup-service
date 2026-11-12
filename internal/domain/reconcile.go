@@ -223,7 +223,7 @@ func (d decodingSource) FetchContent(ctx context.Context, e BackupItem) (io.Read
 	defer func() {
 		if !committed {
 			_ = tmp.Close()
-			_ = os.Remove(tmp.Name())
+			_ = os.Remove(tmp.Name()) // #nosec G703 -- Remove only the path returned by os.CreateTemp above.
 		}
 	}()
 	if err := decodeStream(ctx, d.src, e.ExternalID, tmp, func() error { return rewindTruncate(tmp) }); err != nil {
@@ -248,7 +248,7 @@ func (t *tempReadCloser) Read(p []byte) (int, error) { return t.f.Read(p) }
 // An already-gone file (IsNotExist) is not an error.
 func (t *tempReadCloser) Close() error {
 	err := t.f.Close()
-	if rmErr := os.Remove(t.f.Name()); rmErr != nil && !os.IsNotExist(rmErr) {
+	if rmErr := os.Remove(t.f.Name()); rmErr != nil && !os.IsNotExist(rmErr) { // #nosec G703 -- This private reader owns only an os.CreateTemp file from decodingSource.
 		err = errors.Join(err, rmErr)
 	}
 	return err
