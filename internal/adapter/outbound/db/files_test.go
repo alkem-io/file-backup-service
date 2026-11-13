@@ -14,6 +14,29 @@ import (
 	"github.com/alkem-io/file-backup-service/internal/domain"
 )
 
+func TestFileHasReferences(t *testing.T) {
+	for _, referenced := range []bool{false, true} {
+		r, mock := newMockFiles(t)
+		mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM file WHERE "externalID" = \$1\)`).WithArgs("shared-hash").
+			WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(referenced))
+		got, err := r.HasReferences(context.Background(), "shared-hash")
+		if err != nil || got != referenced {
+			t.Fatalf("references=%v want=%v err=%v", got, referenced, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("read-error", func(t *testing.T) {
+		r, mock := newMockFiles(t)
+		cause := errors.New("file table unavailable")
+		mock.ExpectQuery("SELECT EXISTS").WithArgs("hash").WillReturnError(cause)
+		if _, err := r.HasReferences(context.Background(), "hash"); !errors.Is(err, cause) {
+			t.Fatalf("reference read error must propagate: %v", err)
+		}
+	})
+}
+
 func newMockFiles(t *testing.T) (*FileRepo, pgxmock.PgxPoolIface) {
 	t.Helper()
 	mock, err := pgxmock.NewPool()

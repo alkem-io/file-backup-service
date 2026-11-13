@@ -39,6 +39,30 @@ func (q *Queries) CoverageGaps(ctx context.Context, arg CoverageGapsParams) (int
 	return gaps, err
 }
 
+const deleteEmptyLedgerObject = `-- name: DeleteEmptyLedgerObject :execrows
+DELETE FROM file_backup_object o
+WHERE o."externalID" = $1
+  AND NOT EXISTS (SELECT 1 FROM file_backup_target_status s WHERE s."externalID" = o."externalID")
+`
+
+func (q *Queries) DeleteEmptyLedgerObject(ctx context.Context, externalID string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteEmptyLedgerObject, externalID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteUnstoredStatuses = `-- name: DeleteUnstoredStatuses :exec
+DELETE FROM file_backup_target_status
+WHERE "externalID" = $1 AND state <> 'stored'
+`
+
+func (q *Queries) DeleteUnstoredStatuses(ctx context.Context, externalID string) error {
+	_, err := q.db.Exec(ctx, deleteUnstoredStatuses, externalID)
+	return err
+}
+
 const lastVerifiedAge = `-- name: LastVerifiedAge :one
 SELECT
   count(*) FILTER (WHERE mv IS NULL) AS never_verified,
@@ -92,6 +116,18 @@ func (q *Queries) ListStoredTargets(ctx context.Context, externalID string) ([]s
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockLedgerObject = `-- name: LockLedgerObject :one
+SELECT "externalID" FROM file_backup_object
+WHERE "externalID" = $1 FOR UPDATE
+`
+
+// Serialize retirement with RecordBackup, which upserts this parent before writing statuses.
+func (q *Queries) LockLedgerObject(ctx context.Context, externalID string) (string, error) {
+	row := q.db.QueryRow(ctx, lockLedgerObject, externalID)
+	err := row.Scan(&externalID)
+	return externalID, err
 }
 
 const probe = `-- name: Probe :one

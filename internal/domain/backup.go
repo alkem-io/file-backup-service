@@ -75,6 +75,7 @@ type Target struct {
 
 // Pipeline backs up one object to all configured targets and updates the ledger.
 type Pipeline struct {
+	sourceLifecycle *SourceLifecycle
 	// Source fetches object bytes by content hash (the object's externalID).
 	Source Source
 	// Ledger records object + per-target status and answers dedup.
@@ -95,6 +96,12 @@ type Pipeline struct {
 // NewPipeline constructs a Pipeline.
 func NewPipeline(src Source, ledger Ledger, targets []Target) *Pipeline {
 	return &Pipeline{Source: src, Ledger: ledger, Targets: targets, Metrics: Nop{}}
+}
+
+// WithSourceLifecycle enables reference-aware classification of primary-source 404s.
+func (p *Pipeline) WithSourceLifecycle(lifecycle *SourceLifecycle) *Pipeline {
+	p.sourceLifecycle = lifecycle
+	return p
 }
 
 // WithIsolation gives a pipeline the same per-target hung-target isolation serve uses: a
@@ -203,7 +210,7 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem, kno
 	// doesn't re-store them.
 	aborted := ferr != nil
 	if aborted && (results == nil || ctx.Err() == nil) {
-		return false, false, ferr
+		return false, false, p.classifySourceError(ctx, e, ferr)
 	}
 
 	if shouldRecordCircuit(ctx, aborted, verified >= 0) {
@@ -250,6 +257,15 @@ func (p *Pipeline) backupFrom(ctx context.Context, src Source, e BackupItem, kno
 	// are down/timed-out targets → DEFERRED (retry later, NO attempt; reconcile refills).
 	done = allStored && !skippedOpen && !aborted
 	return done, !done, nil
+}
+
+func (p *Pipeline) classifySourceError(ctx context.Context, e BackupItem, sourceErr error) error {
+	if errors.Is(sourceErr, ErrSourceGone) && p.sourceLifecycle != nil {
+		if _, err := p.sourceLifecycle.ResolveSourceGone(ctx, e); err != nil {
+			return err
+		}
+	}
+	return sourceErr
 }
 
 // precheck rejects a backup that must not proceed, before any fetch or ledger read:

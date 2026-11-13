@@ -146,6 +146,7 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 
 	outbox := db.NewOutboxRepo(alkemioPool, cfg.MaxAttempts, cfg.MaxDeliveries).WithReadTimeout(cfg.DBTimeout())
 	ledger := db.NewLedgerRepo(ledgerPool).WithReadTimeout(cfg.DBTimeout())
+	files := db.NewFileRepo(alkemioPool).WithReadTimeout(cfg.DBTimeout())
 	targets, err := buildTargets(cfg.Targets)
 	if err != nil {
 		return err
@@ -170,6 +171,9 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 	if err := startupChecks(ctx, logger, fsClient, outbox, ledger, targets); err != nil {
 		return err
 	}
+	if err := files.Probe(ctx); err != nil {
+		return fmt.Errorf("file references not readable: %w", err)
+	}
 
 	// Per-target circuit breaker (T017a): a persistently-down/hung target trips out of the
 	// fan-out so objects needing it are DEFERRED (re-claimable), not dead-lettered. serve and
@@ -178,6 +182,7 @@ func serveCtx(ctx context.Context, cfgPath string) error {
 	// silently keeps running a differently-isolated pipeline. serve also keeps the breaker for
 	// the sampler's targets-down gauge.
 	pipeline, breaker := isolatedPipeline(cfg, fsClient, ledger, targets)
+	pipeline.WithSourceLifecycle(domain.NewSourceLifecycle(files, ledger, targets))
 	pipeline.Metrics = mx
 	cons := consumer.New(consumer.Deps{
 		Outbox:           outbox,
@@ -722,7 +727,8 @@ func ledgerJob(ctx context.Context, cfgPath string) (*config.Config, *db.LedgerR
 
 // runReconcile repairs under-replicated objects target-to-target (FR-025/T029): for
 // each object the ledger shows not stored on every target, fetch it from a target that
-// has it and re-fan-out to the missing ones. Needs the ledger DB + EVERY target.
+// has it and re-fan-out to the missing ones. The primary source + file references
+// distinguish failed-only orphan metadata from real missing-source failures.
 func runReconcile(args []string) error {
 	fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
 	cfgPath := registerConfigFlag(fs)
@@ -766,8 +772,23 @@ func runReconcile(args []string) error {
 		OnError(func(id string, e error) {
 			logger.Warn("reconcile repair failed", zap.String("externalID", id), zap.Error(e))
 		})
+	// Cleanup is available with normal worker config. Keep target-to-target repair
+	// usable with ledger/target-only DR config and while the primary service is down.
+	if cfg.FileServiceBase != "" && cfg.AlkemioDB.Host != "" {
+		if err := cfg.AlkemioDB.Validate("alkemioDB"); err != nil {
+			return fmt.Errorf("invalid config: %w", err)
+		}
+		alkemioPool, err := openPool(ctx, cfg.AlkemioDB.DSN(), cfg.PoolSize(4), cfg.DBTimeout(), "alkemio")
+		if err != nil {
+			return err
+		}
+		defer alkemioPool.Close()
+		files := db.NewFileRepo(alkemioPool).WithReadTimeout(cfg.DBTimeout())
+		fsClient := fileservice.New(cfg.FileServiceBase, cfg.Concurrency, nil)
+		rec.WithSourceLifecycle(fsClient, domain.NewSourceLifecycle(files, ledger, targets))
+	}
 	st, err := rec.Run(ctx, *ratePerSec)
-	fmt.Printf("reconcile: repaired=%d skipped=%d failed=%d cancelled=%d\n", st.Repaired, st.Skipped, st.Failed, st.Cancelled)
+	fmt.Printf("reconcile: repaired=%d retired=%d skipped=%d failed=%d cancelled=%d\n", st.Repaired, st.Retired, st.Skipped, st.Failed, st.Cancelled)
 	return reconcileVerdict(st, err)
 }
 
@@ -830,6 +851,7 @@ func runBackfill(args []string) error {
 	// pipeline would let a black-holing target wedge every object for the full perObjectTimeout,
 	// invisibly. backfill doesn't need the breaker handle itself (no sampler).
 	pipeline, _ := isolatedPipeline(cfg, fsClient, ledger, targets)
+	pipeline.WithSourceLifecycle(domain.NewSourceLifecycle(files, ledger, targets))
 	st, err := domain.NewBackfiller(files, pipeline, cfg.PerObjectTimeout(), cfg.Concurrency).Run(ctx, *ratePerSec)
 	fmt.Printf("backfill: backed=%d skipped=%d deferred=%d failed=%d cancelled=%d\n", st.Backed, st.Skipped, st.Deferred, st.Failed, st.Cancelled)
 	return backfillVerdict(st, err)

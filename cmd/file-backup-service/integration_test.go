@@ -155,6 +155,8 @@ func TestIntegrationRunBackfill(t *testing.T) {
 		fid, h, int64(len(content))); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}
+	cleanupFileReference(t, fid)
+	cleanupLedger(t, "local")
 	fs := stubFileService(t, content)
 	cfgPath, targetDir := harnessConfig(t, fs.URL)
 
@@ -168,6 +170,7 @@ func TestIntegrationRunBackfill(t *testing.T) {
 
 func TestIntegrationServeBacksUpOutboxRow(t *testing.T) {
 	ctx := context.Background()
+	cleanupLedger(t, "local")
 	// Unique content per run: a fixed hash would already be in the shared ledger from a prior run
 	// (or a prior -count iteration), so the pipeline would dedup and skip the physical write to
 	// this run's fresh target — a false "done with no bytes". (Mirrors the fault suite's uuid body.)

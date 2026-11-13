@@ -15,10 +15,11 @@ import (
 // stored on every configured target (the ledger's TargetGaps), it fetches the
 // plaintext from a target that HAS it and re-fans it out to the targets missing it via
 // the backup pipeline — which dedups the source, hash-verifies, and records the
-// ledger. Target-to-target repair; no re-fetch from the primary store. This is the
-// recovery path that makes object-level dead-letter safe: a target that was down comes
+// ledger. This is the recovery path that makes object-level dead-letter safe: a target that was down comes
 // back and reconcile fills its gaps.
 type Reconciler struct {
+	source      Source
+	lifecycle   *SourceLifecycle
 	ledger      Ledger
 	targets     []Target
 	byName      map[string]Target
@@ -28,6 +29,13 @@ type Reconciler struct {
 	circuit     *CircuitBreaker
 	concurrency int                                // in-flight repairs (the Concurrency knob), like serve
 	onError     func(externalID string, err error) // per-object failure sink (logging); nil = silent
+}
+
+// WithSourceLifecycle enables cleanup of failed-only orphan metadata after checking the
+// primary source and all file references. Primary bytes are not copied by reconciliation.
+func (rc *Reconciler) WithSourceLifecycle(source Source, lifecycle *SourceLifecycle) *Reconciler {
+	rc.source, rc.lifecycle = source, lifecycle
+	return rc
 }
 
 // OnError registers a callback invoked with the cause each time an object can't be repaired,
@@ -68,6 +76,7 @@ func NewReconciler(led Ledger, targets []Target, perObjectTimeout time.Duration,
 // ReconcileStats reports one reconcile pass.
 type ReconcileStats struct {
 	Repaired  int // objects brought to full replication this pass
+	Retired   int // source gone, no file references, and no stored backup: failed metadata removed
 	Skipped   int // no target holds the object — needs a backfill from the primary store
 	Failed    int // a repair GENUINELY errored or left the object still under-replicated (not a shutdown)
 	Cancelled int // in-flight when a SIGTERM landed (a resumable interruption, NOT a failure) — see repair
@@ -154,12 +163,41 @@ func (rc *Reconciler) repair(ctx context.Context, p *Pipeline, externalID string
 		// this source was gone/corrupt — try the next source
 	}
 	if !tried {
-		bump(mu, &st.Skipped) // no configured target holds it — needs a backfill from the primary store
-		rc.reportErr(externalID, fmt.Errorf("on NO current target — needs a primary-store backfill (not reconcilable)"))
+		rc.retireOrSkip(ctx, octx, entry, st, mu)
 		return
 	}
 	bump(mu, &st.Failed) // every source failed to fetch
 	rc.reportErr(externalID, fmt.Errorf("every source failed to fetch/decode: %w", lastErr))
+}
+
+func (rc *Reconciler) retireOrSkip(ctx, octx context.Context, entry BackupItem, st *ReconcileStats, mu *sync.Mutex) {
+	retired, err := rc.retireOrphan(octx, entry)
+	switch {
+	case cancelledInFlight(ctx, err):
+		bump(mu, &st.Cancelled)
+	case err != nil:
+		bump(mu, &st.Failed)
+		rc.reportErr(entry.ExternalID, err)
+	case retired:
+		bump(mu, &st.Retired)
+	default:
+		bump(mu, &st.Skipped)
+		rc.reportErr(entry.ExternalID, fmt.Errorf("on NO current target — needs a primary-store backfill (not reconcilable)"))
+	}
+}
+
+func (rc *Reconciler) retireOrphan(ctx context.Context, entry BackupItem) (bool, error) {
+	if rc.source == nil || rc.lifecycle == nil {
+		return false, nil // target-only reconciler (without primary-source dependencies)
+	}
+	r, err := rc.source.FetchContent(ctx, entry)
+	if err == nil {
+		return false, r.Close() // primary still exists: retain metadata for a backfill
+	}
+	if !errors.Is(err, ErrSourceGone) {
+		return false, fmt.Errorf("check orphan primary source: %w", err)
+	}
+	return rc.lifecycle.ResolveSourceGone(ctx, entry)
 }
 
 // orderSources returns the holder names from stored, circuit-HEALTHY targets first and

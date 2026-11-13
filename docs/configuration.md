@@ -164,9 +164,9 @@ export FBS_TARGET_OFFSITE_SECRETKEY=…
 
 | Subcommand | fileServiceBase | alkemioDB | ledgerDB | targets |
 |---|:---:|:---:|:---:|:---:|
-| `serve` | ✅ | ✅ (outbox) | ✅ | ✅ |
+| `serve` | ✅ | ✅ (outbox + file references) | ✅ | ✅ |
 | `backfill` | ✅ | ✅ (`file` corpus) | ✅ | ✅ |
-| `reconcile` | — | — | ✅ | ✅ |
+| `reconcile` | optional (orphan cleanup) | optional (file references for orphan cleanup) | ✅ | ✅ |
 | `audit` | — | — | ✅ | ✅ |
 | `restore object` / `verify` | — | — | — | ✅ (the `--from` target) |
 | `restore all` | — | — | ✅ (enumerate) | ✅ (the `--from` target) |
@@ -174,8 +174,12 @@ export FBS_TARGET_OFFSITE_SECRETKEY=…
 | `drill` | — | — | ✅ (sample) | ✅ (the `--from` target) |
 | `migrate` | — | — | ✅ | — |
 
-`reconcile`/`audit`/`restore`/`verify`/`drill` run in a degraded/DR environment and
-deliberately don't require file-service or the outbox DB. `restore all` and `drill`
+Target-to-target `reconcile`, `audit`, `restore`, `verify`, and `drill` can run in a
+degraded/DR environment without file-service or the outbox DB. When both `fileServiceBase`
+and the Alkemio DB are configured, reconciliation also checks primary-source absence and
+file references before retiring failed-only orphan metadata. If either dependency is
+unavailable, affected orphan checks fail without deleting metadata; target-backed repairs
+continue independently. `restore all` and `drill`
 read the **ledger** to enumerate/sample objects; `restore current` needs the
 **alkemio DB** to resolve a `--file-id` to its content hash — unless you pass an
 explicit `--hash` (a hash recovered from a DB point-in-time restore), which skips

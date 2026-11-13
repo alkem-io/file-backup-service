@@ -36,6 +36,19 @@ func NewFileRepo(p PgxDB) *FileRepo { return &FileRepo{p: p} }
 // defaultDBReadTimeout. See LedgerRepo.WithReadTimeout / the shared readBounded.
 func (r *FileRepo) WithReadTimeout(d time.Duration) *FileRepo { r.setReadTimeout(d); return r }
 
+// HasReferences checks the content hash across all documents; deduplicated and temporary
+// references also prevent retirement of a missing source's metadata.
+func (r *FileRepo) HasReferences(ctx context.Context, externalID string) (bool, error) {
+	ctx, cancel := boundRead(ctx, r.readTimeout)
+	defer cancel()
+	var referenced bool
+	err := r.p.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM file WHERE "externalID" = $1)`, externalID).Scan(&referenced)
+	if err != nil {
+		return false, fmt.Errorf("file references: %w", err)
+	}
+	return referenced, nil
+}
+
 // EachFile invokes fn for every non-temporary file (the backfill work-list), ordered by
 // id for a stable, resumable pass. It KEYSET-PAGES the `file` table (id > after ORDER BY
 // id LIMIT), releasing the pool connection between pages — a backfill runs the full

@@ -36,7 +36,7 @@ operator restore. A worker + CLI, not a public API.
 |---|---|
 | `serve`     | The worker: drain the outbox continuously, fan out to all targets, run the RPO/coverage samplers + periodic ledger-snapshot manifests, serve `/live` `/health` `/metrics`. |
 | `backfill`  | Back up the whole pre-existing corpus (the file-service `file` table) — for objects created before this service. Resumable + rate-limited (`--rate`). |
-| `reconcile` | Repair under-replicated objects target-to-target: fetch from a holder, re-fan-out to the targets missing it (`--rate`). |
+| `reconcile` | Repair under-replicated objects target-to-target (`--rate`). With primary-source and Alkemio DB config, also retire failed-only metadata for source-gone objects with no file references. |
 | `audit`     | Verify the ledger against reality (FR-014): sample objects per target and confirm the target still holds them (ledger→target). Also runs the WORM immutability drift-check, and — with `--inventory` — the target→ledger direction (diff each target's manifest against the ledger). Nonzero exit on missing/drift/unverifiable, for cron/CI (`--sample`, `--inventory`). |
 | `restore`   | Operator DR. `restore [object] --hash --from [--to]` restores one object; `restore all --from [--to] [--concurrency]` restores the whole store (resumable, idempotent, prints per-target sizes; fails loud on **0 objects enumerated** — an empty/wrong source); `restore current --file-id --at [--hash] [--from] [--to]` restores a file's CURRENT backed-up version, guarded by `--at` (fail loud otherwise — see below). Every restored object is hash-verified. `--from` default picks the first **readable** (non-WORM) target; an **explicit** `--from <worm>` is allowed (restore from the sole surviving immutable copy is attempted with a read-capable credential — a 403 fails with an actionable error). |
 | `verify`    | Confirm one stored object decodes + hashes correctly, no write (`--hash`, `--from`). |
@@ -66,6 +66,19 @@ every field, env var, default, and constraint — is in
   `fanoutStallSec`, `dbTimeoutSec`, `metricsPort` (default 4004), `scratchDir`.
 
 ## Operations
+
+- **Deleted sources:** replication checks all `file` rows sharing a content hash, including
+  temporary files, before treating a source 404/410 as a benign deletion. A still-referenced
+  missing blob is retried and recorded as a failed ledger object so coverage keeps alerting.
+  When no reference remains, only metadata without a stored copy on **any** target can be
+  removed; existing backups and their metadata are retained.
+- **Orphan cleanup:** run `file-backup-service reconcile --rate 5` with the normal worker
+  configuration to clean failed metadata left after deliberate deletions, including when
+  file-service already removed the pending outbox entry. The summary reports `retired=N`.
+  Cleanup requires a primary-source 404/410 and a successful zero-reference check; source or
+  database errors retain metadata and fail that item. Target-only DR configuration still
+  repairs between backup targets, but cannot retire orphan metadata. A surviving primary blob
+  with no backup still needs `backfill`; reconciliation does not copy it from primary storage.
 
 - **Health:** `GET /live` (process alive) and `GET /health` (dependencies —
   outbox + ledger reachable; 503 when a probe fails). `GET /metrics` (Prometheus).
